@@ -202,6 +202,14 @@ void AsyncIoUringSocket::processConnectResult(int i) {
   connectSqe_.reset();
   connectEndTime_ = std::chrono::steady_clock::now();
   if (i == 0) {
+    int rv = netops_->set_socket_non_blocking(fd_);
+    if (rv == -1) {
+      auto errnoCopy = errno;
+      throw AsyncSocketException(
+          AsyncSocketException::INTERNAL_ERROR,
+          "failed to put socket in non-blocking mode",
+          errnoCopy);
+    }
     connectCallback_->connectSuccess();
   } else {
     connectCallback_->connectErr(AsyncSocketException(
@@ -485,6 +493,26 @@ void AsyncIoUringSocket::preReadCallback() noexcept {
 AsyncIoUringSocket::WriteSqe::WriteSqe(
     AsyncIoUringSocket* parent,
     WriteCallback* callback,
+    const void* extBuf, size_t len,
+    WriteFlags flags)
+    : parent_(parent),
+      callback_(callback),
+      flags_(flags),
+      totalLength_(len) {
+  iov1_.iov_base = const_cast<uint8_t*>(static_cast<const uint8_t*>(extBuf));
+  iov1_.iov_len = totalLength_;
+  msg_.msg_iov = &iov1_;
+  msg_.msg_iovlen = 1;
+  msg_.msg_name = nullptr;
+  msg_.msg_namelen = 0;
+  msg_.msg_control = nullptr;
+  msg_.msg_controllen = 0;
+  msg_.msg_flags = 0;
+}
+
+AsyncIoUringSocket::WriteSqe::WriteSqe(
+    AsyncIoUringSocket* parent,
+    WriteCallback* callback,
     std::unique_ptr<IOBuf>&& buf,
     WriteFlags flags)
     : parent_(parent),
@@ -493,18 +521,26 @@ AsyncIoUringSocket::WriteSqe::WriteSqe(
       flags_(flags),
       totalLength_(0) {
   IOBuf const* p = buf_.get();
-  do {
-    if (auto l = p->length(); l > 0) {
-      iov_.emplace_back();
-      iov_.back().iov_base = const_cast<uint8_t*>(p->data());
-      iov_.back().iov_len = l;
-      totalLength_ += l;
-    }
-    p = p->next();
-  } while (p != buf_.get());
+  if (p->next() == buf_.get()) {
+    iov1_.iov_base = const_cast<uint8_t*>(p->data());
+    iov1_.iov_len = p->length();
+    totalLength_ += p->length();
+    msg_.msg_iov = &iov1_;
+    msg_.msg_iovlen = 1;
+  } else {
+    do {
+      if (auto l = p->length(); l > 0) {
+        iov_.emplace_back();
+        iov_.back().iov_base = const_cast<uint8_t*>(p->data());
+        iov_.back().iov_len = l;
+        totalLength_ += l;
+      }
+      p = p->next();
+    } while (p != buf_.get());
+    msg_.msg_iov = iov_.data();
+    msg_.msg_iovlen = iov_.size();
+  }
 
-  msg_.msg_iov = iov_.data();
-  msg_.msg_iovlen = iov_.size();
   msg_.msg_name = nullptr;
   msg_.msg_namelen = 0;
   msg_.msg_control = nullptr;
@@ -620,10 +656,15 @@ void AsyncIoUringSocket::failWrite(const AsyncSocketException& ex) {
   writeDone();
 }
 
-void AsyncIoUringSocket::write(
-    WriteCallback* callback, const void* buff, size_t n, WriteFlags wf) {
-  // pretty sure that buff cannot change until the write completes
-  writeChain(callback, IOBuf::wrapBuffer(buff, n), wf);
+void AsyncIoUringSocket::writeWithSqe(AsyncIoUringSocket::WriteSqe* w) {
+  if (writeSqeActive_) {
+    writeSqeQueue_.push_back(*w);
+    DVLOG(5) << "enquque " << w << " as have active. queue now "
+             << writeSqeQueue_.size();
+  } else {
+    writeSqeActive_ = w;
+    doSubmitWrite();
+  }
 }
 
 void AsyncIoUringSocket::writev(
@@ -641,15 +682,119 @@ void AsyncIoUringSocket::writev(
 
 void AsyncIoUringSocket::writeChain(
     WriteCallback* callback, std::unique_ptr<IOBuf>&& buf, WriteFlags flags) {
-  WriteSqe* w = new WriteSqe(this, callback, std::move(buf), flags);
-  if (writeSqeActive_) {
-    writeSqeQueue_.push_back(*w);
-    DVLOG(5) << "enquque " << w << " as have active. queue now "
-             << writeSqeQueue_.size();
-  } else {
-    writeSqeActive_ = w;
-    doSubmitWrite();
+    PollWriteReq writeReq(callback, std::move(buf), flags);
+    int ret = 0;
+    if (pendingWrites_.empty()) {
+        ret = submitWritevOne(writeReq, false);
+    }
+    if (ret == 0) {
+        pendingWrites_.push(std::move(writeReq));
+    }
+}
+
+void AsyncIoUringSocket::write(WriteCallback* callback, const void* buff, size_t n, WriteFlags wf) {
+    writeChain(callback, IOBuf::wrapBuffer(buff, n), wf);
+}
+
+void AsyncIoUringSocket::PollWriteSqe::processSubmit(
+  struct io_uring_sqe* sqe) noexcept {
+      ::io_uring_prep_poll_add(sqe, parent_->usedFd_, POLLOUT);
+      sqe->flags |= parent_->mbFixedFileFlags_;
+}
+
+
+void AsyncIoUringSocket::PollWriteSqe::callback(int res, uint32_t flags) noexcept {
+    parent_->submitWritev();
+}
+
+int AsyncIoUringSocket::getDefaultFlags(
+    folly::WriteFlags flags, bool zeroCopyEnabled) {
+  int msg_flags = MSG_DONTWAIT;
+
+#ifdef MSG_NOSIGNAL // Linux-only
+  msg_flags |= MSG_NOSIGNAL;
+#ifdef MSG_MORE
+  if (isSet(flags, WriteFlags::CORK)) {
+    // MSG_MORE tells the kernel we have more data to send, so wait for us to
+    // give it the rest of the data rather than immediately sending a partial
+    // frame, even when TCP_NODELAY is enabled.
+    msg_flags |= MSG_MORE;
   }
+#endif // MSG_MORE
+#endif // MSG_NOSIGNAL
+  if (isSet(flags, WriteFlags::EOR)) {
+    // marks that this is the last byte of a record (response)
+    msg_flags |= MSG_EOR;
+  }
+
+  if (zeroCopyEnabled && isSet(flags, WriteFlags::WRITE_MSG_ZEROCOPY)) {
+    msg_flags |= MSG_ZEROCOPY;
+  }
+
+  return msg_flags;
+}
+
+FOLLY_ALWAYS_INLINE
+int AsyncIoUringSocket::submitWritevOne(PollWriteReq& writeReq, bool more)
+{
+  auto callback = writeReq.callback;
+  int flags = getDefaultFlags(writeReq.wf, 0);
+  if (more) {
+    //flags |= MSG_MORE;
+  }
+  struct msghdr msg = {};
+  msg.msg_iov = &writeReq.iov[writeReq.iovIndex];
+  msg.msg_iovlen = writeReq.iov.size() – writeReq.iovIndex;
+
+  ssize_t countWritten = netops_->sendmsg(fd_, &msg, flags);
+
+  if (countWritten < 0 && errno != EAGAIN) {
+    if (callback) {
+      callback->writeErr(0,
+          AsyncSocketException(AsyncSocketException::UNKNOWN, "write error"));
+    }
+    return -1;
+  } else {
+    while (countWritten > 0) {
+      auto &iov = writeReq.iov[writeReq.iovIndex];
+      if (iov.iov_len <= countWritten) {
+        // the current iov is fully consumed, skip it
+        countWritten -= iov.iov_len;
+        iov.iov_len = 0;
+        writeReq.iovIndex++;
+      } else {
+        // the current iov has partial write, stop here
+        iov.iov_base = reinterpret_cast<uint8_t*>(iov.iov_base) + countWritten;
+        iov.iov_len -= countWritten;
+        break;
+      }
+    }
+
+    if (writeReq.iovIndex < writeReq.iov.size()) {
+      backend_->submitNow(pollWriteSqe_);
+      return 0;
+    } else {
+      if (callback) {
+        callback->writeSuccess();
+      }
+      //pendingWrites_.pop();
+      return 1;
+    }
+  }
+}
+
+int AsyncIoUringSocket::submitWritev() {
+  while (!pendingWrites_.empty()) {
+    auto& writeReq = pendingWrites_.front();
+    bool more = pendingWrites_.size() > 1;
+    int ret = submitWritevOne(writeReq, more);
+    if (ret != 1) {
+      return ret;
+    }
+    pendingWrites_.pop();
+    // the current request was full sent, loop to the next one
+  }
+  return 1;
 }
 
 void AsyncIoUringSocket::closeProcessSubmit(struct io_uring_sqe* sqe) {

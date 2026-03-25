@@ -134,18 +134,18 @@ void runTAsyncIOTest(
   suspender.rehire();
 }
 
-void runAsyncIOTest(
-    unsigned int iters, size_t numEntries, size_t batchSize, bool persist) {
-  class BatchAsyncIO : public folly::AsyncIO {
-   public:
-    BatchAsyncIO(size_t capacity, PollMode pollMode, size_t /*unused*/)
-        : folly::AsyncIO(capacity, pollMode) {}
-    void register_buffers(
-        const std::vector<folly::test::async_base_test_lib_detail::TestUtil::
-                              ManagedBuffer>&) {}
-  };
-  runTAsyncIOTest<BatchAsyncIO>(iters, numEntries, batchSize, persist, false);
-}
+// void runAsyncIOTest(
+//     unsigned int iters, size_t numEntries, size_t batchSize, bool persist) {
+//   class BatchAsyncIO : public folly::AsyncIO {
+//    public:
+//     BatchAsyncIO(size_t capacity, PollMode pollMode, size_t /*unused*/)
+//         : folly::AsyncIO(capacity, pollMode) {}
+//     void register_buffers(
+//         const std::vector<folly::test::async_base_test_lib_detail::TestUtil::
+//                               ManagedBuffer>&) {}
+//   };
+//   runTAsyncIOTest<BatchAsyncIO>(iters, numEntries, batchSize, persist, false);
+// }
 
 void runIOUringTest(
     unsigned int iters,
@@ -177,19 +177,19 @@ void runIOUringTest(
 }
 
 } // namespace
-BENCHMARK_DRAW_LINE();
-BENCHMARK_NAMED_PARAM(
-    runAsyncIOTest, async_io_no_batching_no_per, 1024, 1, false)
-BENCHMARK_RELATIVE_NAMED_PARAM(
-    runAsyncIOTest, async_io_batching_64_no_per, 1024, 64, false)
-BENCHMARK_RELATIVE_NAMED_PARAM(
-    runAsyncIOTest, async_io_batching_256_no_per, 1024, 256, false)
-BENCHMARK_RELATIVE_NAMED_PARAM(
-    runAsyncIOTest, async_io_no_batching_per, 1024, 1, true)
-BENCHMARK_RELATIVE_NAMED_PARAM(
-    runAsyncIOTest, async_io_batching_64_per, 1024, 64, true)
-BENCHMARK_RELATIVE_NAMED_PARAM(
-    runAsyncIOTest, async_io_batching_256_per, 1024, 256, true)
+// BENCHMARK_DRAW_LINE();
+// BENCHMARK_NAMED_PARAM(
+//     runAsyncIOTest, async_io_no_batching_no_per, 1024, 1, false)
+// BENCHMARK_RELATIVE_NAMED_PARAM(
+//     runAsyncIOTest, async_io_batching_64_no_per, 1024, 64, false)
+// BENCHMARK_RELATIVE_NAMED_PARAM(
+//     runAsyncIOTest, async_io_batching_256_no_per, 1024, 256, false)
+// BENCHMARK_RELATIVE_NAMED_PARAM(
+//     runAsyncIOTest, async_io_no_batching_per, 1024, 1, true)
+// BENCHMARK_RELATIVE_NAMED_PARAM(
+//     runAsyncIOTest, async_io_batching_64_per, 1024, 64, true)
+// BENCHMARK_RELATIVE_NAMED_PARAM(
+//     runAsyncIOTest, async_io_batching_256_per, 1024, 256, true)
 BENCHMARK_DRAW_LINE();
 BENCHMARK_RELATIVE_NAMED_PARAM(
     runIOUringTest, io_uring_no_batching_no_per, 1024, 1, false)

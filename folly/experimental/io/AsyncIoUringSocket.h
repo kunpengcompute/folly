@@ -46,6 +46,26 @@ namespace folly {
 
 #if __has_include(<liburing.h>)
 
+namespace{
+
+  class ConnectCallback : public AsyncSocket::ConnectCallback {
+    private:
+        bool &isConnected_;
+    public:
+        ConnectCallback(bool &isConnected) : isConnected_(isConnected) {}
+        virtual void connectSuccess() noexcept override
+        {
+            isConnected_ = true;
+        }
+        virtual void connectErr(const AsyncSocketException &ex) noexcept override
+        {
+            isConnected_ = true;
+            LOG(ERROR) << "Connection error: " << ex.what();
+        }
+  };
+
+}
+
 class AsyncIoUringSocket : public AsyncTransport {
  public:
   using UniquePtr = std::unique_ptr<AsyncIoUringSocket, Destructor>;
@@ -66,6 +86,28 @@ class AsyncIoUringSocket : public AsyncTransport {
 
   std::chrono::nanoseconds getConnectTime() const {
     return connectEndTime_ - connectStartTime_;
+  }
+
+  static UniquePtr newSocket(
+      EventBase* evb,
+      const std::string& ip,
+      uint16_t port,
+      uint32_t connectTimeout = 0,
+      bool useZeroCopy = false) {
+      bool isConnected = false;
+      folly::AsyncIoUringSocket::UniquePtr socket;
+      
+      SocketAddress sockAddr(ip, port);
+      auto connCb = std::make_shared<ConnectCallback>(isConnected);
+      evb->runInEventBaseThread([&socket, connCb, sockAddr, evb]{
+        socket = folly::AsyncIoUringSocket::UniquePtr{new folly::AsyncIoUringSocket(evb)};
+        socket->connect(connCb.get(), sockAddr);
+      });
+      
+      while (!isConnected) {
+        std::this_thread::yield();
+      }
+      return socket;
   }
 
   // AsyncSocketBase
@@ -170,10 +212,25 @@ class AsyncIoUringSocket : public AsyncTransport {
 
   const AsyncTransport* getWrappedTransport() const override { return nullptr; }
 
+  struct PollWriteReq{
+    WriteCallback* callback;
+    WriteFlags wf;
+    std::unique_ptr<IOBuf> iobuf;
+    folly::fbvector<struct iovec> iov;
+    size_t iovIndex = 0;
+
+    PollWriteReq(WriteCallback* callback, std::unique_ptr<IOBuf> &&iobuf, WriteFlags wf)
+        : callback(callback), wf(wf), iobuf(std::move(iobuf)), iov(this->iobuf->getIov()) { }
+  };
+
+  void setFd(NetworkSocket ns);
+
  private:
   friend class ReadSqe;
   friend class WriteSqe;
-  void setFd(NetworkSocket ns);
+  friend class PollWriteSqe;
+  std::queue<PollWriteReq> pendingWrites_; //queue
+  // void setFd(NetworkSocket ns);
   bool readCallbackUseIoBufs() const;
   void appendPreReceive(std::unique_ptr<IOBuf> iobuf) noexcept;
   void readProcessSubmit(
@@ -200,6 +257,9 @@ class AsyncIoUringSocket : public AsyncTransport {
   void failWrite(const AsyncSocketException& ex);
   void sendReadBuf(std::unique_ptr<IOBuf> buf) noexcept;
   void invalidState(ReadCallback* callback);
+  int submitWritevOne(PollWriteReq& writeReq, bool more);
+  int submitWritev();
+  int getDefaultFlags(folly::WriteFlags flags, bool zeroCopyEnabled);
 
   struct PreReadSqe : IoUringBackend::IoSqeBase {
     explicit PreReadSqe(AsyncIoUringSocket* parent) : parent_(parent) {}
@@ -261,6 +321,11 @@ class AsyncIoUringSocket : public AsyncTransport {
         WriteCallback* callback,
         std::unique_ptr<IOBuf>&& buf,
         WriteFlags flags);
+    explicit WriteSqe(
+        AsyncIoUringSocket* parent,
+        WriteCallback* callback,
+        const void* extBuf, size_t len,
+        WriteFlags flags);
     ~WriteSqe() override { DVLOG(5) << "~WriteSqe() " << this; }
 
     void processSubmit(struct io_uring_sqe* sqe) noexcept override;
@@ -271,8 +336,10 @@ class AsyncIoUringSocket : public AsyncTransport {
     boost::intrusive::list_member_hook<> member_hook_;
     AsyncIoUringSocket* parent_;
     WriteCallback* callback_;
+    const void* extBuf_;
     std::unique_ptr<IOBuf> buf_;
     WriteFlags flags_;
+    struct iovec iov1_;
     std::vector<struct iovec> iov_; // todo how many really
     size_t totalLength_;
     struct msghdr msg_;
@@ -291,6 +358,20 @@ class AsyncIoUringSocket : public AsyncTransport {
 
    private:
     AsyncIoUringSocket* socket_;
+  };
+
+  void writeWithSqe(WriteSqe* w);
+
+  struct PollWriteSqe : public IoUringBackend::IoSqeBase {
+    AsyncIoUringSocket* parent_;
+    uint32_t pollMask_{POLLOUT}; // e.g., POLLOUT
+
+    explicit PollWriteSqe(AsyncIoUringSocket* parent)
+    : parent_(parent) {}
+
+    void processSubmit(io_uring_sqe* sqe) noexcept override;
+    void callback(int res, uint32_t flags) noexcept override;
+    void callbackCancelled() noexcept override {}
   };
 
   struct ConnectSqe : IoUringBackend::IoSqeBase, AsyncTimeout {
@@ -341,6 +422,10 @@ class AsyncIoUringSocket : public AsyncTransport {
   WriteSqe* writeSqeActive_ = nullptr;
   WriteSqeList writeSqeQueue_;
   size_t bytesWritten_{0};
+
+  //poll
+  PollWriteSqe pollWriteSqe_{this};
+  netops::DispatcherContainer netops_;
 
   // connect
   std::unique_ptr<ConnectSqe> connectSqe_;

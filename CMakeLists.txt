@@ -1077,6 +1077,20 @@ if (BUILD_TESTS OR BUILD_BENCHMARKS)
     )
   endif()
 
+  if (${LIBURING_FOUND})
+    folly_define_tests(
+      DIRECTORY experimental/io/test/
+        TEST async_iouring_socket_test SOURCES AsyncIoUringSocketTest.cpp
+        BENCHMARK IOBenchmark
+          HEADERS
+            IoTestTempFileUtil.h
+          SOURCES
+            IOBenchmark.cpp
+            AsyncBaseTestLib.cpp
+            IoTestTempFileUtil.cpp
+    )
+  endif()
+
   if (${LIBAIO_FOUND})
     folly_define_tests(
       DIRECTORY experimental/io/test/
