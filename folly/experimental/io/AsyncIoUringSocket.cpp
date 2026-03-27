@@ -744,7 +744,7 @@ int AsyncIoUringSocket::submitWritevOne(PollWriteReq& writeReq, bool more)
   }
   struct msghdr msg = {};
   msg.msg_iov = &writeReq.iov[writeReq.iovIndex];
-  msg.msg_iovlen = writeReq.iov.size() – writeReq.iovIndex;
+  msg.msg_iovlen = writeReq.iov.size() - writeReq.iovIndex;
 
   ssize_t countWritten = netops_->sendmsg(fd_, &msg, flags);
 
