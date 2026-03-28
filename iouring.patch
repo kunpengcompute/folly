@@ -196,7 +196,7 @@ diff -ruN '--exclude=.git' folly_ori/folly/experimental/io/AsyncIoUringSocket.cp
 +  }
 +  struct msghdr msg = {};
 +  msg.msg_iov = &writeReq.iov[writeReq.iovIndex];
-+  msg.msg_iovlen = writeReq.iov.size() – writeReq.iovIndex;
++  msg.msg_iovlen = writeReq.iov.size() - writeReq.iovIndex;
 +
 +  ssize_t countWritten = netops_->sendmsg(fd_, &msg, flags);
 +
