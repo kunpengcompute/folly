@@ -4,24 +4,55 @@
 
 ### 产品版本信息
 
-|产品名称|Kunpeng BoostKit|
+|项目|版本|
 |--|--|
-|产品版本|26.0.0|
-|软件名称|folly io_uring优化补丁仓|
-|软件包版本|1.0.0|
+|产品名称|Kunpeng BoostKit|
+|产品版本|26.1.RC1|
+|软件名称|Folly性能优化补丁仓|
+|软件包版本|v1.1.0|
 
-### 与操作系统、编译器和CPU配套说明
+### 配套环境
 
 |操作系统|CPU类型|编译器|
 |--|--|--|
-|Debian 12 等支持 io_uring 的系统|鲲鹏950处理器|clang-16|
+|Debian 12、openEuler等Linux系统|鲲鹏950及其他受支持处理器|Clang 16|
 
 ## 版本更新说明
 
-### V1.0.0
+### v1.1.0
 
 **新增特性**
 
 |特性描述|更新说明|
 |--|--|
-|新增folly io_uring优化补丁仓|基于folly框架，针对网络异步io进行io_uring的优化。本方案采用混合模式，即读操作使用io_uring的multishot模式以减少系统调用，而写操作回退到使用原生send系统调用，以规避io_uring在保序场景下可能引入的延迟。|
+|IOBuf TLS内存池|每线程维护TLSBlockCache，复用IoBufBlock并从current_share连续切分slice，减少小IOBuf数据区的malloc/free。|
+|可配置池块大小|新增IOBuf::setBlockSize()，默认块大小为8KB，建议只在服务启动阶段配置。|
+|显式启用接口|新增IOBuf::enableMemoryPool()；未调用时保持Folly原有分配路径。|
+|容量路由与回退|小容量请求优先使用池块；大容量、未启用或池化失败时回退到createCombined/createSeparate。|
+|ABI兼容设计|复用flagsAndSharedInfo_保存池标记和IoBufBlock指针，不增加IOBuf数据成员，不改变sizeof(IOBuf)。|
+|完整生命周期管理|使用ref_count和share_count分别管理TLS持有与IOBuf引用，覆盖clone、reserve、析构、线程退出及跨线程释放。|
+
+**默认配置**
+
+|配置项|默认值|说明|
+|--|--|--|
+|池块大小|8KB|包含块头，实际数据区略小。|
+|每线程空闲块上限|8|缓存满后将多余块释放给系统。|
+|启用状态|关闭|调用enableMemoryPool()后启用。|
+
+**兼容性与风险说明**
+
+- 内存池只池化数据块，IOBuf对象仍沿用原有创建和销毁方式。
+- 未启用或容量不适合池化时自动回退，不影响原有大请求路径。
+- setBlockSize()属于全局配置，应在创建工作线程前设置，避免运行期配置竞争。
+- 线程退出时只释放TLS持有引用，仍被IOBuf引用的数据块必须继续存活。
+- IOBuf跨线程析构时，数据块可能进入最终释放线程的TLS缓存，需监控线程间内存分布。
+- 块大小和缓存上限会影响常驻内存，应结合线程数和请求大小分布调优。
+
+### v1.0.0
+
+**新增特性**
+
+|特性描述|更新说明|
+|--|--|
+|Folly io_uring混合读写优化|读操作使用io_uring multishot减少系统调用；写操作使用原生send保持连续写顺序，并通过PollWriteSqe监听socket可写事件。|
