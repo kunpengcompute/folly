@@ -1,8 +1,8 @@
 # API参考
 
-## v1.1.0：IOBuf TLS内存池
+## Folly v1.1.0：IOBuf TLS内存池接口说明
 
-> 本节说明v1.1.0新增的IOBuf TLS内存池接口和生命周期规则。该能力默认不改变原有分配行为，调用enableMemoryPool()后才会进入池化路径。
+本章介绍Folly v1.1.0新增的IOBuf TLS内存池接口和生命周期规则。该能力默认不改变原有分配行为，调用enableMemoryPool()后才会进入池化路径。
 
 ### 接口概览
 
@@ -18,17 +18,17 @@
 
 ### `IOBuf::enableMemoryPool`
 
-**函数功能**
+#### IOBuf::enableMemoryPool函数功能
 
 启用进程内IOBuf池化创建路径。启用后，满足容量条件的IOBuf::create()会优先从当前线程的IoBufBlock切分slice；不满足条件时继续使用Folly原有分配实现。
 
-**函数定义**
+#### IOBuf::enableMemoryPool函数定义
 
 ```cpp
 static void folly::IOBuf::enableMemoryPool();
 ```
 
-**使用约束**
+#### IOBuf::enableMemoryPool函数约束说明
 
 - 建议在服务启动、工作线程创建之前调用一次。
 - 未调用时保持原有createCombined()或createSeparate()行为。
@@ -36,17 +36,17 @@ static void folly::IOBuf::enableMemoryPool();
 
 ### `IOBuf::setBlockSize`
 
-**函数功能**
+#### IOBuf::setBlockSize函数功能
 
 设置后续新建IoBufBlock的块大小。默认值为8KB，实际可切分空间需要扣除块头元数据。
 
-**函数定义**
+#### IOBuf::setBlockSize函数定义
 
 ```cpp
 static void folly::IOBuf::setBlockSize(std::size_t size);
 ```
 
-**参数说明**
+#### IOBuf::setBlockSize函数参数说明
 
 |参数名|描述|输入/输出|
 |--|--|--|
@@ -56,14 +56,14 @@ static void folly::IOBuf::setBlockSize(std::size_t size);
 
 ### `IOBuf::create`路由
 
-**函数定义**
+#### IOBuf::create函数定义
 
 ```cpp
 static std::unique_ptr<folly::IOBuf>
 folly::IOBuf::create(std::size_t capacity);
 ```
 
-**路由规则**
+#### IOBuf::create路由规则
 
 ```text
 IOBuf::create(capacity)
@@ -81,7 +81,7 @@ IOBuf::create(capacity)
 
 #### `IoBufBlock`
 
-IoBufBlock是自描述的池化数据块：
+IoBufBlock是自描述的池化数据块。
 
 ```text
 IoBufBlock
@@ -97,7 +97,7 @@ IoBufBlock
 
 #### `TLSBlockCache`
 
-每个线程维护独立的TLSBlockCache：
+每个线程维护独立的TLSBlockCache。
 
 ```text
 TLSBlockCache
@@ -110,7 +110,7 @@ TLSBlockCache
 
 #### 数据块申请与回收
 
-**函数定义**
+##### 函数定义
 
 ```cpp
 IoBufBlock* ioBufBlockAllocate();
@@ -121,7 +121,7 @@ static std::unique_ptr<folly::IOBuf>
 folly::IOBuf::createFromPoolShared(std::size_t capacity);
 ```
 
-**处理流程**
+##### 处理流程
 
 1. ioBufBlockAllocate()优先从当前线程blocks[]取出空闲块；缓存为空时再向系统申请。
 2. share_block()检查current_share剩余空间；不足时释放TLS持有并切换新块。
@@ -139,7 +139,7 @@ IoBufBlock
 
 #### `flagsAndSharedInfo_`复用
 
-内存池不为IOBuf增加新的数据成员，而是复用flagsAndSharedInfo_：
+内存池不为IOBuf增加新的数据成员，而是复用flagsAndSharedInfo_。
 
 ```text
 普通IOBuf
@@ -173,25 +173,25 @@ IoBufBlock
 - setBlockSize()建议只在启动阶段调用一次。
 - 块大小和每线程缓存上限需要结合请求分布、工作线程数及总体内存预算调优。
 
-## v1.0.0：io_uring优化
+## Folly v1.0.0：io_uring混合读写接口说明
 
-> 本节保留v1.0.0提供的io_uring混合读写接口，与v1.1.0的IOBuf TLS内存池分开说明。
+> 本节保留Folly v1.0.0提供的io_uring混合读写接口，与Folly v1.1.0的IOBuf TLS内存池分开说明。
 
 ### 接口概览
 
 |名称|说明|
 |--|--|
 |newSocket|支持与AsyncSocket相同的同步连接功能。|
-|writeChain|将写请求按顺序存入写队列，通过原生send执行发送。|
+|writeChain|将写请求按顺序存入写队列，通过开源send执行发送。|
 |PollWriteSqe|通过io_uring接收socket可写通知。|
 
 ### `AsyncIoUringSocket::writeChain`
 
-**函数功能**
+#### 函数功能
 
 在AsyncIoUringSocket中处理写操作。优化版本不再通过io_uring WriteSqe发送数据，而是将写请求按顺序存入队列，并连续调用send，避免io_uring在保序场景下可能引入的延迟。
 
-**函数定义**
+#### 函数定义
 
 ```cpp
 void AsyncIoUringSocket::writeChain(
@@ -200,7 +200,7 @@ void AsyncIoUringSocket::writeChain(
     WriteFlags flags);
 ```
 
-**参数说明**
+#### 参数说明
 
 |参数名|描述|输入/输出|
 |--|--|--|
@@ -209,3 +209,5 @@ void AsyncIoUringSocket::writeChain(
 |flags|写操作标志|输入|
 
 该函数无返回值。当send因缓冲区不足无法继续发送时，结合PollWriteSqe监听socket fd的可写事件，并在可写后恢复发送。
+
+## 修订记录

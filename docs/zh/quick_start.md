@@ -1,10 +1,10 @@
 # 快速入门
 
-> 适用版本：v1.1.0
+> 适用版本：Folly v1.1.0
 
 本文指导用户编译Folly优化版本、启用IOBuf TLS内存池，并验证原有io_uring混合读写路径。
 
-## 1. 环境与源码
+## 1. 环境准备
 
 ### 1.1 环境要求
 
@@ -12,7 +12,7 @@
 - Clang 16或更高版本，所有依赖使用同一工具链。
 - 安装CMake、Boost、fmt、glog、libevent、liburing及压缩库开发包。
 
-Debian或Ubuntu执行：
+Debian或Ubuntu执行以下命令。
 
 ```bash
 sudo apt-get update
@@ -25,22 +25,24 @@ sudo apt-get install -y \
   zlib1g-dev libbz2-dev
 ```
 
-### 1.2 获取并应用优化
+### 1.2 获取并应用优化补丁
 
-```bash
-git clone --recurse-submodules --branch dev_iouring --single-branch \
-  https://gitcode.com/boostkit/folly.git
-cd folly
-```
+1. 获取优化补丁代码。
 
-IOBuf TLS内存池需要由v1.1.0优化补丁提供。源码尚未包含对应实现时，在配置前应用补丁：
+   ```bash
+   git clone --recurse-submodules --branch dev_iouring --single-branch \
+   https://gitcode.com/boostkit/folly.git
+   cd folly
+   ```
 
-```bash
-git apply --check /path/to/folly_iobuf_tls_pool.patch
-git apply --3way /path/to/folly_iobuf_tls_pool.patch
-```
+2. IOBuf TLS内存池需要由v1.1.0优化补丁提供。源码尚未包含对应实现时，在配置前应用补丁。
 
-如git apply --reverse --check能够成功，说明补丁已经应用，不应重复执行。
+   ```bash
+   git apply --check /path/to/folly_iobuf_tls_pool.patch
+   git apply --3way /path/to/folly_iobuf_tls_pool.patch
+   ```
+
+   如git apply --reverse --check能够成功，说明补丁已经应用，不应重复执行。
 
 ## 2. 编译与安装
 
@@ -67,29 +69,26 @@ fmt或其他依赖安装在自定义位置时，通过CMAKE_PREFIX_PATH或fmt_DI
 
 ### 3.1 启动阶段配置
 
-内存池默认不改变原有IOBuf分配行为。建议在创建工作线程前完成配置：
+- 内存池默认不改变原有IOBuf分配行为。建议在创建工作线程前完成配置。
 
-```cpp
-#include <folly/io/IOBuf.h>
+  ```cpp
+  #include <folly/io/IOBuf.h>
 
-int main() {
-  // 默认块大小为8KB。仅在需要调优时显式设置。
+  int main() {
   folly::IOBuf::setBlockSize(8 * 1024);
   folly::IOBuf::enableMemoryPool();
+  }
+  ```
 
-  // 随后启动EventBase、线程池或RPC服务。
-}
-```
+- 启用后的IOBuf::create()路由如下。
 
-启用后的IOBuf::create()路由如下：
+  ```text
+  容量能够由池块容纳
+  └── 从当前线程current_share切分slice
 
-```text
-容量能够由池块容纳
-└── 从当前线程current_share切分slice
-
-容量过大、内存池未启用或池化失败
-└── 回退到Folly原有createCombined/createSeparate路径
-```
+  容量过大、内存池未启用或池化失败
+  └── 回退到Folly原有createCombined/createSeparate路径
+  ```
 
 ### 3.2 配置建议
 
@@ -101,13 +100,13 @@ int main() {
 
 ### 3.3 正确性验证
 
-编译全部Folly测试并执行：
+编译全部Folly测试并执行以下命令。
 
 ```bash
 ctest --test-dir _build --output-on-failure
 ```
 
-内存池专项验证至少覆盖：
+内存池专项验证至少覆盖以下内容。
 
 - 未启用时保持原有IOBuf::create()路径。
 - 多个小IOBuf从同一块切分且slice互不重叠。
@@ -116,52 +115,54 @@ ctest --test-dir _build --output-on-failure
 - reserveSlow()离开池slice时不释放其他IOBuf共享的数据块。
 - 线程退出和跨线程析构后无泄漏、重复释放或悬空引用。
 
-## 4. io_uring与Benchmark验证
+## 4. 验证与测试io_uring与Benchmark
 
-### 4.1 原生io_uring测试
+### 4.1 测试开源io_uring
 
-构建时启用BUILD_TESTS后，可运行AsyncIoUringSocket测试：
+构建时启用BUILD_TESTS后，可运行AsyncIoUringSocket测试。
 
 ```bash
 ./_build/experimental/io/test/async_iouring_socket_test
 ```
 
-v1.0.0采用混合模式：读操作使用io_uring multishot，写操作使用原生send；send暂时不可写时由PollWriteSqe监听socket fd并恢复发送。
+v1.0.0采用混合模式：读操作使用io_uring multishot，写操作使用开源send；send暂时不可写时由PollWriteSqe侦听socket fd并恢复发送。
 
-### 4.2 获取Benchmark
+### 4.2 测试Benchmark
 
-```bash
-git clone https://gitcode.com/donghuanan/AccLibBenchmark.git
-cd AccLibBenchmark/folly
-```
+1. 获取Benchmrk代码
 
-双机压测前建议设置：
+   ```bash
+   git clone https://gitcode.com/donghuanan/AccLibBenchmark.git
+   cd AccLibBenchmark/folly
+   ```
 
-```bash
-sudo cpupower frequency-set -g performance
-ulimit -n 65536
-export LD_LIBRARY_PATH=/usr/local/folly/lib:$LD_LIBRARY_PATH
-```
+2. 双机压测前建议设置。
 
-根据实际安装路径修改Benchmark Makefile中的Folly和fmt目录，然后分别编译服务端及客户端：
+   ```bash
+   sudo cpupower frequency-set -g performance
+   ulimit -n 65536
+   export LD_LIBRARY_PATH=/usr/local/folly/lib:$LD_LIBRARY_PATH
+   ```
 
-```bash
-cd benchmark/server
-make
-numactl -N 0 ./net-server3-iouring
+3. 根据实际安装路径修改Benchmark Makefile中的Folly和fmt目录，然后分别编译服务端及客户端。
 
-cd ../client/iouring
-make
-./net-client \
-  --conn_per_thread 1 \
-  --qps_per_conn 10000 \
-  --batch_size 1 \
-  --total_requests 100000
-```
+   ```bash
+   cd benchmark/server
+   make
+   numactl -N 0 ./net-server3-iouring
+
+   cd ../client/iouring
+   make
+   ./net-client \
+   --conn_per_thread 1 \
+   --qps_per_conn 10000 \
+   --batch_size 1 \
+   --total_requests 100000
+   ```
 
 ### 4.3 A/B测试原则
 
-使用同一份二进制，通过是否调用enableMemoryPool()切换内存池状态，保持线程数、连接数、Payload和CPU绑定一致。至少比较：
+使用同一份二进制，通过是否调用enableMemoryPool()切换内存池状态，保持线程数、连接数、Payload和CPU绑定一致。至少比较以下方面。
 
 - QPS与吞吐量。
 - 平均延迟及P99延迟。
@@ -170,3 +171,5 @@ make
 - 单位成功请求CPU周期。
 
 正式压测应先预热，再交替运行基线与优化组，避免温度、频率和缓存状态造成单向偏差。
+
+## 修订记录
