@@ -211,3 +211,7 @@ void AsyncIoUringSocket::writeChain(
 该函数无返回值。当send因缓冲区不足无法继续发送时，结合PollWriteSqe监听socket fd的可写事件，并在可写后恢复发送。
 
 ## 修订记录
+|发布日期|修订记录|
+| :---| :---|
+|2026-9-30|第二次正式发布:<br>• 新增了 `IoBufBlock`、`TLSBlockCache` 以及 `ioBufBlockAllocate`、`ioBufBlockRelease`、`share_block` 等分配/回收/共享块接口，为 `IOBuf` 引入基于线程本地缓存的内存池 `IoBufPool` 。|
+|2026-6-30|第一次正式发布:<br>• 新增 `pollSQE` 进行写查询，收到 `pollCQE` 后连续 `send`，以优化 `AsyncIOUringSocket`, 优化 `iouring` 写流程。|
