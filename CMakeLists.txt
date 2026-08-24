@@ -887,6 +887,7 @@ if (BUILD_TESTS OR BUILD_BENCHMARKS)
       TEST mallctl_helper_test SOURCES MallctlHelperTest.cpp
       TEST uninitialized_memory_hacks_test
         SOURCES UninitializedMemoryHacksTest.cpp
+      TEST iobuf_pool_test WINDOWS_DISABLED SOURCES IoBufPoolTest.cpp
 
     DIRECTORY net/detail/test/
       TEST socket_file_descriptor_map_test SOURCES SocketFileDescriptorMapTest.cpp

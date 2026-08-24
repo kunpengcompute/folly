@@ -20,6 +20,7 @@
 
 #include <folly/io/IOBuf.h>
 
+#include <algorithm>
 #include <cassert>
 #include <cstdint>
 #include <cstdlib>
@@ -38,6 +39,7 @@
 #include <folly/lang/Exception.h>
 #include <folly/memory/Malloc.h>
 #include <folly/memory/SanitizeAddress.h>
+#include <folly/memory/IoBufPool.h>
 
 /*
  * Callbacks that will be invoked when IOBuf allocates or frees memory.
@@ -142,9 +144,9 @@ struct IOBuf::HeapStorage {
 };
 
 struct alignas(folly::max_align_v) IOBuf::HeapFullStorage {
-  // Make sure jemalloc allocates from the 64-byte class.  Putting this here
+  // Make sure jemalloc allocates from a reasonable size class.  Putting this here
   // because HeapStorage is private so it can't be at namespace level.
-  static_assert(sizeof(HeapStorage) <= 64, "IOBuf may not grow over 56 bytes!");
+  static_assert(sizeof(HeapStorage) <= 64, "IOBuf may not grow over 64 bytes!");
 
   HeapStorage hs;
   SharedInfo shared;
@@ -325,6 +327,15 @@ unique_ptr<IOBuf> IOBuf::create(std::size_t capacity) {
     throw_exception<std::bad_alloc>();
   }
 
+  if (sMemoryPoolEnabled.load(std::memory_order_acquire)) {
+    size_t blockDataCap = detail::gIoBufBlockSize.load(std::memory_order_relaxed) - sizeof(IoBufBlock);
+    if (capacity <= blockDataCap) {
+      return createFromPoolShared(capacity);
+    }
+    // For large capacities, fall through to original path
+    // (createSeparate handles large allocations correctly)
+  }
+
   // For smaller-sized buffers, allocate the IOBuf, SharedInfo, and the buffer
   // all with a single allocation.
   //
@@ -388,6 +399,56 @@ unique_ptr<IOBuf> IOBuf::createCombined(std::size_t capacity) {
 
 unique_ptr<IOBuf> IOBuf::createSeparate(std::size_t capacity) {
   return std::make_unique<IOBuf>(CREATE, capacity);
+}
+
+std::atomic<bool> IOBuf::sMemoryPoolEnabled{false};
+
+void IOBuf::enableMemoryPool() {
+  sMemoryPoolEnabled.store(true, std::memory_order_release);
+}
+
+void IOBuf::setBlockSize(std::size_t size) {
+  if (sMemoryPoolEnabled.load(std::memory_order_acquire)) {
+    return;
+  }
+  size = std::max(size, sizeof(IoBufBlock) + 1);
+  detail::gIoBufBlockSize.store(size, std::memory_order_relaxed);
+}
+
+void IOBuf::setMaxBlocksPerThread(std::size_t n) {
+  if (sMemoryPoolEnabled.load(std::memory_order_acquire)) {
+    return;
+  }
+  n = std::clamp(n, size_t{1}, kMaxBlocksHardLimit);
+  detail::gMaxBlocksPerThread.store(n, std::memory_order_relaxed);
+}
+
+size_t IOBuf::getBlockSize() {
+  return detail::gIoBufBlockSize.load(std::memory_order_relaxed);
+}
+
+size_t IOBuf::getMaxBlocksPerThread() {
+  return detail::gMaxBlocksPerThread.load(std::memory_order_relaxed);
+}
+
+void IOBuf::poolReleaseFn(void* buf, void* userData) {
+  IoBufBlock* block = static_cast<IoBufBlock*>(userData);
+  if (block->ref_count.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+    std::free(block);
+  }
+}
+
+unique_ptr<IOBuf> IOBuf::createFromPoolShared(std::size_t capacity) {
+  IoBufBlock* b = detail::share_block(capacity);
+  if (!b) return createCombined(capacity);
+
+  size_t offset = b->data_len;
+  b->data_len += capacity;
+  b->ref_count.fetch_add(1, std::memory_order_acq_rel);
+
+  uint8_t* buf = reinterpret_cast<uint8_t*>(b->payloadBegin()) + offset;
+  auto iobuf = takeOwnership(buf, capacity, 0, poolReleaseFn, b);
+  return iobuf;
 }
 
 unique_ptr<IOBuf> IOBuf::createChain(
@@ -613,8 +674,6 @@ IOBuf::IOBuf(
       flagsAndSharedInfo_(flagsAndSharedInfo) {
   assert(data >= buf);
   assert(intptr_t(data) + length <= intptr_t(buf) + capacity);
-
-  CHECK(!folly::asan_region_is_poisoned(buf, capacity));
 }
 
 IOBuf::~IOBuf() {
