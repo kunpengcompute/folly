@@ -42,8 +42,8 @@ endif()
 # ── 可执行文件 ──
 add_executable(UrmaEchoDemo UrmaEchoDemo.cpp)
 
-# ── 链接 folly ──
-target_link_libraries(UrmaEchoDemo
+# ── 链接 folly（静态库放后面，解决符号依赖顺序）──
+target_link_libraries(UrmaEchoDemo PRIVATE
     ${FOLLY_BUILD}/libfolly.a
     glog gflags double-conversion fmt
     boost_context boost_system boost_filesystem boost_thread boost_program_options boost_regex

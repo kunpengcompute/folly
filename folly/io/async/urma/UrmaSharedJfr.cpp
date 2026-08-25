@@ -84,18 +84,18 @@ UrmaSharedJfr::UrmaSharedJfr(EventBase* evb, const UrmaConfig& config)
     }
 
     urma_jfr_wr_t* wr = &rx_bufs_[i].wr;
-    rx_bufs_[i].sge.addr = rx_bufs_[i].data;
+    rx_bufs_[i].sge.addr = reinterpret_cast<uint64_t>(rx_bufs_[i].data);
     rx_bufs_[i].sge.len = URMA_SMALL_BUF_SIZE;
     rx_bufs_[i].sge.tseg = UrmaInit::getPoolTseg();
     wr->src.sge = &rx_bufs_[i].sge;
     wr->src.num_sge = 1;
     wr->user_ctx = i;  // slot 索引
     wr->next = nullptr;
-    urma_post_jfr_wr(io_jfr_, wr);
+    urma_post_jfr_wr(io_jfr_, wr, nullptr);
   }
 
   // IO CqHandler
-  io_cq_handler_ = new UrmaCqHandler(evb_, urma_get_jfce_fd(io_jfce_),
+  io_cq_handler_ = new UrmaCqHandler(evb_, io_jfce_->fd,
                                       this, false);
   urma_rearm_jfc(io_jfc_, false);
 
@@ -129,7 +129,7 @@ UrmaSharedJfr::UrmaSharedJfr(EventBase* evb, const UrmaConfig& config)
   }
 
   // FC RX buffer: Phase 2 空实现(Phase 4 填充)
-  fc_cq_handler_ = new UrmaCqHandler(evb_, urma_get_jfce_fd(fc_jfce_),
+  fc_cq_handler_ = new UrmaCqHandler(evb_, fc_jfce_->fd,
                                       this, true);
   urma_rearm_jfc(fc_jfc_, false);
 
@@ -184,7 +184,7 @@ UrmaSharedJfr::~UrmaSharedJfr() {
 
 void UrmaSharedJfr::replenishRxBuf(uint32_t slot) noexcept {
   if (slot >= rx_bufs_.size()) return;
-  urma_post_jfr_wr(io_jfr_, &rx_bufs_[slot].wr);
+  urma_post_jfr_wr(io_jfr_, &rx_bufs_[slot].wr, nullptr);
 }
 
 void UrmaSharedJfr::fillFcRxBuf() noexcept {

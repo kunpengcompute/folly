@@ -12,6 +12,8 @@ namespace {
 thread_local TLSBlockCache g_tls_cache;
 } // namespace
 
+std::atomic<IoBufBlockAllocFn> g_alloc_fn{&std::malloc};
+std::atomic<IoBufBlockFreeFn>  g_free_fn{&std::free};
 std::atomic<IoBufBlockSizeFn> g_size_fn{nullptr};
 
 void setIoBufBlockAllocFree(IoBufBlockAllocFn alloc_fn,

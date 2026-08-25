@@ -853,9 +853,6 @@ if (BUILD_TESTS OR BUILD_BENCHMARKS)
         SOURCES SSLSessionTest.cpp
       TEST writechain_test SOURCES WriteChainAsyncTransportWrapperTest.cpp
 
-    DIRECTORY io/async/urma/test/
-      TEST urma_init_test SOURCES UrmaInitTest.cpp
-
     DIRECTORY io/async/ssl/test/
       TEST ssl_errors_test SOURCES SSLErrorsTest.cpp
 

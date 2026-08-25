@@ -36,11 +36,10 @@ class UrmaInit {
 
   // 全局 context(MR 池 + URMA 对象创建都基于此)
   static urma_context_t* getContext() { return s_ctx; }
-  static urma_seg_t* getPoolSeg() { return s_pool_seg; }
+  static urma_target_seg_t* getPoolSeg() { return s_pool_seg; }
   // 全局内存池的 target_seg(供 SGE.tseg 使用,NIC DMA 需要此句柄定位 MR 段)
-  static urma_target_seg_t* getPoolTseg() {
-    return s_pool_seg ? s_pool_seg->tseg : nullptr;
-  }
+  // register_seg 返回的就是 target_seg_t*,直接用于 SGE.tseg
+  static urma_target_seg_t* getPoolTseg() { return s_pool_seg; }
 
   // 硬件能力(init 时查询,供 UrmaAsyncSocket 等使用)
   static uint8_t getMaxJfsSge() { return s_max_jfs_sge; }
@@ -62,7 +61,7 @@ class UrmaInit {
 
   static bool s_inited_;
   static urma_context_t* s_ctx;
-  static urma_seg_t* s_pool_seg;
+  static urma_target_seg_t* s_pool_seg;
   static UrmaConfig s_config;
   static uint8_t s_max_jfs_sge;
   static urma_eid_t s_local_eid;  // 硬件 max_jfs_sge(init 时查询)

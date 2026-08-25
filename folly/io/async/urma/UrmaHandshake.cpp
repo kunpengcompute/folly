@@ -93,18 +93,22 @@ UrmaHandshake::UrmaHandshake(EventBase* evb, int tcp_fd, bool is_client,
       socket_(socket) {
   // 填充本地 HelloMessage
   urma_context_t* ctx = UrmaInit::getContext();
-  urma_seg_t* pool_seg = UrmaInit::getPoolSeg();
+  urma_target_seg_t* pool_seg = UrmaInit::getPoolSeg();
 
   local_hello_.buffer_size = URMA_SMALL_BUF_SIZE;
   local_hello_.recv_buffer_cnt = config_.rx_depth;
   local_hello_.tp_type = URMA_CTP;
   // jetty_id / fc_jetty_id / eid / uasid / seg_* 在 allocateResources 后填充
   if (pool_seg) {
-    memcpy(local_hello_.seg_eid, pool_seg->eid.eid, 16);
-    local_hello_.seg_uasid = ctx ? ctx->uasid : 0;
-    local_hello_.seg_va = reinterpret_cast<uintptr_t>(pool_seg->va);
-    local_hello_.seg_len = pool_seg->len;
-    local_hello_.seg_token_id = pool_seg->token_id;
+    // pool_seg->seg.ubva 含远端 import 所需的 eid/uasid/va
+    memcpy(local_hello_.seg_eid, pool_seg->seg.ubva.eid.raw, 16);
+    local_hello_.seg_uasid = pool_seg->seg.ubva.uasid;
+    local_hello_.seg_va = pool_seg->seg.ubva.va;
+    local_hello_.seg_len = pool_seg->seg.len;
+    local_hello_.seg_token_id = pool_seg->seg.token_id;
+  }
+  if (ctx) {
+    local_hello_.uasid = ctx->uasid;
   }
 }
 
@@ -127,7 +131,7 @@ void UrmaHandshake::start(ReadyCallback ready_cb, ErrorCallback error_cb) {
       local_hello_.fc_jetty_id = socket_->res_.fc_jetty->jetty_id.id;
     }
     if (urma_context_t* ctx = UrmaInit::getContext()) {
-      memcpy(local_hello_.eid, UrmaInit::getLocalEid().eid, 16);
+      memcpy(local_hello_.eid, UrmaInit::getLocalEid().raw, 16);
       local_hello_.uasid = ctx->uasid;
     }
     sendHello();
@@ -269,26 +273,28 @@ void UrmaHandshake::importPeer(const v2_wire::HelloMessage& hello) {
   // 构造 rjetty for IO
   urma_rjetty_t rjetty = {};
   rjetty.jetty_id.id = hello.jetty_id;
-  memcpy(rjetty.jetty_id.eid.eid, hello.eid, 16);
+  memcpy(rjetty.jetty_id.eid.raw, hello.eid, 16);
   rjetty.trans_mode = URMA_TM_RM;
   rjetty.tp_type = URMA_CTP;
 
-  // 构造 target_seg
-  urma_target_seg_t seg_info = {};
-  memcpy(seg_info.eid.eid, hello.seg_eid, 16);
-  seg_info.uasid = hello.seg_uasid;
-  seg_info.va = hello.seg_va;  // uint64_t ← uint64_t
-  seg_info.len = hello.seg_len;
-  seg_info.token_id = hello.seg_token_id;
+  // 构造 peer_seg(参照 brpc urma_endpoint.cpp:546-560)
+  urma_seg_t peer_seg = {};
+  memcpy(peer_seg.ubva.eid.raw, hello.seg_eid, 16);
+  peer_seg.ubva.uasid = hello.seg_uasid;
+  peer_seg.ubva.va = hello.seg_va;
+  peer_seg.len = hello.seg_len;
+  peer_seg.token_id = hello.seg_token_id;
 
-  // import_seg 必须先于 import_jetty
-  res.remote_seg = urma_import_seg(ctx, &seg_info);
+  urma_token_t seg_token = {};
+  urma_import_seg_flag_t seg_flag = {};
+  // import_seg 必须先于 import_jetty(建立 TP 路由)
+  res.remote_seg = urma_import_seg(ctx, &peer_seg, &seg_token, 0, seg_flag);
   if (!res.remote_seg) {
     onHandshakeError("import_seg failed");
     return;
   }
 
-  urma_token_t token = 0;
+  urma_token_t token = {};
   res.remote_jetty = urma_import_jetty(ctx, &rjetty, &token);
   if (!res.remote_jetty) {
     onHandshakeError("import_jetty(IO) failed");
@@ -298,7 +304,7 @@ void UrmaHandshake::importPeer(const v2_wire::HelloMessage& hello) {
   // import FC jetty
   urma_rjetty_t fc_rjetty = {};
   fc_rjetty.jetty_id.id = hello.fc_jetty_id;
-  memcpy(fc_rjetty.jetty_id.eid.eid, hello.eid, 16);
+  memcpy(fc_rjetty.jetty_id.eid.raw, hello.eid, 16);
   fc_rjetty.trans_mode = URMA_TM_RM;
   fc_rjetty.tp_type = URMA_CTP;
 
@@ -332,7 +338,7 @@ void UrmaHandshake::processRemoteHello(const v2_wire::HelloMessage& hello) {
       local_hello_.fc_jetty_id = socket_->res_.fc_jetty->jetty_id.id;
     }
     if (urma_context_t* ctx = UrmaInit::getContext()) {
-      memcpy(local_hello_.eid, UrmaInit::getLocalEid().eid, 16);
+      memcpy(local_hello_.eid, UrmaInit::getLocalEid().raw, 16);
       local_hello_.uasid = ctx->uasid;
     }
     importPeer(hello);

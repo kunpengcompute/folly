@@ -25,7 +25,7 @@ namespace folly {
 
 bool UrmaInit::s_inited_ = false;
 urma_context_t* UrmaInit::s_ctx = nullptr;
-urma_seg_t* UrmaInit::s_pool_seg = nullptr;
+urma_target_seg_t* UrmaInit::s_pool_seg = nullptr;
 UrmaConfig UrmaInit::s_config;
 uint8_t UrmaInit::s_max_jfs_sge = 6;
 urma_eid_t UrmaInit::s_local_eid = {};
@@ -115,7 +115,20 @@ void UrmaInit::initMrPool() {
     return;
   }
 
-  s_pool_seg = urma_register_seg(s_ctx, s_mmap_base, s_mmap_size, 0);
+  // 注册 MR 段(参照 brpc urma_helper.cpp:369-379)
+  urma_reg_seg_flag_t seg_flag{};
+  seg_flag.bs.token_policy = URMA_TOKEN_NONE;
+  seg_flag.bs.access = URMA_ACCESS_READ | URMA_ACCESS_WRITE | URMA_ACCESS_ATOMIC;
+
+  urma_seg_cfg_t seg_cfg{};
+  seg_cfg.va = reinterpret_cast<uint64_t>(s_mmap_base);
+  seg_cfg.len = s_mmap_size;
+  seg_cfg.token_id = nullptr;
+  seg_cfg.flag = seg_flag;
+  seg_cfg.user_ctx = reinterpret_cast<uint64_t>(s_mmap_base);
+  seg_cfg.iova = 0;
+
+  s_pool_seg = urma_register_seg(s_ctx, &seg_cfg);
   if (!s_pool_seg) {
     XLOG(ERR) << "UrmaInit: urma_register_seg failed";
     munmap(s_mmap_base, s_mmap_size);
@@ -216,14 +229,16 @@ void UrmaInit::init(const UrmaConfig& config) {
   s_config = config;
 
   // 1. URMA 库初始化
-  if (urma_init() != URMA_SUCCESS) {
-    XLOG(ERR) << "UrmaInit: urma_init failed";
+  urma_init_attr_t init_attr = {};
+  urma_status_t status = urma_init(&init_attr);
+  if (status != URMA_SUCCESS && status != URMA_EEXIST) {
+    XLOG(ERR) << "UrmaInit: urma_init failed, status=" << status;
     return;
   }
 
   // 2. 设备发现 + 按名称选择(参照 brpc FLAGS_urma_device)
   int ndev = 0;
-  urma_device_t* devs = urma_get_device_list(&ndev);
+  urma_device_t** devs = urma_get_device_list(&ndev);
   if (!devs || ndev == 0) {
     XLOG(ERR) << "UrmaInit: no URMA device found";
     urma_uninit();
@@ -232,8 +247,8 @@ void UrmaInit::init(const UrmaConfig& config) {
   urma_device_t* found = nullptr;
   for (int i = 0; i < ndev; ++i) {
     if (s_config.dev_name.empty() ||
-        std::string(devs[i].name) == s_config.dev_name) {
-      found = &devs[i];
+        std::string(devs[i]->name) == s_config.dev_name) {
+      found = devs[i];
       break;
     }
   }
@@ -246,15 +261,15 @@ void UrmaInit::init(const UrmaConfig& config) {
   std::string device_name = found->name;
 
   // 3. 设备能力查询
-  urma_device_cap_t cap;
-  if (urma_query_device(found, &cap) != URMA_SUCCESS) {
+  urma_device_attr_t dev_attr;
+  if (urma_query_device(found, &dev_attr) != URMA_SUCCESS) {
     XLOG(ERR) << "UrmaInit: urma_query_device failed";
     urma_free_device_list(devs);
     urma_uninit();
     return;
   }
-  s_config.validateAndClamp(cap, 0, 0);
-  s_max_jfs_sge = cap.max_jfs_sge > 0 ? cap.max_jfs_sge : 6;
+  s_config.validateAndClamp(dev_attr.dev_cap, 0, 0);
+  s_max_jfs_sge = dev_attr.dev_cap.max_jfs_sge > 0 ? dev_attr.dev_cap.max_jfs_sge : 6;
 
   // 4. EID 发现(参照 brpc urma_get_eid_list)
   uint32_t eid_cnt = 0;
