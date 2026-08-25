@@ -27,6 +27,7 @@ bool UrmaInit::s_inited_ = false;
 urma_context_t* UrmaInit::s_ctx = nullptr;
 urma_seg_t* UrmaInit::s_pool_seg = nullptr;
 UrmaConfig UrmaInit::s_config;
+uint8_t UrmaInit::s_max_jfs_sge = 6;  // 默认 6,init 时从硬件查询覆盖
 
 static void* s_mmap_base = nullptr;
 static uint64_t s_mmap_size = 0;
@@ -230,6 +231,7 @@ void UrmaInit::init(const UrmaConfig& config) {
   urma_device_cap_t cap;
   urma_query_device(devs, &cap);
   s_config.validateAndClamp(cap, 0, 0);
+  s_max_jfs_sge = cap.max_jfs_sge > 0 ? cap.max_jfs_sge : 6;
 
   s_ctx = urma_create_context(devs, 0);
   urma_free_device_list(devs);

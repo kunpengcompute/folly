@@ -37,6 +37,13 @@ class UrmaInit {
   // 全局 context(MR 池 + URMA 对象创建都基于此)
   static urma_context_t* getContext() { return s_ctx; }
   static urma_seg_t* getPoolSeg() { return s_pool_seg; }
+  // 全局内存池的 target_seg(供 SGE.tseg 使用,NIC DMA 需要此句柄定位 MR 段)
+  static urma_target_seg_t* getPoolTseg() {
+    return s_pool_seg ? s_pool_seg->tseg : nullptr;
+  }
+
+  // 硬件能力(init 时查询,供 UrmaAsyncSocket 等使用)
+  static uint8_t getMaxJfsSge() { return s_max_jfs_sge; }
 
   // MR 内存池分配/释放(由 setIoBufBlockAllocFree 注入到 IoBufPool)
   static void* poolAlloc(size_t size);
@@ -53,6 +60,7 @@ class UrmaInit {
   static urma_context_t* s_ctx;
   static urma_seg_t* s_pool_seg;
   static UrmaConfig s_config;
+  static uint8_t s_max_jfs_sge;  // 硬件 max_jfs_sge(init 时查询)
 };
 
 // MR 内存池常量(public,供 UrmaInit.cpp 内部函数使用)
@@ -61,6 +69,11 @@ constexpr size_t URMA_MEDIUM_BUF_SIZE = 16384;
 constexpr size_t URMA_BIG_BUF_SIZE = 65536;
 constexpr size_t URMA_LARGE_BUF_SIZE = 1048576;
 constexpr size_t URMA_NUM_SHARDS = 64;
+
+// JFS/JFR RNR 重试参数(参照 UMQ umq_ub.c:21-23,内部固定不暴露给用户)
+constexpr uint8_t URMA_DEFAULT_RNR_RETRY = 6;       // 硬件自动重试次数
+constexpr uint8_t URMA_DEFAULT_MIN_RNR_TIMER = 19;   // 每次重试间隔 2μs×2^19 ≈ 1.05s
+constexpr uint8_t URMA_DEFAULT_ERR_TIMEOUT = 2;      // jetty 错误超时 4.096×2^2 = 16.4ms
 
 } // namespace folly
 
