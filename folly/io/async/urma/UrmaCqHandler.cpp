@@ -11,6 +11,7 @@
 
 #ifdef FOLLY_HAVE_URMA
 
+#include <folly/io/async/urma/UrmaAsyncSocket.h>
 #include <folly/io/async/urma/UrmaSharedJfr.h>
 
 namespace folly {

@@ -42,7 +42,7 @@ constexpr uint16_t IMPL_V2_VERSION = 1;
 
 constexpr uint32_t HELLO_ACK_VALUE = 0x00000001;
 
-struct HelloMessage {
+struct __attribute__((packed)) HelloMessage {
   uint16_t msg_len{HELLO_PACKET_LEN};
   uint16_t hello_ver{HELLO_V2_VERSION};
   uint16_t impl_ver{IMPL_V2_VERSION};
@@ -72,6 +72,7 @@ static_assert(sizeof(HelloMessage) == HELLO_BODY_LEN,
 class UrmaAsyncSocket;
 
 class UrmaHandshake : private AsyncTimeout {
+  friend class UrmaAsyncSocket;
  public:
   using ReadyCallback = std::function<void()>;
   using ErrorCallback = std::function<void(const std::string&)>;
@@ -117,6 +118,7 @@ class UrmaHandshake : private AsyncTimeout {
   Phase phase_{Phase::kIdle};
   v2_wire::HelloMessage local_hello_;
 
+  // peer_rx_buf_size_ 在握手完成后被 UrmaAsyncSocket::onHandshakeReady 读取
   uint32_t peer_rx_buf_size_{4096};
 
   ReadyCallback ready_cb_;

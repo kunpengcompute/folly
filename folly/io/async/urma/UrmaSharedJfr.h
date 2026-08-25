@@ -74,9 +74,10 @@ class UrmaSharedJfr {
   urma_jfr_t* fcJfr() const noexcept { return fc_jfr_; }
   urma_jfc_t* fcJfc() const noexcept { return fc_jfc_; }
 
- private:
+  // 构造函数(EventBaseLocal::try_emplace_with 需要访问)
   UrmaSharedJfr(EventBase* evb, const UrmaConfig& config);
 
+ private:
   void replenishRxBuf(uint32_t slot) noexcept;
   void fillFcRxBuf() noexcept;  // Phase 2 空实现
 

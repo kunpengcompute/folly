@@ -127,7 +127,7 @@ void UrmaHandshake::start(ReadyCallback ready_cb, ErrorCallback error_cb) {
       local_hello_.fc_jetty_id = socket_->res_.fc_jetty->jetty_id.id;
     }
     if (urma_context_t* ctx = UrmaInit::getContext()) {
-      memcpy(local_hello_.eid, ctx->eid.eid, 16);
+      memcpy(local_hello_.eid, UrmaInit::getLocalEid().eid, 16);
       local_hello_.uasid = ctx->uasid;
     }
     sendHello();
@@ -277,7 +277,7 @@ void UrmaHandshake::importPeer(const v2_wire::HelloMessage& hello) {
   urma_target_seg_t seg_info = {};
   memcpy(seg_info.eid.eid, hello.seg_eid, 16);
   seg_info.uasid = hello.seg_uasid;
-  seg_info.va = reinterpret_cast<void*>(hello.seg_va);
+  seg_info.va = hello.seg_va;  // uint64_t ← uint64_t
   seg_info.len = hello.seg_len;
   seg_info.token_id = hello.seg_token_id;
 
@@ -332,7 +332,7 @@ void UrmaHandshake::processRemoteHello(const v2_wire::HelloMessage& hello) {
       local_hello_.fc_jetty_id = socket_->res_.fc_jetty->jetty_id.id;
     }
     if (urma_context_t* ctx = UrmaInit::getContext()) {
-      memcpy(local_hello_.eid, ctx->eid.eid, 16);
+      memcpy(local_hello_.eid, UrmaInit::getLocalEid().eid, 16);
       local_hello_.uasid = ctx->uasid;
     }
     importPeer(hello);

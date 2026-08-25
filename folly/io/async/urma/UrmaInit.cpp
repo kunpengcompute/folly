@@ -27,7 +27,8 @@ bool UrmaInit::s_inited_ = false;
 urma_context_t* UrmaInit::s_ctx = nullptr;
 urma_seg_t* UrmaInit::s_pool_seg = nullptr;
 UrmaConfig UrmaInit::s_config;
-uint8_t UrmaInit::s_max_jfs_sge = 6;  // 默认 6,init 时从硬件查询覆盖
+uint8_t UrmaInit::s_max_jfs_sge = 6;
+urma_eid_t UrmaInit::s_local_eid = {};
 
 static void* s_mmap_base = nullptr;
 static uint64_t s_mmap_size = 0;
@@ -214,12 +215,13 @@ void UrmaInit::init(const UrmaConfig& config) {
   }
   s_config = config;
 
-  // 1. URMA 库初始化 + 设备发现
+  // 1. URMA 库初始化
   if (urma_init() != URMA_SUCCESS) {
     XLOG(ERR) << "UrmaInit: urma_init failed";
     return;
   }
 
+  // 2. 设备发现 + 按名称选择(参照 brpc FLAGS_urma_device)
   int ndev = 0;
   urma_device_t* devs = urma_get_device_list(&ndev);
   if (!devs || ndev == 0) {
@@ -227,13 +229,49 @@ void UrmaInit::init(const UrmaConfig& config) {
     urma_uninit();
     return;
   }
+  urma_device_t* found = nullptr;
+  for (int i = 0; i < ndev; ++i) {
+    if (s_config.dev_name.empty() ||
+        std::string(devs[i].name) == s_config.dev_name) {
+      found = &devs[i];
+      break;
+    }
+  }
+  if (!found) {
+    XLOG(ERR) << "UrmaInit: URMA device not found: " << s_config.dev_name;
+    urma_free_device_list(devs);
+    urma_uninit();
+    return;
+  }
+  std::string device_name = found->name;
 
+  // 3. 设备能力查询
   urma_device_cap_t cap;
-  urma_query_device(devs, &cap);
+  if (urma_query_device(found, &cap) != URMA_SUCCESS) {
+    XLOG(ERR) << "UrmaInit: urma_query_device failed";
+    urma_free_device_list(devs);
+    urma_uninit();
+    return;
+  }
   s_config.validateAndClamp(cap, 0, 0);
   s_max_jfs_sge = cap.max_jfs_sge > 0 ? cap.max_jfs_sge : 6;
 
-  s_ctx = urma_create_context(devs, 0);
+  // 4. EID 发现(参照 brpc urma_get_eid_list)
+  uint32_t eid_cnt = 0;
+  urma_eid_info_t* eids = urma_get_eid_list(found, &eid_cnt);
+  if (!eids || eid_cnt == 0) {
+    XLOG(ERR) << "UrmaInit: urma_get_eid_list failed";
+    urma_free_eid_list(eids);
+    urma_free_device_list(devs);
+    urma_uninit();
+    return;
+  }
+  // 保存本地 EID(供 HelloMessage 握手通告)
+  s_local_eid = eids[0].eid;
+
+  // 5. 创建 context(使用 eid_index,非硬编码 0)
+  s_ctx = urma_create_context(found, eids[0].eid_index);
+  urma_free_eid_list(eids);
   urma_free_device_list(devs);
   if (!s_ctx) {
     XLOG(ERR) << "UrmaInit: urma_create_context failed";
@@ -241,7 +279,7 @@ void UrmaInit::init(const UrmaConfig& config) {
     return;
   }
 
-  // 2. MR 内存池
+  // 6. MR 内存池
   initMrPool();
   if (!s_pool_seg) {
     XLOG(ERR) << "UrmaInit: MR pool init failed, URMA disabled";
@@ -251,7 +289,7 @@ void UrmaInit::init(const UrmaConfig& config) {
     return;
   }
 
-  // 3. folly IOBuf 注入(三步)
+  // 7. folly IOBuf 注入(三步)
   setIoBufBlockAllocFree(
       &UrmaInit::poolAlloc, &UrmaInit::poolFree, &UrmaInit::poolBufSize);
   IOBuf::enableMemoryPool();
@@ -259,7 +297,9 @@ void UrmaInit::init(const UrmaConfig& config) {
   IOBuf::enableUnifiedPoolMode();
 
   s_inited_ = true;
-  XLOG(INFO) << "UrmaInit: initialized successfully";
+  XLOG(INFO) << "UrmaInit: initialized, device=" << device_name
+             << " max_sge=" << static_cast<unsigned>(s_max_jfs_sge)
+             << " pool_size=" << s_mmap_size;
 }
 
 void UrmaInit::fini() {

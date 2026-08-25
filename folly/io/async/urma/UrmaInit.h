@@ -44,6 +44,10 @@ class UrmaInit {
 
   // 硬件能力(init 时查询,供 UrmaAsyncSocket 等使用)
   static uint8_t getMaxJfsSge() { return s_max_jfs_sge; }
+  static const UrmaConfig& getConfig() { return s_config; }
+
+  // 本地 EID(init 时从 urma_get_eid_list 获取,供 UrmaHandshake 填充 HelloMessage)
+  static urma_eid_t getLocalEid() { return s_local_eid; }
 
   // MR 内存池分配/释放(由 setIoBufBlockAllocFree 注入到 IoBufPool)
   static void* poolAlloc(size_t size);
@@ -60,7 +64,8 @@ class UrmaInit {
   static urma_context_t* s_ctx;
   static urma_seg_t* s_pool_seg;
   static UrmaConfig s_config;
-  static uint8_t s_max_jfs_sge;  // 硬件 max_jfs_sge(init 时查询)
+  static uint8_t s_max_jfs_sge;
+  static urma_eid_t s_local_eid;  // 硬件 max_jfs_sge(init 时查询)
 };
 
 // MR 内存池常量(public,供 UrmaInit.cpp 内部函数使用)

@@ -12,10 +12,6 @@ namespace {
 thread_local TLSBlockCache g_tls_cache;
 } // namespace
 
-<<<<<<< HEAD
-static IoBufBlock* allocateFromSystem() {
-  void* mem = std::malloc(gIoBufBlockSize);
-=======
 std::atomic<IoBufBlockSizeFn> g_size_fn{nullptr};
 
 void setIoBufBlockAllocFree(IoBufBlockAllocFn alloc_fn,
@@ -43,7 +39,6 @@ static inline void blockFree(void* ptr) {
 
 static IoBufBlock* allocateFromSystem(size_t size = gIoBufBlockSize) {
   void* mem = blockAlloc(size);
->>>>>>> cb210abbb (初始化)
   if (!mem) return nullptr;
   auto* b = static_cast<IoBufBlock*>(mem);
   b->magic = IoBufBlock::kBlockMagic;

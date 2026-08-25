@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <string>
 
 #include <folly/io/async/urma/stub/urma_api.h>
 #include <folly/logging/xlog.h>
@@ -38,6 +39,10 @@ constexpr uint32_t kUrmaJettyPerConnection = 2; // IO + FC,每连接 2 个 jetty
 constexpr uint32_t kUrmaTxJfcReservedSlots = 1; // flush_done CQE 预留 1 个 slot
 
 struct UrmaConfig {
+  // ── URMA 设备选择 ──
+  // 空字符串表示使用第一个可用设备(参照 brpc FLAGS_urma_device)
+  std::string dev_name;
+
   // ── 共享 JFR 接收侧 ──
   uint32_t rx_depth = kUrmaDefaultRxDepth;
   uint32_t fc_rx_depth = kUrmaDefaultFcRxDepth;

@@ -57,7 +57,7 @@ void UrmaAsyncSocket::ConnectCallback::connectErr(
 
 UrmaAsyncSocket::UrmaAsyncSocket(EventBase* evb, const SocketAddress& addr)
     : evb_(evb), state_(State::kConnecting) {
-  tcp_socket_ = std::make_unique<AsyncSocket>(evb, addr);
+  tcp_socket_ = AsyncSocket::newSocket(evb, addr);
   connect_cb_ = std::make_unique<ConnectCallback>();
   connect_cb_->self = this;
   tcp_socket_->connect(connect_cb_.get(), addr, 0);
@@ -90,7 +90,7 @@ void UrmaAsyncSocket::startHandshake(bool is_client) {
     return;
   }
   handshake_ = new UrmaHandshake(evb_, tcp_fd_, is_client, shared_,
-                                  UrmaInit::s_config, this);
+                                  UrmaInit::getConfig(), this);
   state_ = State::kHandshaking;
 
   // 注册 TCP fd 到 EventBase epoll,握手数据到达时触发 handlerReady
@@ -176,8 +176,8 @@ void UrmaAsyncSocket::writev(WriteCallback* cb, const iovec* vec, size_t count,
 void UrmaAsyncSocket::writeChain(WriteCallback* cb, std::unique_ptr<IOBuf>&& chain,
                                   WriteFlags flags) noexcept {
   if (state_ != State::kOpen) {
-    if (cb) cb->writeError(0, AsyncSocketException(
-        AsyncSocketException::NOT_OPEN, "socket not open"));
+    if (cb) cb->writeErr(0, AsyncSocketException(
+        AsyncSocketException::UNKNOWN, "socket not open"));
     return;
   }
 
@@ -204,7 +204,9 @@ void UrmaAsyncSocket::writeChain(WriteCallback* cb, std::unique_ptr<IOBuf>&& cha
 
     // 堆分配 SGE 数组:post 后 NIC 异步 DMA,栈数组会失效
     auto sge_arr = std::make_shared<std::vector<urma_sge_t>>(sge_capacity);
-    auto wr_chain_head = std::make_shared<IOBuf>();
+    // 用 shared_ptr 持有 IOBuf 链头,链头的 next_ 持有后续 IOBuf
+    // 初始为空 IOBuf(prependChain 到空 IOBuf 上创建链)
+    auto wr_chain_head = std::shared_ptr<IOBuf>(IOBuf::create(0).release());
 
     while (chain && num_sge < sge_capacity) {
       size_t iobuf_len = chain->length();
@@ -212,14 +214,14 @@ void UrmaAsyncSocket::writeChain(WriteCallback* cb, std::unique_ptr<IOBuf>&& cha
         break;  // 超 peer_rx_buf_size_,新开 WR
       }
       if (iobuf_len > peer_rx_buf_size_) {
-        if (cb) cb->writeError(total_posted, AsyncSocketException(
-            AsyncSocketException::OTHER, "IOBuf > peer_rx_buf_size not supported in Phase 2"));
+        if (cb) cb->writeErr(total_posted, AsyncSocketException(
+            AsyncSocketException::UNKNOWN, "IOBuf > peer_rx_buf_size not supported in Phase 2"));
         return;
       }
       (*sge_arr)[num_sge].addr = chain->writableData();
       (*sge_arr)[num_sge].len = static_cast<uint32_t>(iobuf_len);
       (*sge_arr)[num_sge].tseg = UrmaInit::getPoolTseg();
-      wr_chain_head->prependChain(chain->cloneCoalescedAsValue());
+      wr_chain_head->prependChain(chain->cloneCoalesced());
       sge_total += iobuf_len;
       num_sge++;
       chain = chain->pop();
@@ -256,10 +258,10 @@ void UrmaAsyncSocket::writeChain(WriteCallback* cb, std::unique_ptr<IOBuf>&& cha
       }
       return;  // 不回调 writeSuccess
     }
-    // 其他错误(URMA_FAIL/ENOMEM/EINVAL 等):回调 writeError
+    // 其他错误(URMA_FAIL/ENOMEM/EINVAL 等):回调 writeErr
     XLOG(ERR) << "UrmaAsyncSocket: post failed, status=" << ret;
-    if (cb) cb->writeError(total_posted, AsyncSocketException(
-        AsyncSocketException::OTHER, "urma_post_jetty_send_wr failed"));
+    if (cb) cb->writeErr(total_posted, AsyncSocketException(
+        AsyncSocketException::UNKNOWN, "urma_post_jetty_send_wr failed"));
     return;
   }
 

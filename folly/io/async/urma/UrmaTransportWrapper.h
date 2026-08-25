@@ -18,6 +18,7 @@
 
 #include <folly/io/async/AsyncTransport.h>
 #include <folly/io/async/EventBase.h>
+#include <folly/io/async/urma/UrmaAsyncSocket.h>
 
 namespace folly {
 

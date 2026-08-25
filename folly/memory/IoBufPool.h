@@ -12,8 +12,6 @@ constexpr size_t kMaxBlocksHardLimit = 256;  // 数组硬上限（指针数组 2
 extern size_t gIoBufBlockSize;
 extern size_t gMaxBlocksPerThread;           // 运行时可调（默认 8，上限 kMaxBlocksHardLimit）
 
-<<<<<<< HEAD
-=======
 /**
  * IoBufPool 底层 block 内存申请/释放函数签名
  *
@@ -51,7 +49,6 @@ void setIoBufBlockAllocFree(IoBufBlockAllocFn alloc_fn,
                             IoBufBlockFreeFn free_fn,
                             IoBufBlockSizeFn size_fn = nullptr);
 
->>>>>>> cb210abbb (初始化)
 struct IoBufBlock {
   static constexpr uint32_t kBlockMagic = 0x12345678;
 

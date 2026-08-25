@@ -44,6 +44,7 @@ class UrmaHandshake;
 class UrmaCqHandler;
 
 class UrmaAsyncSocket : public AsyncTransport {
+  friend class UrmaHandshake;
  public:
   // 客户端构造
   UrmaAsyncSocket(EventBase* evb, const SocketAddress& addr);
@@ -67,6 +68,7 @@ class UrmaAsyncSocket : public AsyncTransport {
                   WriteFlags flags = WriteFlags::NONE) noexcept override;
 
   // ---------- AsyncTransport ----------
+  EventBase* getEventBase() const override { return evb_; }
   void close() override;
   void closeNow() override;
   void shutdownWrite() override;
@@ -144,7 +146,7 @@ class UrmaAsyncSocket : public AsyncTransport {
 
   // TCP connect
   std::unique_ptr<ConnectCallback> connect_cb_;
-  std::unique_ptr<AsyncSocket> tcp_socket_;  // 用于 TCP connect + 握手数据传输
+  AsyncSocket::UniquePtr tcp_socket_;  // 用于 TCP connect + 握手数据传输
 
   // URMA 资源(握手完成后填充)
   UrmaSharedJfr* shared_{nullptr};

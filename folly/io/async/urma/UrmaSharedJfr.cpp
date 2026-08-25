@@ -12,6 +12,7 @@
 #ifdef FOLLY_HAVE_URMA
 
 #include <folly/io/async/EventBase.h>
+#include <folly/io/async/urma/UrmaAsyncSocket.h>
 #include <folly/io/async/urma/UrmaCqHandler.h>
 #include <folly/logging/xlog.h>
 
@@ -24,7 +25,7 @@ EventBaseLocal<std::unique_ptr<UrmaSharedJfr>>& UrmaSharedJfr::registry() {
 
 UrmaSharedJfr* UrmaSharedJfr::getOrCreate(EventBase* evb) {
   auto& up = registry().try_emplace_with(*evb, [evb]() {
-    return std::make_unique<UrmaSharedJfr>(evb, UrmaInit::s_config);
+    return std::make_unique<UrmaSharedJfr>(evb, UrmaInit::getConfig());
   });
   return up.get();
 }
