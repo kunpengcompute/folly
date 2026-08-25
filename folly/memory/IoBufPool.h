@@ -12,6 +12,46 @@ constexpr size_t kMaxBlocksHardLimit = 256;  // 数组硬上限（指针数组 2
 extern size_t gIoBufBlockSize;
 extern size_t gMaxBlocksPerThread;           // 运行时可调（默认 8，上限 kMaxBlocksHardLimit）
 
+<<<<<<< HEAD
+=======
+/**
+ * IoBufPool 底层 block 内存申请/释放函数签名
+ *
+ * 默认走 std::malloc / std::free,保持原 folly 行为不变。
+ * 业务可通过 setIoBufBlockAllocFree() 注入自定义实现(如 DTOE MR 内存池),
+ * 注入后所有 IoBufBlock 分配/回收都走注入函数,使 IOBuf TLS 缓存复用的
+ * block 全部来自业务指定的内存区(已 MR 注册等)。
+ *
+ * 约束:
+ *   - 必须在首次 IOBuf::create 之前调用(启动期单次设置)
+ *   - alloc 返回的内存必须满足 sizeof(IoBufBlock) + payload 连续可用
+ *   - free 必须能处理 alloc 返回的指针
+ *   - 设置后不可改回 nullptr(避免 TLS 中已缓存的 block 释放路径错乱)
+ */
+using IoBufBlockAllocFn = void* (*)(size_t size);
+using IoBufBlockFreeFn  = void  (*)(void* ptr);
+using IoBufBlockSizeFn  = size_t (*)(size_t requested_size);
+
+extern std::atomic<IoBufBlockSizeFn> g_size_fn;  // size 查询函数(默认 nullptr)
+
+/**
+ * 注入自定义 block alloc/free 函数
+ *
+ * 默认 nullptr,走 std::malloc / std::free。
+ * 业务(如 folly::DtoeInit)在启动期调用此函数注入 kbdtoe_mempool_alloc /
+ * kbdtoe_mempool_free,使 folly IOBuf 内置线程缓存复用的 block 全部 MR 注册。
+ *
+ * size_fn: 可选(默认 nullptr),返回 alloc 实际返回的 buffer 大小(可能 ≥ requested_size,
+ * 如分级内存池返回固定档位 4KB/16KB/64KB/1MB)。nullptr 时按 requested_size 计算 capacity。
+ * URMA 分级内存池注入此函数以使 capacity 认实际 buffer 大小,消除碎片浪费。
+ *
+ * 必须在第一个 IOBuf::create 之前调用。
+ */
+void setIoBufBlockAllocFree(IoBufBlockAllocFn alloc_fn,
+                            IoBufBlockFreeFn free_fn,
+                            IoBufBlockSizeFn size_fn = nullptr);
+
+>>>>>>> cb210abbb (初始化)
 struct IoBufBlock {
   static constexpr uint32_t kBlockMagic = 0x12345678;
 

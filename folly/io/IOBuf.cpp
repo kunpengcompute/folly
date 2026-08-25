@@ -329,11 +329,10 @@ unique_ptr<IOBuf> IOBuf::create(std::size_t capacity) {
 
   if (sMemoryPoolEnabled.load(std::memory_order_relaxed)) {
     size_t blockDataCap = gIoBufBlockSize - sizeof(IoBufBlock);
-    if (capacity <= blockDataCap) {
+    if (sUnifiedPoolMode.load(std::memory_order_acquire) || capacity <= blockDataCap) {
       return createFromPoolShared(capacity);
     }
-    // For large capacities, fall through to original path
-    // (createSeparate handles large allocations correctly)
+    // sUnifiedPoolMode=false && cap > blockDataCap → 原路径 createCombined/createSeparate
   }
 
   // For smaller-sized buffers, allocate the IOBuf, SharedInfo, and the buffer
@@ -402,6 +401,11 @@ unique_ptr<IOBuf> IOBuf::createSeparate(std::size_t capacity) {
 }
 
 std::atomic<bool> IOBuf::sMemoryPoolEnabled{false};
+std::atomic<bool> IOBuf::sUnifiedPoolMode{false};
+
+void IOBuf::enableUnifiedPoolMode() {
+  sUnifiedPoolMode.store(true, std::memory_order_release);
+}
 
 void IOBuf::enableMemoryPool() {
   sMemoryPoolEnabled.store(true, std::memory_order_relaxed);

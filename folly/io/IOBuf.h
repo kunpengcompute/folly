@@ -267,6 +267,9 @@ class IOBuf {
   static void setMaxBlocksPerThread(std::size_t n);
   static std::atomic<bool> sMemoryPoolEnabled;
 
+  static void enableUnifiedPoolMode();
+  static std::atomic<bool> sUnifiedPoolMode;
+
   /**
    * Create a new IOBuf, using a single memory allocation to allocate space
    * for both the IOBuf object and the data storage space.
