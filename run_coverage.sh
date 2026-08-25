@@ -208,23 +208,22 @@ if ! find /usr -name 'libgtest.a' 2>/dev/null | grep -q .; then
   fi
 fi
 
-# 确保 cmake 能找到 gmock（创建 pkg-config 或 cmake config）
-if find /usr -name 'libgmock.a' 2>/dev/null | grep -q .; then
-  GMOCK_LIB=$(find /usr -name 'libgmock.a' 2>/dev/null | head -1)
-  GMOCK_MAIN_LIB=$(find /usr -name 'libgmock_main.a' 2>/dev/null | head -1)
-  GTEST_LIB=$(find /usr -name 'libgtest.a' 2>/dev/null | head -1)
-  GTEST_MAIN_LIB=$(find /usr -name 'libgtest_main.a' 2>/dev/null | head -1)
-  GTEST_INCLUDE=$(find /usr/include -name 'gtest.h' 2>/dev/null | head -1 | xargs dirname 2>/dev/null | xargs dirname 2>/dev/null)
-  
-  if [ -n "$GMOCK_LIB" ]; then
-    # 设置环境变量供 cmake 的 FindGMock.cmake 使用
-    export LIBGMOCK_LIBRARY="$GMOCK_LIB"
-    export LIBGMOCK_MAIN_LIBRARY="$GMOCK_MAIN_LIB"
-    export LIBGTEST_LIBRARY="$GTEST_LIB"
-    export LIBGTEST_MAIN_LIBRARY="$GTEST_MAIN_LIB"
-    export GMOCK_INCLUDE_DIR="${GTEST_INCLUDE}/gmock"
-    export GTEST_INCLUDE_DIR="$GTEST_INCLUDE"
-  fi
+# 查找 gtest/gmock 库路径（传给 cmake，为空则 cmake 自己查找）
+GMOCK_LIB=$(find /usr -name 'libgmock.a' 2>/dev/null | head -1)
+GMOCK_MAIN_LIB=$(find /usr -name 'libgmock_main.a' 2>/dev/null | head -1)
+GTEST_LIB=$(find /usr -name 'libgtest.a' 2>/dev/null | head -1)
+GTEST_MAIN_LIB=$(find /usr -name 'libgtest_main.a' 2>/dev/null | head -1)
+GTEST_INCLUDE_DIR=$(find /usr/include -name 'gtest.h' 2>/dev/null | head -1 | xargs dirname 2>/dev/null | xargs dirname 2>/dev/null)
+GMOCK_INCLUDE_DIR="${GTEST_INCLUDE_DIR}/gmock"
+
+# 同时设置环境变量（双保险：cmake 变量 + 环境变量）
+if [ -n "$GMOCK_LIB" ]; then
+  export LIBGMOCK_LIBRARY="$GMOCK_LIB"
+  export LIBGMOCK_MAIN_LIBRARY="$GMOCK_MAIN_LIB"
+  export LIBGTEST_LIBRARY="$GTEST_LIB"
+  export LIBGTEST_MAIN_LIBRARY="$GTEST_MAIN_LIB"
+  export GMOCK_INCLUDE_DIR="$GMOCK_INCLUDE_DIR"
+  export GTEST_INCLUDE_DIR="$GTEST_INCLUDE_DIR"
 fi
 
 # 常见 C++ 项目依赖（folly/fbthrift 需要）
@@ -304,12 +303,12 @@ cmake "$SRC_DIR" \
   -DBUILD_TESTS=ON \
   -DDOUBLE_CONVERSION_LIBRARY=/usr/lib/aarch64-linux-gnu/libdouble-conversion.so \
   -DDOUBLE_CONVERSION_INCLUDE_DIR=/usr/include/double-conversion \
-  -DGMOCK_LIBRARY=/usr/lib/aarch64-linux-gnu/libgmock.a \
-  -DGMOCK_MAIN_LIBRARY=/usr/lib/aarch64-linux-gnu/libgmock_main.a \
-  -DGMOCK_INCLUDE_DIR=/usr/include \
-  -DGTEST_LIBRARY=/usr/lib/aarch64-linux-gnu/libgtest.a \
-  -DGTEST_MAIN_LIBRARY=/usr/lib/aarch64-linux-gnu/libgtest_main.a \
-  -DGTEST_INCLUDE_DIR=/usr/include \
+  ${GMOCK_LIB:+-DLIBGMOCK_LIBRARY="$GMOCK_LIB"} \
+  ${GMOCK_MAIN_LIB:+-DLIBGMOCK_MAIN_LIBRARY="$GMOCK_MAIN_LIB"} \
+  ${GTEST_LIB:+-DLIBGTEST_LIBRARY="$GTEST_LIB"} \
+  ${GTEST_MAIN_LIB:+-DLIBGTEST_MAIN_LIBRARY="$GTEST_MAIN_LIB"} \
+  ${GMOCK_INCLUDE_DIR:+-DGMOCK_INCLUDE_DIR="$GMOCK_INCLUDE_DIR"} \
+  ${GTEST_INCLUDE_DIR:+-DGTEST_INCLUDE_DIR="$GTEST_INCLUDE_DIR"} \
   2>&1 | tee /tmp/cmake_output.log | tail -20
 
 if [ ! -f CMakeCache.txt ] || ! grep -q "CMAKE_PROJECT_NAME" CMakeCache.txt 2>/dev/null; then
