@@ -168,6 +168,9 @@ UrmaSharedJfr::UrmaSharedJfr(EventBase* evb, const UrmaConfig& config)
 }
 
 UrmaSharedJfr::~UrmaSharedJfr() {
+  // 销毁顺序: CqHandler → JFR(停止产生新CQE) → JFC → JFCE
+  // JFR 依赖 JFC(完成队列),JFC 依赖 JFCE(事件fd)
+  // 先停 CqHandler(取消 epoll 注册)
   if (io_cq_handler_) {
     delete io_cq_handler_;
     io_cq_handler_ = nullptr;
@@ -176,29 +179,32 @@ UrmaSharedJfr::~UrmaSharedJfr() {
     delete fc_cq_handler_;
     fc_cq_handler_ = nullptr;
   }
+  // 再删 JFR(停止接收,不再产生新 CQE)
+  if (io_jfr_) {
+    urma_delete_jfr(io_jfr_);
+    io_jfr_ = nullptr;
+  }
   if (fc_jfr_) {
     urma_delete_jfr(fc_jfr_);
     fc_jfr_ = nullptr;
   }
-  if (fc_jfce_) {
-    urma_delete_jfce(fc_jfce_);
-    fc_jfce_ = nullptr;
+  // 再删 JFC(CQE 队列)
+  if (io_jfc_) {
+    urma_delete_jfc(io_jfc_);
+    io_jfc_ = nullptr;
   }
   if (fc_jfc_) {
     urma_delete_jfc(fc_jfc_);
     fc_jfc_ = nullptr;
   }
-  if (io_jfr_) {
-    urma_delete_jfr(io_jfr_);
-    io_jfr_ = nullptr;
-  }
+  // 最后删 JFCE(关闭事件 fd)
   if (io_jfce_) {
     urma_delete_jfce(io_jfce_);
     io_jfce_ = nullptr;
   }
-  if (io_jfc_) {
-    urma_delete_jfc(io_jfc_);
-    io_jfc_ = nullptr;
+  if (fc_jfce_) {
+    urma_delete_jfce(fc_jfce_);
+    fc_jfce_ = nullptr;
   }
   for (auto& rb : rx_bufs_) {
     if (rb.data) {

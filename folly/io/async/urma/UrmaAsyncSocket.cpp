@@ -120,11 +120,12 @@ void UrmaAsyncSocket::onHandshakeReady() {
   }
 
   // 注册 socket 到共享层路由表
-  if (res_.io_jetty) {
-    shared_->registerSocket(res_.io_jetty->jetty_id.id, this);
+  // key = 远端 jetty_id.id(= CQE.remote_id.id),pollAndDispatch 按此路由
+  if (res_.remote_jetty) {
+    shared_->registerSocket(res_.remote_jetty->id.id, this);
   }
-  if (res_.fc_jetty) {
-    shared_->registerFcSocket(res_.fc_jetty->jetty_id.id, this);
+  if (res_.remote_fc_jetty) {
+    shared_->registerFcSocket(res_.remote_fc_jetty->id.id, this);
   }
 
   // TX JFCE handler: EAGAIN(SQ 满)时 urma_rearm_jfc 武装, CQE 到达唤醒 pollTx + retryWrite
@@ -245,7 +246,8 @@ void UrmaAsyncSocket::writeChain(WriteCallback* cb, std::unique_ptr<IOBuf>&& cha
     sbuf_.push_back(WrRefs{std::move(sge_arr), std::move(wr_chain_head)});
 
     total_posted += sge_total;
-    urma_status_t ret = urma_post_jetty_send_wr(res_.io_jetty, &wr, nullptr);
+    urma_jfs_wr_t* bad_wr = nullptr;
+    urma_status_t ret = urma_post_jetty_send_wr(res_.io_jetty, &wr, &bad_wr);
     if (ret == URMA_SUCCESS) {
       continue;  // post 成功,处理下一个 IOBuf
     }
@@ -338,11 +340,11 @@ void UrmaAsyncSocket::destroyUrmaResources() {
     tx_cq_handler_ = nullptr;
   }
   if (shared_) {
-    if (res_.io_jetty) {
-      shared_->unregisterSocket(res_.io_jetty->jetty_id.id);
+    if (res_.remote_jetty) {
+      shared_->unregisterSocket(res_.remote_jetty->id.id);
     }
-    if (res_.fc_jetty) {
-      shared_->unregisterFcSocket(res_.fc_jetty->jetty_id.id);
+    if (res_.remote_fc_jetty) {
+      shared_->unregisterFcSocket(res_.remote_fc_jetty->id.id);
     }
   }
   if (res_.remote_fc_jetty) {

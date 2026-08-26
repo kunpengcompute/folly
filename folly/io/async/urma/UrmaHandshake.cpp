@@ -349,8 +349,8 @@ void UrmaHandshake::processRemoteHello(const v2_wire::HelloMessage& hello) {
     }
     importPeer(hello);
     // 发 Hello(通过 TCP fd)
-    phase_ = Phase::kSendHello;
-    scheduleTimeout(handshake_timeout_ms_);
+    sendHello();
+    // sendHello 内部设置 phase_ = kWaitAck 并启动超时
   }
 }
 
