@@ -138,13 +138,13 @@ void UrmaHandshake::start(ReadyCallback ready_cb, ErrorCallback error_cb) {
   } else {
     // 服务端:等客户端 Hello
     phase_ = Phase::kWaitHello;
-    scheduleTimeout(HANDSHAKE_TIMEOUT_MS);
+    scheduleTimeout(handshake_timeout_ms_);
   }
 }
 
 void UrmaHandshake::sendHello() {
   phase_ = Phase::kSendHello;
-  scheduleTimeout(HANDSHAKE_TIMEOUT_MS);
+  scheduleTimeout(handshake_timeout_ms_);
 
   // 序列化 HelloMessage 并通过 TCP fd 发送
   uint8_t buf[v2_wire::HELLO_PACKET_LEN];
@@ -272,11 +272,13 @@ void UrmaHandshake::importPeer(const v2_wire::HelloMessage& hello) {
   urma_context_t* ctx = UrmaInit::getContext();
   auto& res = socket_->res_;
 
-  // 构造 rjetty for IO
+  // 构造 rjetty for IO(参照 brpc urma_endpoint.cpp:567-577)
   urma_rjetty_t rjetty = {};
-  rjetty.jetty_id.id = hello.jetty_id;
   memcpy(rjetty.jetty_id.eid.raw, hello.eid, 16);
+  rjetty.jetty_id.uasid = hello.uasid;
+  rjetty.jetty_id.id = hello.jetty_id;
   rjetty.trans_mode = URMA_TM_RM;
+  rjetty.type = URMA_JETTY;
   rjetty.tp_type = URMA_CTP;
 
   // 构造 peer_seg(参照 brpc urma_endpoint.cpp:546-560)
@@ -305,9 +307,11 @@ void UrmaHandshake::importPeer(const v2_wire::HelloMessage& hello) {
 
   // import FC jetty
   urma_rjetty_t fc_rjetty = {};
-  fc_rjetty.jetty_id.id = hello.fc_jetty_id;
   memcpy(fc_rjetty.jetty_id.eid.raw, hello.eid, 16);
+  fc_rjetty.jetty_id.uasid = hello.uasid;
+  fc_rjetty.jetty_id.id = hello.fc_jetty_id;
   fc_rjetty.trans_mode = URMA_TM_RM;
+  fc_rjetty.type = URMA_JETTY;
   fc_rjetty.tp_type = URMA_CTP;
 
   res.remote_fc_jetty = urma_import_jetty(ctx, &fc_rjetty, &token);
@@ -346,7 +350,7 @@ void UrmaHandshake::processRemoteHello(const v2_wire::HelloMessage& hello) {
     importPeer(hello);
     // 发 Hello(通过 TCP fd)
     phase_ = Phase::kSendHello;
-    scheduleTimeout(HANDSHAKE_TIMEOUT_MS);
+    scheduleTimeout(handshake_timeout_ms_);
   }
 }
 

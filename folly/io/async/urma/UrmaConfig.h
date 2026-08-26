@@ -55,6 +55,9 @@ struct UrmaConfig {
   // ── 流控 ──
   uint32_t idle_timeout_ms = kUrmaDefaultIdleTimeoutMs;
 
+  // ── 握手 ──
+  uint32_t handshake_timeout_ms = 5000;  // URMA 握手超时(毫秒)
+
   // ── MR 内存池 ──
   uint64_t pool_size = kUrmaDefaultPoolSize;
 

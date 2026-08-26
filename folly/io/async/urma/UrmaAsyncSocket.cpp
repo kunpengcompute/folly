@@ -42,8 +42,9 @@ void UrmaAsyncSocket::TcpHandshakeHandler::handlerReady(
 // ── ConnectCallback ──
 
 void UrmaAsyncSocket::ConnectCallback::connectSuccess() noexcept {
-  self->tcp_fd_ = self->tcp_socket_->getNetworkSocket().toFd();
-  self->tcp_socket_.reset();  // 释放 AsyncSocket,保留 fd
+  // detachNetworkSocket 转移 fd 所有权,之后 reset 不会关闭 fd
+  self->tcp_fd_ = self->tcp_socket_->detachNetworkSocket().toFd();
+  self->tcp_socket_.reset();
   self->startHandshake(true);
 }
 
@@ -91,6 +92,7 @@ void UrmaAsyncSocket::startHandshake(bool is_client) {
   }
   handshake_ = new UrmaHandshake(evb_, tcp_fd_, is_client, shared_,
                                   UrmaInit::getConfig(), this);
+  handshake_->setHandshakeTimeoutMs(UrmaInit::getConfig().handshake_timeout_ms);
   state_ = State::kHandshaking;
 
   // 注册 TCP fd 到 EventBase epoll,握手数据到达时触发 handlerReady

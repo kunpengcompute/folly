@@ -100,7 +100,22 @@ UrmaSharedJfr::UrmaSharedJfr(EventBase* evb, const UrmaConfig& config)
     wr->src.num_sge = 1;
     wr->user_ctx = i;  // slot 索引
     wr->next = nullptr;
-    urma_post_jfr_wr(io_jfr_, wr, nullptr);
+    urma_jfr_wr_t* bad_wr = nullptr;
+    urma_status_t ret = urma_post_jfr_wr(io_jfr_, wr, &bad_wr);
+    if (ret != URMA_SUCCESS) {
+      XLOG(ERR) << "UrmaSharedJfr: post_jfr_wr failed at slot " << i
+                << ", status=" << ret;
+      UrmaInit::poolFree(rx_bufs_[i].data);
+      rx_bufs_[i].data = nullptr;
+      rx_bufs_.resize(i);  // 截断,析构清理已分配的
+      urma_delete_jfr(io_jfr_);
+      io_jfr_ = nullptr;
+      urma_delete_jfc(io_jfc_);
+      io_jfc_ = nullptr;
+      urma_delete_jfce(io_jfce_);
+      io_jfce_ = nullptr;
+      return;
+    }
   }
 
   // IO CqHandler
@@ -195,7 +210,12 @@ UrmaSharedJfr::~UrmaSharedJfr() {
 
 void UrmaSharedJfr::replenishRxBuf(uint32_t slot) noexcept {
   if (slot >= rx_bufs_.size()) return;
-  urma_post_jfr_wr(io_jfr_, &rx_bufs_[slot].wr, nullptr);
+  urma_jfr_wr_t* bad_wr = nullptr;
+  urma_status_t ret = urma_post_jfr_wr(io_jfr_, &rx_bufs_[slot].wr, &bad_wr);
+  if (ret != URMA_SUCCESS) {
+    XLOG(WARN) << "UrmaSharedJfr: replenishRxBuf post failed at slot "
+               << slot << ", status=" << ret;
+  }
 }
 
 void UrmaSharedJfr::fillFcRxBuf() noexcept {

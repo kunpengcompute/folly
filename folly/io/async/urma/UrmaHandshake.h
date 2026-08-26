@@ -80,6 +80,10 @@ class UrmaHandshake : private AsyncTimeout {
   UrmaHandshake(EventBase* evb, int tcp_fd, bool is_client,
                 UrmaSharedJfr* shared, const UrmaConfig& config,
                 class UrmaAsyncSocket* socket);
+
+  // 设置握手超时(毫秒),默认 5000
+  void setHandshakeTimeoutMs(uint32_t ms) { handshake_timeout_ms_ = ms; }
+
   ~UrmaHandshake() override;
 
   // 启动握手(客户端发 Hello, 服务端等 Hello)
@@ -127,7 +131,7 @@ class UrmaHandshake : private AsyncTimeout {
   // 握手缓冲区(收到的 TCP 数据累积)
   std::vector<uint8_t> recv_buf_;
 
-  static constexpr uint32_t HANDSHAKE_TIMEOUT_MS = 5000;
+  uint32_t handshake_timeout_ms_{5000};  // 握手超时(可配置)
 };
 
 } // namespace folly
