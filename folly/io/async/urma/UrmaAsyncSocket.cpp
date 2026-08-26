@@ -57,7 +57,7 @@ void UrmaAsyncSocket::ConnectCallback::connectErr(
 
 UrmaAsyncSocket::UrmaAsyncSocket(EventBase* evb, const SocketAddress& addr)
     : evb_(evb), state_(State::kConnecting) {
-  tcp_socket_ = AsyncSocket::newSocket(evb, addr);
+  tcp_socket_ = AsyncSocket::newSocket(evb);
   connect_cb_ = std::make_unique<ConnectCallback>();
   connect_cb_->self = this;
   tcp_socket_->connect(connect_cb_.get(), addr, 0);

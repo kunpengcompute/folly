@@ -24,6 +24,14 @@ EventBaseLocal<std::unique_ptr<UrmaSharedJfr>>& UrmaSharedJfr::registry() {
 }
 
 UrmaSharedJfr* UrmaSharedJfr::getOrCreate(EventBase* evb) {
+  auto* existing = get(evb);
+  if (existing && existing->isValid()) {
+    return existing;
+  }
+  // 旧的无效或不存在,删除后重新创建
+  if (existing) {
+    registry().erase(*evb);
+  }
   auto& up = registry().try_emplace_with(*evb, [evb]() {
     return std::make_unique<UrmaSharedJfr>(evb, UrmaInit::getConfig());
   });
@@ -65,6 +73,7 @@ UrmaSharedJfr::UrmaSharedJfr(EventBase* evb, const UrmaConfig& config)
   urma_jfr_cfg_t io_jfr_cfg = {};
   io_jfr_cfg.depth = config_.rx_depth;
   io_jfr_cfg.trans_mode = URMA_TM_RM;
+  io_jfr_cfg.max_sge = 1;  // 每个 recv WR 用 1 个 SGE(参照 brpc)
   io_jfr_cfg.min_rnr_timer = URMA_DEFAULT_MIN_RNR_TIMER;
   io_jfr_cfg.jfc = io_jfc_;
   io_jfr_ = urma_create_jfr(ctx, &io_jfr_cfg);
@@ -120,6 +129,7 @@ UrmaSharedJfr::UrmaSharedJfr(EventBase* evb, const UrmaConfig& config)
   urma_jfr_cfg_t fc_jfr_cfg = {};
   fc_jfr_cfg.depth = config_.fc_rx_depth;
   fc_jfr_cfg.trans_mode = URMA_TM_RM;
+  fc_jfr_cfg.max_sge = 1;  // FC recv WR 用 1 个 SGE
   fc_jfr_cfg.min_rnr_timer = URMA_DEFAULT_MIN_RNR_TIMER;
   fc_jfr_cfg.jfc = fc_jfc_;
   fc_jfr_ = urma_create_jfr(ctx, &fc_jfr_cfg);
@@ -137,6 +147,7 @@ UrmaSharedJfr::UrmaSharedJfr(EventBase* evb, const UrmaConfig& config)
   credit_idle_.store(config_.rx_depth);
   credit_allocated_.store(0);
 
+  valid_ = true;  // 全部资源创建成功
   XLOG(INFO) << "UrmaSharedJfr: initialized, rx_depth=" << config_.rx_depth
              << " fc_rx_depth=" << config_.fc_rx_depth;
 }

@@ -50,6 +50,9 @@ class UrmaSharedJfr {
 
   ~UrmaSharedJfr();
 
+  // 构造是否完全成功(URMA 资源全部创建)
+  bool isValid() const noexcept { return valid_; }
+
   void pollAndDispatch() noexcept;
   void pollFcAndDispatch() noexcept;
 
@@ -83,6 +86,7 @@ class UrmaSharedJfr {
 
   EventBase* evb_;
   UrmaConfig config_;
+  bool valid_{false};  // 构造成功标记
 
   // IO 组
   urma_jfr_t* io_jfr_{nullptr};
