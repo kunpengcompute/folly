@@ -154,9 +154,10 @@ class EchoAcceptCb : public AsyncServerSocket::AcceptCallback {
   EventBase* evb_;
 };
 
-int runServer(uint16_t port) {
+int runServer(const std::string& devName, uint16_t port) {
 #ifdef FOLLY_HAVE_URMA
   UrmaConfig config;
+  config.dev_name = devName;
   config.pool_size = 64 * 1024 * 1024;  // 64MB(测试用小池)
   UrmaInit::init(config);
 #endif
@@ -236,9 +237,10 @@ class ClientConn : public AsyncReader::ReadCallback,
   char read_buf_[4096];
 };
 
-int runClient(const std::string& serverIp, uint16_t port) {
+int runClient(const std::string& devName, const std::string& serverIp, uint16_t port) {
 #ifdef FOLLY_HAVE_URMA
   UrmaConfig config;
+  config.dev_name = devName;
   config.pool_size = 64 * 1024 * 1024;  // 64MB(测试用小池)
   UrmaInit::init(config);
 #endif
@@ -278,24 +280,27 @@ int runClient(const std::string& serverIp, uint16_t port) {
 int main(int argc, char** argv) {
   if (argc < 2) {
     std::cerr << "usage:\n"
-              << "  " << argv[0] << " server <port>\n"
-              << "  " << argv[0] << " client <server_ip> <port>\n"
+              << "  " << argv[0] << " server <port> [dev_name]\n"
+              << "  " << argv[0] << " client <server_ip> <port> [dev_name]\n"
+              << "  dev_name: URMA device name (optional, empty = first device)\n"
               << "  (mode: " << kMode << ")\n";
     return 1;
   }
   std::string mode = argv[1];
   if (mode == "server") {
     if (argc < 3) {
-      std::cerr << "server needs: <port>\n";
+      std::cerr << "server needs: <port> [dev_name]\n";
       return 1;
     }
-    return runServer(static_cast<uint16_t>(std::stoi(argv[2])));
+    std::string devName = (argc >= 4) ? argv[3] : "";
+    return runServer(devName, static_cast<uint16_t>(std::stoi(argv[2])));
   } else if (mode == "client") {
     if (argc < 4) {
-      std::cerr << "client needs: <server_ip> <port>\n";
+      std::cerr << "client needs: <server_ip> <port> [dev_name]\n";
       return 1;
     }
-    return runClient(argv[2], static_cast<uint16_t>(std::stoi(argv[3])));
+    std::string devName = (argc >= 5) ? argv[4] : "";
+    return runClient(devName, argv[2], static_cast<uint16_t>(std::stoi(argv[3])));
   }
   std::cerr << "unknown mode: " << mode << "\n";
   return 1;
