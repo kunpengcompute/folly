@@ -173,7 +173,8 @@ v1.0.0采用混合模式：读操作使用io_uring multishot，写操作使用�
 正式压测应先预热，再交替运行基线与优化组，避免温度、频率和缓存状态造成单向偏差。
 
 ## 修订记录
-|发布日期|修订记录|
-| :---| :---|
-|2026-9-30|第二次正式发布:<br>• 新增 `fbthrift_folly_benchmark` 并在benchmark侧布置外部接口  `setBlockSize()`, `enableMemoryPool()`，默认大小512KB。|
-|2026-6-30|第一次正式发布:<br>• 新增 `folly Benchmark` 支持对比 `epoll/io uring` 在端到端的性能比对。|
+
+|文档版本|发布日期|修改说明|
+| :---| :---| :---|
+|02|2026-9-30|第二次正式发布:<br>• 新增 `fbthrift_folly_benchmark` 并在benchmark侧布置外部接口  `setBlockSize()`, `enableMemoryPool()`，默认大小512KB。|
+|01|2026-6-30|第一次正式发布:<br>• 新增 `folly Benchmark` 支持对比 `epoll/io uring` 在端到端的性能比对。|

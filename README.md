@@ -1,6 +1,7 @@
 # Folly性能优化补丁介绍
 
 简体中文|[English]()
+
 ## 最新消息
 
 - 2026.09.30：发布Follyv1.1.0版本补丁，新增IOBuf TLS内存池，通过线程本地数据块复用和连续slice切分减少高QPS场景下的`malloc/free`。
@@ -54,7 +55,7 @@ fbthrift/
 | --------- | --------- |
 | [快速入门](docs/zh/quick_start.md) | 提供io_uring与IOBuf TLS内存池的编译、启用和验证指导。 |
 | [版本说明书](docs/zh/release_notes.md) | 提供Folly v1.1.0版本信息、兼容性约束和特性更新。 |
-| [API参考](docs/zh/api.md) | 按版本提供TLS内存池和io_uring相关接口说明。 |
+| [API参考](docs/zh/api_reference.md) | 按版本提供TLS内存池和io_uring相关接口说明。 |
 
 ## 免责声明
 
