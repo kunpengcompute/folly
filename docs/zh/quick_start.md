@@ -1,132 +1,180 @@
 # 快速入门
 
-## 环境要求
+> 适用版本：Folly v1.1.0
 
-- 已验证的OS：Debian 12 等支持 io_uring 的 Linux 系统
-- 已验证的编译器：clang-16 或更高版本
-- 系统依赖：需要安装 `liburing-dev` 及相关依赖包
+本文指导用户编译Folly优化版本、启用IOBuf TLS内存池，并验证原有io_uring混合读写路径。
 
-## 使能 folly io_uring 优化
+## 1. 环境准备
 
-本优化方案采用混合模式，读操作使用 io_uring 的 multishot 模式，写操作使用原生 send 系统调用，以规避 io_uring 在保序场景下可能引入的延迟。
+### 1.1 环境要求
 
-获取优化后的 folly 源码：
+- Linux系统，推荐Debian 12或openEuler。
+- Clang 16或更高版本，所有依赖使用同一工具链。
+- 安装CMake、Boost、fmt、glog、libevent、liburing及压缩库开发包。
 
-```bash
-git clone -b dev_iouring https://gitcode.com/boostkit/folly.git
-cd folly
-```
-
-### 安装依赖包
-
-在 debian 系统上，需要安装以下依赖：
+Debian或Ubuntu执行以下命令。
 
 ```bash
-apt install liburing-dev libboost-all-dev libdouble-conversion-dev libgflags-dev \
-libgoogle-glog-dev libevent-dev libsodium-dev liblz4-dev libsnappy-dev libzstd-dev \
-libfmt-dev liblzma-dev libgtest-dev libgmock-dev libssl-dev libaio-dev \
-libunwind-dev libdwarf-dev binutils-dev libiberty-dev zlib1g-dev libbz2-dev
+sudo apt-get update
+sudo apt-get install -y \
+  git cmake build-essential liburing-dev libboost-all-dev \
+  libdouble-conversion-dev libgflags-dev libgoogle-glog-dev \
+  libevent-dev libsodium-dev liblz4-dev libsnappy-dev libzstd-dev \
+  libfmt-dev liblzma-dev libgtest-dev libgmock-dev libssl-dev \
+  libaio-dev libunwind-dev libdwarf-dev binutils-dev libiberty-dev \
+  zlib1g-dev libbz2-dev
 ```
 
-### 编译与安装
+### 1.2 获取并应用优化补丁
 
-建议统一编译器，例如使用 clang-16：
+1. 获取优化补丁代码。
+
+   ```bash
+   git clone --recurse-submodules --branch dev_iouring --single-branch \
+   https://gitcode.com/boostkit/folly.git
+   cd folly
+   ```
+
+2. IOBuf TLS内存池需要由v1.1.0优化补丁提供。源码尚未包含对应实现时，在配置前应用补丁。
+
+   ```bash
+   git apply --check /path/to/folly_iobuf_tls_pool.patch
+   git apply --3way /path/to/folly_iobuf_tls_pool.patch
+   ```
+
+   如git apply --reverse --check能够成功，说明补丁已经应用，不应重复执行。
+
+## 2. 编译与安装
 
 ```bash
 export CC=/usr/bin/clang-16
 export CXX=/usr/bin/clang++-16
+export FOLLY_INS=/usr/local/folly
 
-mkdir -p _build
-cd _build
-cmake .. \
--DCMAKE_BUILD_TYPE=Release \
--DCMAKE_CXX_STANDARD=17 \
--DBUILD_BENCHMARKS=OFF \
--DBUILD_TESTS=ON \
--DCMAKE_INSTALL_PREFIX=/usr/local/folly \
--DBUILD_SHARED_LIBS=ON
+cmake -S . -B _build \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CXX_STANDARD=17 \
+  -DBUILD_BENCHMARKS=OFF \
+  -DBUILD_TESTS=ON \
+  -DBUILD_SHARED_LIBS=ON \
+  -DCMAKE_INSTALL_PREFIX="$FOLLY_INS"
 
-make -j
+cmake --build _build --parallel "$(nproc)"
+cmake --install _build
 ```
 
-> **说明：** 
-> - `DCMAKE_INSTALL_PREFIX` 可替换为自定义的 folly 安装目的地址。
-> - 若有自定义路径的库（如 fmt），可通过 `-DCMAKE_PREFIX_PATH` 指定。
+fmt或其他依赖安装在自定义位置时，通过CMAKE_PREFIX_PATH或fmt_DIR传入实际CMake package路径。
 
-## folly io_uring 原生测试用例
+## 3. 启用IOBuf TLS内存池
 
-编译时若指定了 `-DBUILD_TESTS=ON`，可运行官方的 AsyncIoUringSocket 测试用例：
+### 3.1 启动阶段配置
+
+- 内存池默认不改变原有IOBuf分配行为。建议在创建工作线程前完成配置。
+
+  ```cpp
+  #include <folly/io/IOBuf.h>
+
+  int main() {
+  folly::IOBuf::setBlockSize(8 * 1024);
+  folly::IOBuf::enableMemoryPool();
+  }
+  ```
+
+- 启用后的IOBuf::create()路由如下。
+
+  ```text
+  容量能够由池块容纳
+  └── 从当前线程current_share切分slice
+
+  容量过大、内存池未启用或池化失败
+  └── 回退到Folly原有createCombined/createSeparate路径
+  ```
+
+### 3.2 配置建议
+
+- 默认每线程最多缓存8个空闲块，默认块大小为8KB,建议set至256KB。
+- setBlockSize()只在启动阶段调用，不要在请求处理中动态修改。
+- 小请求占比较高时可提高块复用率；请求经常超过块容量时仍会走原有路径。
+- 线程数较多时，需要按“线程数 × 每线程缓存上限 × 块大小”评估内存上界。
+- IOBuf可能跨线程释放，数据块可进入最终释放线程的TLS缓存，应观察线程间缓存分布。
+
+### 3.3 正确性验证
+
+编译全部Folly测试并执行以下命令。
 
 ```bash
-# 在 _build 文件夹下运行测试
-./experimental/io/test/async_iouring_socket_test
+ctest --test-dir _build --output-on-failure
 ```
 
-*注：测试用例全部通过，超时（timeout）功能尚未集成，因此相关测试用例被跳过。*
+内存池专项验证至少覆盖以下内容。
 
-## benchmark 性能测试
+- 未启用时保持原有IOBuf::create()路径。
+- 多个小IOBuf从同一块切分且slice互不重叠。
+- 超过块容量时正确回退。
+- cloneOne()、cloneOneAsValue()和析构的双计数语义。
+- reserveSlow()离开池slice时不释放其他IOBuf共享的数据块。
+- 线程退出和跨线程析构后无泄漏、重复释放或悬空引用。
 
-为了测试不同场景下 folly 的 io 能力，我们提供了 benchmark 测试脚本，可测试不同 io 压力下的时延及最大 QPS。
+## 4. 验证与测试io_uring与Benchmark
 
-### 准备工作
+### 4.1 测试开源io_uring
 
-测试应使用双机测试，并开启 performance 模式：
+构建时启用BUILD_TESTS后，可运行AsyncIoUringSocket测试。
 
 ```bash
-cpupower frequency-set -g performance
-ulimit -n 65536
+./_build/experimental/io/test/async_iouring_socket_test
 ```
 
-拉取测试脚本：
+v1.0.0采用混合模式：读操作使用io_uring multishot，写操作使用开源send；send暂时不可写时由PollWriteSqe侦听socket fd并恢复发送。
 
-```bash
-git clone https://gitcode.com/boostkit/AccLibBenchmark.git
-cd AccLibBenchmark/folly
-```
+### 4.2 测试Benchmark
 
-### 编译与启动
+1. 获取Benchmrk代码
 
-**编译 Server:**
+   ```bash
+   git clone https://gitcode.com/donghuanan/AccLibBenchmark.git
+   cd AccLibBenchmark/folly
+   ```
 
-```bash
-cd benchmark/server
-export LD_LIBRARY_PATH=/usr/local/folly/lib:$LD_LIBRARY_PATH
-# 注意：修改 Makefile 中的路径指向实际安装的 folly 与 fmt 路径，并修改LD_LIBRARY_PATH指向folly实际安装路径
-make
-numactl -N 0,1 ./net-server3-iouring
-```
+2. 双机压测前建议设置。
 
-**编译并启动 io_uring Client:**
+   ```bash
+   sudo cpupower frequency-set -g performance
+   ulimit -n 65536
+   export LD_LIBRARY_PATH=/usr/local/folly/lib:$LD_LIBRARY_PATH
+   ```
 
-```bash
-cd benchmark/client/iouring
-export LD_LIBRARY_PATH=/usr/local/folly/lib:$LD_LIBRARY_PATH
-# 注意：修改 Makefile 中的路径指向实际安装的 folly 与 fmt 路径, 并修改LD_LIBRARY_PATH指向folly实际安装路径
-make
+3. 根据实际安装路径修改Benchmark Makefile中的Folly和fmt目录，然后分别编译服务端及客户端。
 
-# 启动测试，例如：1个连接，每个连接 10000 qps，加压 10s
-./net-client --conn_per_thread 1 --qps_per_conn 10000 --batch_size 1 --total_requests 100000
-```
+   ```bash
+   cd benchmark/server
+   make
+   numactl -N 0 ./net-server3-iouring
 
-### 自动化脚本测试
+   cd ../client/iouring
+   make
+   ./net-client \
+   --conn_per_thread 1 \
+   --qps_per_conn 10000 \
+   --batch_size 1 \
+   --total_requests 100000
+   ```
 
-在 `epoll` 和 `iouring` 文件夹下提供了快速启动脚本 `run.sh`：
+### 4.3 A/B测试原则
 
-```bash
-# 修改 run.sh 中的 LD_LIBRARY_PATH 后执行：
-bash run.sh 1 10000 1 100000
-```
+使用同一份二进制，通过是否调用enableMemoryPool()切换内存池状态，保持线程数、连接数、Payload和CPU绑定一致。至少比较以下方面。
 
-测试最大 QPS：
+- QPS与吞吐量。
+- 平均延迟及P99延迟。
+- malloc/free或内存分配热点。
+- 进程常驻内存和各线程TLS缓存占用。
+- 单位成功请求CPU周期。
 
-```bash
-python3 get_max_qps.py --mode iouring --duration 10 --max_repeat 3
-```
+正式压测应先预热，再交替运行基线与优化组，避免温度、频率和缓存状态造成单向偏差。
 
-测试 QPS-时延曲线：
+## 修订记录
 
-```bash
-# 在 iouring 文件夹下运行
-bash ../latency_test.sh
-```
-
+|文档版本|发布日期|修改说明|
+| :---| :---| :---|
+|02|2026-9-30|第二次正式发布:<br>• 新增 `fbthrift_folly_benchmark` 并在benchmark侧布置外部接口  `setBlockSize()`, `enableMemoryPool()`，默认大小512KB。|
+|01|2026-6-30|第一次正式发布:<br>• 新增 `folly Benchmark` 支持对比 `epoll/io uring` 在端到端的性能比对。|
