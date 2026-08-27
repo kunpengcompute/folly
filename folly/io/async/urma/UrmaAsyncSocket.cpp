@@ -136,6 +136,10 @@ void UrmaAsyncSocket::onHandshakeReady() {
 
   state_ = State::kOpen;
   XLOG(INFO) << "UrmaAsyncSocket: URMA_ON, peer_rx_buf_size=" << peer_rx_buf_size_;
+
+  // flush 握手期间排队的写请求
+  // pending_write_head_ 已包含排队节点,直接调用 handlePendingWrites 逐个发送
+  handlePendingWrites();
 }
 
 void UrmaAsyncSocket::onHandshakeError(const std::string& reason) {
@@ -145,6 +149,18 @@ void UrmaAsyncSocket::onHandshakeError(const std::string& reason) {
   if (handshake_) {
     delete handshake_;
     handshake_ = nullptr;
+  }
+  // 回调握手期间排队的写请求
+  while (pending_write_head_) {
+    auto pw = std::move(pending_write_head_);
+    pending_write_head_ = std::move(pw->next);
+    if (!pending_write_head_) {
+      pending_write_tail_ = nullptr;
+    }
+    if (pw->cb) {
+      pw->cb->writeErr(0, AsyncSocketException(
+          AsyncSocketException::UNKNOWN, reason));
+    }
   }
 }
 
@@ -157,9 +173,13 @@ void UrmaAsyncSocket::onHandshakeData(const uint8_t* data, size_t len) {
 // ── AsyncReader ──
 
 void UrmaAsyncSocket::setReadCB(ReadCallback* callback) noexcept {
+  // 握手期间拒绝设置(避免干扰 TcpHandshakeHandler)
+  // 上层会在握手完成后重新设置
+  if (state_ == State::kConnecting || state_ == State::kHandshaking) {
+    read_cb_ = callback;  // 暂存,握手完成后上层会重新设置
+    return;
+  }
   read_cb_ = callback;
-  // 如果有 preReceivedData,立即触发 readDataAvailable
-  // (Phase 4 TCP 降级时 setPreReceivedData 使用)
 }
 
 // ── AsyncWriter ──
@@ -178,99 +198,44 @@ void UrmaAsyncSocket::writev(WriteCallback* cb, const iovec* vec, size_t count,
 
 void UrmaAsyncSocket::writeChain(WriteCallback* cb, std::unique_ptr<IOBuf>&& chain,
                                   WriteFlags flags) noexcept {
-  if (state_ != State::kOpen) {
+  if (state_ == State::kError || state_ == State::kClosed) {
     if (cb) cb->writeErr(0, AsyncSocketException(
         AsyncSocketException::UNKNOWN, "socket not open"));
     return;
   }
 
-  pollTx();  // 发送前先回收 SEND completion
-
-  // 检查 pending_write_(上次 EAGAIN 挂起的)
-  if (pending_write_) {
-    // 将新 chain 追加到 pending_write_ 末尾
-    pending_write_->prependChain(std::move(chain));
-    // 不回调,等 retryWrite 全部完成
+  // 有挂起请求时(连接中/握手中/EAGAIN),新请求追加到链表尾部
+  if (pending_write_head_) {
+    auto pw = std::make_unique<PendingWrite>();
+    pw->cb = cb;
+    pw->buf = std::move(chain);
+    pw->next = nullptr;
+    pending_write_tail_->next = std::move(pw);
+    pending_write_tail_ = pending_write_tail_->next.get();
     return;
   }
 
+  pollTx();
+
+  // 没有挂起请求,直接发送
   uint32_t total_posted = 0;
-  while (chain) {
-    // 多 SGE 合并:累积 IOBuf 直到总大小 ≤ peer_rx_buf_size_
-    uint32_t sge_total = 0;
-    int num_sge = 0;
-
-    uint8_t hw_max_sge = UrmaInit::getMaxJfsSge();
-    size_t chain_remaining = chain->countChainElements();
-    uint8_t sge_capacity = static_cast<uint8_t>(
-        std::min(chain_remaining, static_cast<size_t>(hw_max_sge)));
-
-    // 堆分配 SGE 数组:post 后 NIC 异步 DMA,栈数组会失效
-    auto sge_arr = std::make_shared<std::vector<urma_sge_t>>(sge_capacity);
-    // 用 shared_ptr 持有 IOBuf 链头,链头的 next_ 持有后续 IOBuf
-    // 初始为空 IOBuf(prependChain 到空 IOBuf 上创建链)
-    auto wr_chain_head = std::shared_ptr<IOBuf>(IOBuf::create(0).release());
-
-    while (chain && num_sge < sge_capacity) {
-      size_t iobuf_len = chain->length();
-      if (sge_total + iobuf_len > peer_rx_buf_size_ && num_sge > 0) {
-        break;  // 超 peer_rx_buf_size_,新开 WR
-      }
-      if (iobuf_len > peer_rx_buf_size_) {
-        if (cb) cb->writeErr(total_posted, AsyncSocketException(
-            AsyncSocketException::UNKNOWN, "IOBuf > peer_rx_buf_size not supported in Phase 2"));
-        return;
-      }
-      (*sge_arr)[num_sge].addr = reinterpret_cast<uint64_t>(chain->writableData());
-      (*sge_arr)[num_sge].len = static_cast<uint32_t>(iobuf_len);
-      (*sge_arr)[num_sge].tseg = UrmaInit::getPoolTseg();
-      wr_chain_head->prependChain(chain->cloneCoalesced());
-      sge_total += iobuf_len;
-      num_sge++;
-      chain = chain->pop();
+  urma_status_t ret = sendChain(cb, chain, total_posted);
+  if (ret == URMA_EAGAIN) {
+    // SQ 满:剩余 chain 挂到链表头,武装 TX JFCE 中断
+    auto pw = std::make_unique<PendingWrite>();
+    pw->cb = cb;
+    pw->buf = std::move(chain);
+    pw->next = nullptr;
+    pending_write_head_ = std::move(pw);
+    pending_write_tail_ = pending_write_head_.get();
+    if (res_.tx_jfc) {
+      urma_rearm_jfc(res_.tx_jfc, false);
     }
-
-    if (num_sge == 0) break;
-
-    // 构造 SEND WR
-    urma_jfs_wr_t wr = {};
-    wr.opcode = URMA_OPC_SEND;
-    wr.tjetty = res_.remote_jetty;
-    wr.flag.bs.complete_enable = 1;
-    wr.send.src.sge = sge_arr->data();
-    wr.send.src.num_sge = static_cast<uint32_t>(num_sge);
-    wr.user_ctx = sbuf_.size();
-    wr.next = nullptr;
-
-    // 持有 SGE 数组 + IOBuf 链引用直到 SEND completion
-    sbuf_.push_back(WrRefs{std::move(sge_arr), std::move(wr_chain_head)});
-
-    total_posted += sge_total;
-    urma_jfs_wr_t* bad_wr = nullptr;
-    urma_status_t ret = urma_post_jetty_send_wr(res_.io_jetty, &wr, &bad_wr);
-    if (ret == URMA_SUCCESS) {
-      continue;  // post 成功,处理下一个 IOBuf
-    }
-    // post 失败:回滚刚 push 的 sbuf_ 条目
-    sbuf_.pop_back();
-    if (ret == URMA_EAGAIN) {
-      // SQ 满:挂起剩余 IOBuf 链,武装 TX JFCE 中断等 CQE 回收
-      pending_write_ = std::move(chain);
-      pending_write_cb_ = cb;
-      if (res_.tx_jfc) {
-        urma_rearm_jfc(res_.tx_jfc, false);
-      }
-      return;  // 不回调 writeSuccess
-    }
-    // 其他错误(URMA_FAIL/ENOMEM/EINVAL 等):回调 writeErr
-    XLOG(ERR) << "UrmaAsyncSocket: post failed, status=" << ret;
-    if (cb) cb->writeErr(total_posted, AsyncSocketException(
-        AsyncSocketException::UNKNOWN, "urma_post_jetty_send_wr failed"));
-    return;
+  } else if (ret == URMA_SUCCESS) {
+    if (cb) cb->writeSuccess();
+    bytes_written_ += total_posted;
   }
-
-  if (cb) cb->writeSuccess();
-  bytes_written_ += total_posted;
+  // 其他错误: sendChain 内部已回调 writeErr
 }
 
 // ── TX completion ──
@@ -292,12 +257,116 @@ void UrmaAsyncSocket::pollTx() noexcept {
 }
 
 void UrmaAsyncSocket::retryWrite() noexcept {
-  if (!pending_write_) return;
-  auto chain = std::move(pending_write_);
-  auto cb = pending_write_cb_;
-  pending_write_cb_ = nullptr;
-  pending_write_.reset();
-  writeChain(cb, std::move(chain), WriteFlags::NONE);
+  handlePendingWrites();
+}
+
+// 发送单个 IOBuf chain(多 SGE 合并 → post SEND)
+// 返回值: URMA_SUCCESS(全部发完) / URMA_EAGAIN(SQ 满,chain 中剩余部分通过 chain 引用返回) / URMA_FAIL(已回调 writeErr)
+urma_status_t UrmaAsyncSocket::sendChain(WriteCallback* cb,
+                                          std::unique_ptr<IOBuf>& chain,
+                                          uint32_t& total_posted) noexcept {
+  total_posted = 0;
+  while (chain) {
+    uint32_t sge_total = 0;
+    int num_sge = 0;
+
+    uint8_t hw_max_sge = UrmaInit::getMaxJfsSge();
+    size_t chain_remaining = chain->countChainElements();
+    uint8_t sge_capacity = static_cast<uint8_t>(
+        std::min(chain_remaining, static_cast<size_t>(hw_max_sge)));
+
+    auto sge_arr = std::make_shared<std::vector<urma_sge_t>>(sge_capacity);
+    auto wr_chain_head = std::shared_ptr<IOBuf>(IOBuf::create(0).release());
+
+    while (chain && num_sge < sge_capacity) {
+      size_t iobuf_len = chain->length();
+      if (sge_total + iobuf_len > peer_rx_buf_size_ && num_sge > 0) {
+        break;
+      }
+      if (iobuf_len > peer_rx_buf_size_) {
+        if (cb) cb->writeErr(total_posted, AsyncSocketException(
+            AsyncSocketException::UNKNOWN,
+            "IOBuf > peer_rx_buf_size not supported in Phase 2"));
+        return URMA_FAIL;
+      }
+      (*sge_arr)[num_sge].addr = reinterpret_cast<uint64_t>(chain->writableData());
+      (*sge_arr)[num_sge].len = static_cast<uint32_t>(iobuf_len);
+      (*sge_arr)[num_sge].tseg = UrmaInit::getPoolTseg();
+      wr_chain_head->prependChain(chain->cloneCoalesced());
+      sge_total += iobuf_len;
+      num_sge++;
+      chain = chain->pop();
+    }
+
+    if (num_sge == 0) break;
+
+    urma_jfs_wr_t wr = {};
+    wr.opcode = URMA_OPC_SEND;
+    wr.tjetty = res_.remote_jetty;
+    wr.flag.bs.complete_enable = 1;
+    wr.send.src.sge = sge_arr->data();
+    wr.send.src.num_sge = static_cast<uint32_t>(num_sge);
+    wr.user_ctx = sbuf_.size();
+    wr.next = nullptr;
+
+    sbuf_.push_back(WrRefs{std::move(sge_arr), std::move(wr_chain_head)});
+
+    total_posted += sge_total;
+    urma_jfs_wr_t* bad_wr = nullptr;
+    urma_status_t ret = urma_post_jetty_send_wr(res_.io_jetty, &wr, &bad_wr);
+    if (ret == URMA_SUCCESS) {
+      continue;
+    }
+    sbuf_.pop_back();
+    if (ret == URMA_EAGAIN) {
+      // SQ 满:剩余 chain 通过引用返回给调用方
+      return URMA_EAGAIN;
+    }
+    XLOG(ERR) << "UrmaAsyncSocket: post failed, status=" << ret;
+    if (cb) cb->writeErr(total_posted, AsyncSocketException(
+        AsyncSocketException::UNKNOWN, "urma_post_jetty_send_wr failed"));
+    return URMA_FAIL;
+  }
+  return URMA_SUCCESS;
+}
+
+// 遍历 pending_write_head_ 链表逐个发送(参照 AsyncSocket::handleWrite)
+// 用于握手完成后 flush / EAGAIN 恢复后重试
+void UrmaAsyncSocket::handlePendingWrites() noexcept {
+  pollTx();
+
+  while (pending_write_head_) {
+    auto* pw = pending_write_head_.get();
+    std::unique_ptr<IOBuf> chain = std::move(pw->buf);
+    uint32_t total_posted = 0;
+
+    urma_status_t ret = sendChain(pw->cb, chain, total_posted);
+    if (ret == URMA_EAGAIN) {
+      // SQ 满:剩余 chain 放回当前节点,武装 TX JFCE 中断
+      pw->buf = std::move(chain);
+      if (res_.tx_jfc) {
+        urma_rearm_jfc(res_.tx_jfc, false);
+      }
+      return;
+    }
+    if (ret == URMA_SUCCESS) {
+      // 当前节点全部发完,从链表移除,回调 writeSuccess
+      WriteCallback* cb = pw->cb;
+      pending_write_head_ = std::move(pending_write_head_->next);
+      if (!pending_write_head_) {
+        pending_write_tail_ = nullptr;
+      }
+      if (cb) cb->writeSuccess();
+      bytes_written_ += total_posted;
+    }
+    // URMA_FAIL: sendChain 内部已回调 writeErr,从链表移除当前节点
+    if (ret == URMA_FAIL) {
+      pending_write_head_ = std::move(pending_write_head_->next);
+      if (!pending_write_head_) {
+        pending_write_tail_ = nullptr;
+      }
+    }
+  }
 }
 
 // ── 接收 ──
@@ -380,8 +449,8 @@ void UrmaAsyncSocket::destroyUrmaResources() {
     res_.tx_jfce = nullptr;
   }
   sbuf_.clear();
-  pending_write_.reset();
-  pending_write_cb_ = nullptr;
+  pending_write_head_.reset();
+  pending_write_tail_ = nullptr;
 }
 
 // ── 其他 ──

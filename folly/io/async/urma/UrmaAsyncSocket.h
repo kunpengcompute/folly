@@ -73,9 +73,17 @@ class UrmaAsyncSocket : public AsyncTransport {
   void closeNow() override;
   void shutdownWrite() override;
   void shutdownWriteNow() override;
-  bool good() const override { return state_ == State::kOpen; }
-  bool readable() const override { return state_ == State::kOpen; }
-  bool connecting() const override { return state_ == State::kConnecting; }
+  bool good() const override {
+    return state_ == State::kConnecting || state_ == State::kHandshaking ||
+           state_ == State::kOpen;
+  }
+  bool readable() const override {
+    return state_ == State::kConnecting || state_ == State::kHandshaking ||
+           state_ == State::kOpen;
+  }
+  bool connecting() const override {
+    return state_ == State::kConnecting || state_ == State::kHandshaking;
+  }
   bool error() const override { return state_ == State::kError; }
   void attachEventBase(EventBase* eventBase) override;
   void detachEventBase() override;
@@ -98,6 +106,16 @@ class UrmaAsyncSocket : public AsyncTransport {
   // TX completion(由 UrmaCqHandler TX 模式调用)
   void pollTx() noexcept;
   void retryWrite() noexcept;
+
+  // 发送单个 IOBuf chain(多 SGE 合并 → post SEND)
+  // 返回值: URMA_SUCCESS(全部发完) / URMA_EAGAIN(SQ 满,剩余 chain 通过 remaining �出)
+  urma_status_t sendChain(WriteCallback* cb,
+                          std::unique_ptr<IOBuf>& chain,
+                          uint32_t& total_posted) noexcept;
+
+  // 遍历 pending_write_head_ 链表逐个发送(参照 AsyncSocket::handleWrite)
+  // 用于握手完成后 flush / EAGAIN 恢复后重试
+  void handlePendingWrites() noexcept;
 
   // 握手数据透传(TCP fd 收到的数据转发给 UrmaHandshake)
   void onHandshakeData(const uint8_t* data, size_t len);
@@ -164,8 +182,15 @@ class UrmaAsyncSocket : public AsyncTransport {
     std::shared_ptr<IOBuf> bufs;
   };
   std::vector<WrRefs> sbuf_;
-  std::unique_ptr<IOBuf> pending_write_;
-  WriteCallback* pending_write_cb_{nullptr};
+
+  // 排队的写请求(连接中/握手中/EAGAIN 挂起,参照 AsyncSocket writeReqHead_)
+  struct PendingWrite {
+    WriteCallback* cb;
+    std::unique_ptr<IOBuf> buf;
+    std::unique_ptr<PendingWrite> next;
+  };
+  std::unique_ptr<PendingWrite> pending_write_head_;
+  PendingWrite* pending_write_tail_{nullptr};
 
   // TX JFCE handler (EAGAIN 中断: SQ 满时 urma_rearm_jfc 武装, CQE 到达唤醒 retryWrite)
   UrmaCqHandler* tx_cq_handler_{nullptr};
