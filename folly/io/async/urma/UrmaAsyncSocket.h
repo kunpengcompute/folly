@@ -28,6 +28,7 @@
 
 #include <folly/SocketAddress.h>
 #include <folly/io/IOBuf.h>
+#include <folly/io/IOBufQueue.h>
 #include <folly/io/async/AsyncSocket.h>
 #include <folly/io/async/AsyncTransport.h>
 #include <folly/io/async/EventHandler.h>
@@ -103,6 +104,9 @@ class UrmaAsyncSocket : public AsyncTransport {
   // 接收数据(由 UrmaSharedJfr::pollAndDispatch 调用)
   void onRxBuf(std::unique_ptr<IOBuf> data) noexcept;
 
+  // 交付缓存数据给当前 read_cb_(支持 movable 和非 movable 两种模式)
+  void deliverReadData() noexcept;
+
   // TX completion(由 UrmaCqHandler TX 模式调用)
   void pollTx() noexcept;
   void retryWrite() noexcept;
@@ -161,6 +165,9 @@ class UrmaAsyncSocket : public AsyncTransport {
   int tcp_fd_{-1};
   State state_{State::kIdle};
   ReadCallback* read_cb_{nullptr};
+
+  // 接收数据缓存(URMA 数据到达后缓存,逐块交付给 read_cb_)
+  folly::IOBufQueue read_queue_;
 
   // TCP connect
   std::unique_ptr<ConnectCallback> connect_cb_;

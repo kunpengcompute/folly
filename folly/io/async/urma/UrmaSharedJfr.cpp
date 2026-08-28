@@ -168,7 +168,7 @@ UrmaSharedJfr::UrmaSharedJfr(EventBase* evb, const UrmaConfig& config)
 }
 
 UrmaSharedJfr::~UrmaSharedJfr() {
-  // 销毁顺序: CqHandler → JFR(停止产生新CQE) → JFC → JFCE
+  // 销毁顺序: CqHandler → JFR(停止产生新CQE) → drain CQE → JFC → JFCE
   // JFR 依赖 JFC(完成队列),JFC 依赖 JFCE(事件fd)
   // 先停 CqHandler(取消 epoll 注册)
   if (io_cq_handler_) {
@@ -179,7 +179,7 @@ UrmaSharedJfr::~UrmaSharedJfr() {
     delete fc_cq_handler_;
     fc_cq_handler_ = nullptr;
   }
-  // 再删 JFR(停止接收,不再产生新 CQE)
+  // 删 JFR(停止接收,JFR flush 会产生 flush_done CQE 写入 JFC)
   if (io_jfr_) {
     urma_delete_jfr(io_jfr_);
     io_jfr_ = nullptr;
@@ -188,7 +188,16 @@ UrmaSharedJfr::~UrmaSharedJfr() {
     urma_delete_jfr(fc_jfr_);
     fc_jfr_ = nullptr;
   }
-  // 再删 JFC(CQE 队列)
+  // drain 所有积压 CQE(包括 JFR flush 产生的),否则 urma_delete_jfc 会阻塞
+  if (io_jfc_) {
+    urma_cr_t drain[POLL_BATCH_MAX];
+    while (urma_poll_jfc(io_jfc_, POLL_BATCH_MAX, drain) > 0) {}
+  }
+  if (fc_jfc_) {
+    urma_cr_t drain[POLL_BATCH_MAX];
+    while (urma_poll_jfc(fc_jfc_, POLL_BATCH_MAX, drain) > 0) {}
+  }
+  // 删 JFC(此时已无积压 CQE)
   if (io_jfc_) {
     urma_delete_jfc(io_jfc_);
     io_jfc_ = nullptr;

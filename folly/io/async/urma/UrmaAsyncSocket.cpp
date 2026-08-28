@@ -173,13 +173,11 @@ void UrmaAsyncSocket::onHandshakeData(const uint8_t* data, size_t len) {
 // ── AsyncReader ──
 
 void UrmaAsyncSocket::setReadCB(ReadCallback* callback) noexcept {
-  // 握手期间拒绝设置(避免干扰 TcpHandshakeHandler)
-  // 上层会在握手完成后重新设置
-  if (state_ == State::kConnecting || state_ == State::kHandshaking) {
-    read_cb_ = callback;  // 暂存,握手完成后上层会重新设置
-    return;
-  }
   read_cb_ = callback;
+  // 设置 read_cb_ 后,如果有缓存的未交付数据,立即触发交付
+  if (read_cb_ && !read_queue_.empty()) {
+    deliverReadData();
+  }
 }
 
 // ── AsyncWriter ──
@@ -215,6 +213,19 @@ void UrmaAsyncSocket::writeChain(WriteCallback* cb, std::unique_ptr<IOBuf>&& cha
     return;
   }
 
+  // 没有挂起请求
+  // 连接中/握手中:挂到链表,等握手完成后 flush
+  if (state_ != State::kOpen) {
+    auto pw = std::make_unique<PendingWrite>();
+    pw->cb = cb;
+    pw->buf = std::move(chain);
+    pw->next = nullptr;
+    pending_write_head_ = std::move(pw);
+    pending_write_tail_ = pending_write_head_.get();
+    return;
+  }
+
+  // kOpen 状态:直接发送
   pollTx();
 
   // 没有挂起请求,直接发送
@@ -266,6 +277,10 @@ urma_status_t UrmaAsyncSocket::sendChain(WriteCallback* cb,
                                           std::unique_ptr<IOBuf>& chain,
                                           uint32_t& total_posted) noexcept {
   total_posted = 0;
+  // 握手/连接未完成:返回 EAGAIN,chain 保留在调用方,等握手完成后 flush
+  if (state_ != State::kOpen) {
+    return URMA_EAGAIN;
+  }
   while (chain) {
     uint32_t sge_total = 0;
     int num_sge = 0;
@@ -373,9 +388,40 @@ void UrmaAsyncSocket::handlePendingWrites() noexcept {
 
 void UrmaAsyncSocket::onRxBuf(std::unique_ptr<IOBuf> data) noexcept {
   bytes_received_ += data->length();
+  // 追加到接收缓存队列
+  read_queue_.append(std::move(data));
+  // 如果 read_cb_ 已设置,立即交付
   if (read_cb_) {
-    // URMA 数据已是零拷贝 IOBuf,直接走 readBufferAvailable
-    read_cb_->readBufferAvailable(std::move(data));
+    deliverReadData();
+  }
+}
+
+// 交付缓存数据给当前 read_cb_
+// 支持 isBufferMovable (readBufferAvailable) 和非 movable (getReadBuffer + readDataAvailable)
+void UrmaAsyncSocket::deliverReadData() noexcept {
+  if (!read_cb_ || read_queue_.empty()) return;
+
+  if (read_cb_->isBufferMovable()) {
+    // 零拷贝模式(Rocket Parser / Header TAsyncTransportHandler)
+    // 一次性交付整个 IOBuf chain
+    auto buf = read_queue_.move();
+    read_cb_->readBufferAvailable(std::move(buf));
+  } else {
+    // 传统模式(TransportPeeker)
+    // getReadBuffer → memcpy → readDataAvailable,可能多次调用
+    while (!read_queue_.empty()) {
+      void* buf = nullptr;
+      size_t buf_len = 0;
+      read_cb_->getReadBuffer(&buf, &buf_len);
+      if (!buf || buf_len == 0) break;
+
+      auto front = read_queue_.front();
+      if (!front) break;
+      size_t copy_len = std::min(front->length(), buf_len);
+      memcpy(buf, front->data(), copy_len);
+      read_queue_.trimStart(copy_len);
+      read_cb_->readDataAvailable(copy_len);
+    }
   }
 }
 
@@ -451,6 +497,7 @@ void UrmaAsyncSocket::destroyUrmaResources() {
   sbuf_.clear();
   pending_write_head_.reset();
   pending_write_tail_ = nullptr;
+  read_queue_.move();  // 清空接收缓存
 }
 
 // ── 其他 ──
