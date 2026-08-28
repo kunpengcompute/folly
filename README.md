@@ -4,8 +4,8 @@
 
 ## 最新消息
 
-- 2026.09.30：发布Follyv1.1.0版本补丁，新增IOBuf TLS内存池，通过线程本地数据块复用和连续slice切分减少高QPS场景下的`malloc/free`。
-- 2026.03.30：发布Follyv1.0.0版本补丁仓，针对Folly异步网络io框架进行io_uring优化，提升网络io的稳定性与基线io性能。
+- 2026.09.30：发布Folly v1.1.0版本补丁，新增IOBuf TLS内存池，通过线程本地数据块复用和连续slice切分减少高QPS场景下的`malloc/free`。
+- 2026.06.30：发布Folly v1.0.0版本补丁仓，针对Folly异步网络io框架进行io_uring优化，提升网络io的稳定性与基线io性能。
 
 ## 项目介绍
 
