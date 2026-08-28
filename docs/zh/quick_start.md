@@ -176,4 +176,4 @@ v1.0.0采用混合模式：读操作使用io_uring multishot，写操作使用�
 
 |文档版本|发布日期|修改说明|
 | :---| :---| :---|
-|01|2026-9-30|第一次正式发布:<br>• 新增 `fbthrift_folly_benchmark` 并在benchmark侧布置外部接口  `setBlockSize()`, `enableMemoryPool()`，默认大小512KB。|
+|01|2026-9-30|第一次正式发布。|

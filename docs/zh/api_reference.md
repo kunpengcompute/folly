@@ -214,4 +214,4 @@ void AsyncIoUringSocket::writeChain(
 
 |文档版本|发布日期|修改说明|
 | :---| :---| :---|
-|01|2026-9-30|第一次正式发布:<br>• 新增了 `IoBufBlock`、`TLSBlockCache` 以及 `ioBufBlockAllocate`、`ioBufBlockRelease`、`share_block` 等分配/回收/共享块接口，为 `IOBuf` 引入基于线程本地缓存的内存池 `IoBufPool` 。|
+|01|2026-9-30|第一次正式发布。|
