@@ -76,7 +76,8 @@ void ioBufBlockRelease(IoBufBlock* b) {
       blockFree(b);
     }
   } else {
-    std::free(b);
+    // 大 block 直接走注入的 free 函数(避免 std::free 与 poolAlloc 不匹配)
+    blockFree(b);
   }
 }
 
@@ -105,12 +106,12 @@ IoBufBlock* share_block(size_t min_capacity) {
 TLSBlockCache::~TLSBlockCache() {
   if (current_share != nullptr) {
     if (current_share->ref_count.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-      std::free(current_share);
+      blockFree(current_share);
     }
     current_share = nullptr;
   }
   for (size_t i = 0; i < count; ++i) {
-    std::free(blocks[i]);
+    blockFree(blocks[i]);
   }
   count = 0;
 }
