@@ -176,5 +176,4 @@ v1.0.0采用混合模式：读操作使用io_uring multishot，写操作使用�
 
 |文档版本|发布日期|修改说明|
 | :---| :---| :---|
-|02|2026-9-30|第二次正式发布:<br>• 新增 `fbthrift_folly_benchmark` 并在benchmark侧布置外部接口  `setBlockSize()`, `enableMemoryPool()`，默认大小512KB。|
-|01|2026-6-30|第一次正式发布:<br>• 新增 `folly Benchmark` 支持对比 `epoll/io uring` 在端到端的性能比对。|
+|01|2026-9-30|第一次正式发布。|
