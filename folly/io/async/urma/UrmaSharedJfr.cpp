@@ -202,13 +202,20 @@ void UrmaSharedJfr::fillFcRxBuf() noexcept {
 }
 
 void UrmaSharedJfr::pollAndDispatch() noexcept {
-  // handlerReady 被 epoll 唤醒后调用,无需 wait
-  urma_jfc_t* jfcs[1] = {io_jfc_};
-  uint32_t nevents[1] = {1};
-  urma_ack_jfc(jfcs, nevents, 1);
+  // 参照 brpc/UMQ 的事件模式:
+  // 1. urma_wait_jfc: 消费 JFCE fd 上的内核事件(使 fd 不可读)
+  // 2. urma_poll_jfc: drain CQE 队列
+  // 3. urma_ack_jfc: 确认事件(内核解锁 comp_events_acked)
+  // 4. urma_rearm_jfc: 写 doorbell 武装下次中断(CQE 到达时 fd 变可读 → ET 触发一次)
+  urma_jfc_t* wait_jfcs[1] = {io_jfc_};
+  int wait_ret = urma_wait_jfc(io_jfce_, 1, 0, wait_jfcs);
+  if (wait_ret < 0) {
+    XLOG(ERR) << "UrmaSharedJfr: urma_wait_jfc failed, ret=" << wait_ret;
+    urma_rearm_jfc(io_jfc_, false);
+    return;
+  }
   urma_cr_t cr[POLL_BATCH_MAX];
   int n;
-  // 循环 poll 直到 CQE 全部收割
   while ((n = urma_poll_jfc(io_jfc_, POLL_BATCH_MAX, cr)) > 0) {
     for (int i = 0; i < n; ++i) {
       uint32_t slot = static_cast<uint32_t>(cr[i].user_ctx);
@@ -234,18 +241,34 @@ void UrmaSharedJfr::pollAndDispatch() noexcept {
       socket->onRxBuf(std::move(data));
     }
   }
+  // poll 后 ack + rearm(参照 brpc: poll → ack → rearm)
+  urma_jfc_t* ack_jfcs[1] = {io_jfc_};
+  uint32_t nevents[1] = {static_cast<uint32_t>(wait_ret > 0 ? wait_ret : 0)};
+  if (nevents[0] > 0) {
+    urma_ack_jfc(ack_jfcs, nevents, 1);
+  }
   urma_rearm_jfc(io_jfc_, false);
 }
 
 void UrmaSharedJfr::pollFcAndDispatch() noexcept {
   // Phase 4: 完整 FC 消息处理
-  urma_jfc_t* jfcs[1] = {fc_jfc_};
-  uint32_t nevents[1] = {1};
-  urma_ack_jfc(jfcs, nevents, 1);
+  // 同 pollAndDispatch: wait_jfc → poll → ack → rearm
+  urma_jfc_t* wait_jfcs[1] = {fc_jfc_};
+  int wait_ret = urma_wait_jfc(fc_jfce_, 1, 0, wait_jfcs);
+  if (wait_ret < 0) {
+    XLOG(ERR) << "UrmaSharedJfr: urma_wait_jfc(fc) failed, ret=" << wait_ret;
+    urma_rearm_jfc(fc_jfc_, false);
+    return;
+  }
   urma_cr_t cr[POLL_BATCH_MAX];
   int n;
   while ((n = urma_poll_jfc(fc_jfc_, POLL_BATCH_MAX, cr)) > 0) {
     (void)n;  // Phase 4 处理 FC CQE
+  }
+  urma_jfc_t* ack_jfcs[1] = {fc_jfc_};
+  uint32_t nevents[1] = {static_cast<uint32_t>(wait_ret > 0 ? wait_ret : 0)};
+  if (nevents[0] > 0) {
+    urma_ack_jfc(ack_jfcs, nevents, 1);
   }
   urma_rearm_jfc(fc_jfc_, false);
 }
