@@ -320,13 +320,14 @@ void UrmaInit::init(const UrmaConfig& config) {
 void UrmaInit::fini() {
   if (!s_inited_) return;
 
+  // 参照 brpc: 不在 fini 中删除 URMA 硬件资源(context/seg/JFR/JFC/JFCE/jetty)
+  // 原因:硬件资源在进程退出时由内核自动回收
+  // 用户态清理可能导致阻塞(jetty 引用 JFR/JFC 时删除会等待解绑)
+  // 仅恢复 IOBuf allocator 到默认值
   setIoBufBlockAllocFree(&std::malloc, &std::free, nullptr);
 
-  finiMrPool();
-  if (s_ctx) {
-    urma_delete_context(s_ctx);
-    s_ctx = nullptr;
-  }
+  // MR 内存池(mmap + register_seg)不 munmap——依赖进程退出时内核回收
+  // URMA context 不删除——同上
   urma_uninit();
   s_inited_ = false;
 }

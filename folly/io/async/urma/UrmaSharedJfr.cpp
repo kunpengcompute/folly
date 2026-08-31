@@ -168,9 +168,13 @@ UrmaSharedJfr::UrmaSharedJfr(EventBase* evb, const UrmaConfig& config)
 }
 
 UrmaSharedJfr::~UrmaSharedJfr() {
-  // 销毁顺序: CqHandler → JFR(停止产生新CQE) → drain CQE → JFC → JFCE
-  // JFR 依赖 JFC(完成队列),JFC 依赖 JFCE(事件fd)
-  // 先停 CqHandler(取消 epoll 注册)
+  // 参照 brpc urma_helper.cpp:624-628:
+  // 不在析构中删除 URMA 硬件资源(JFR/JFC/JFCE/jetty)
+  // 原因:
+  // 1. jetty 可能仍引用 JFR(share_jfr=1),urma_delete_jfr 会阻塞等待解绑
+  // 2. urma_delete_jfc 会阻塞等待所有 CQE 被消费
+  // 3. 进程退出时内核自动回收所有 URMA 资源
+  // 仅清理 CqHandler(从 EventBase epoll 注销)
   if (io_cq_handler_) {
     delete io_cq_handler_;
     io_cq_handler_ = nullptr;
@@ -179,48 +183,8 @@ UrmaSharedJfr::~UrmaSharedJfr() {
     delete fc_cq_handler_;
     fc_cq_handler_ = nullptr;
   }
-  // 删 JFR(停止接收,JFR flush 会产生 flush_done CQE 写入 JFC)
-  if (io_jfr_) {
-    urma_delete_jfr(io_jfr_);
-    io_jfr_ = nullptr;
-  }
-  if (fc_jfr_) {
-    urma_delete_jfr(fc_jfr_);
-    fc_jfr_ = nullptr;
-  }
-  // drain 所有积压 CQE(包括 JFR flush 产生的),否则 urma_delete_jfc 会阻塞
-  if (io_jfc_) {
-    urma_cr_t drain[POLL_BATCH_MAX];
-    while (urma_poll_jfc(io_jfc_, POLL_BATCH_MAX, drain) > 0) {}
-  }
-  if (fc_jfc_) {
-    urma_cr_t drain[POLL_BATCH_MAX];
-    while (urma_poll_jfc(fc_jfc_, POLL_BATCH_MAX, drain) > 0) {}
-  }
-  // 删 JFC(此时已无积压 CQE)
-  if (io_jfc_) {
-    urma_delete_jfc(io_jfc_);
-    io_jfc_ = nullptr;
-  }
-  if (fc_jfc_) {
-    urma_delete_jfc(fc_jfc_);
-    fc_jfc_ = nullptr;
-  }
-  // 最后删 JFCE(关闭事件 fd)
-  if (io_jfce_) {
-    urma_delete_jfce(io_jfce_);
-    io_jfce_ = nullptr;
-  }
-  if (fc_jfce_) {
-    urma_delete_jfce(fc_jfce_);
-    fc_jfce_ = nullptr;
-  }
-  for (auto& rb : rx_bufs_) {
-    if (rb.data) {
-      UrmaInit::poolFree(rb.data);
-      rb.data = nullptr;
-    }
-  }
+  // JFR/JFC/JFCE 不删除——依赖进程退出时内核回收
+  // RX buffer 也不释放——MR 内存池在进程退出时由 munmap 回收
 }
 
 void UrmaSharedJfr::replenishRxBuf(uint32_t slot) noexcept {

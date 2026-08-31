@@ -35,6 +35,9 @@ void UrmaAsyncSocket::TcpHandshakeHandler::handlerReady(
   } else if (n == 0) {
     socket_->onHandshakeError("TCP connection closed during handshake");
   } else {
+    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+      return;  // spurious 触发,忽略,等下次 epoll 事件
+    }
     socket_->onHandshakeError("TCP read error during handshake");
   }
 }
@@ -450,6 +453,10 @@ void UrmaAsyncSocket::shutdownWriteNow() {
 }
 
 void UrmaAsyncSocket::destroyUrmaResources() {
+  // 参照 brpc: 不在析构中删除 URMA 硬件资源(jetty/JFC/JFCE)
+  // 原因:urma_delete_jetty 会阻塞等待硬件 flush;urma_delete_jfc 会阻塞等待 CQE 消费
+  // 进程退出时内核自动回收所有 URMA 资源
+  // 仅清理用户态资源(CqHandler/路由表/sbuf/pending/read_queue)
   if (tx_cq_handler_) {
     delete tx_cq_handler_;
     tx_cq_handler_ = nullptr;
@@ -462,6 +469,7 @@ void UrmaAsyncSocket::destroyUrmaResources() {
       shared_->unregisterFcSocket(res_.remote_fc_jetty->id.id);
     }
   }
+  // unimport 远端 jetty/seg(解除 TP 路由引用)
   if (res_.remote_fc_jetty) {
     urma_unimport_jetty(res_.remote_fc_jetty);
     res_.remote_fc_jetty = nullptr;
@@ -474,26 +482,7 @@ void UrmaAsyncSocket::destroyUrmaResources() {
     urma_unimport_seg(res_.remote_seg);
     res_.remote_seg = nullptr;
   }
-  if (res_.fc_jetty) {
-    urma_delete_jetty(res_.fc_jetty);
-    res_.fc_jetty = nullptr;
-  }
-  if (res_.io_jetty) {
-    urma_delete_jetty(res_.io_jetty);
-    res_.io_jetty = nullptr;
-  }
-  if (res_.fc_tx_jfc) {
-    urma_delete_jfc(res_.fc_tx_jfc);
-    res_.fc_tx_jfc = nullptr;
-  }
-  if (res_.tx_jfc) {
-    urma_delete_jfc(res_.tx_jfc);
-    res_.tx_jfc = nullptr;
-  }
-  if (res_.tx_jfce) {
-    urma_delete_jfce(res_.tx_jfce);
-    res_.tx_jfce = nullptr;
-  }
+  // jetty/JFC/JFCE 不删除——依赖进程退出时内核回收
   sbuf_.clear();
   pending_write_head_.reset();
   pending_write_tail_ = nullptr;
