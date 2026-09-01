@@ -138,7 +138,6 @@ void UrmaAsyncSocket::onHandshakeReady() {
   handshake_ = nullptr;
 
   state_ = State::kOpen;
-  XLOG(INFO) << "UrmaAsyncSocket: URMA_ON, peer_rx_buf_size=" << peer_rx_buf_size_;
 
   // flush 握手期间排队的写请求
   // pending_write_head_ 已包含排队节点,直接调用 handlePendingWrites 逐个发送
@@ -243,7 +242,10 @@ void UrmaAsyncSocket::writeChain(WriteCallback* cb, std::unique_ptr<IOBuf>&& cha
     pending_write_head_ = std::move(pw);
     pending_write_tail_ = pending_write_head_.get();
     if (res_.tx_jfc) {
-      urma_rearm_jfc(res_.tx_jfc, false);
+      urma_status_t rearm_ret = urma_rearm_jfc(res_.tx_jfc, false);
+      if (rearm_ret != URMA_SUCCESS) {
+        XLOG(ERR) << "UrmaAsyncSocket: urma_rearm_jfc(tx) failed, status=" << rearm_ret;
+      }
     }
   } else if (ret == URMA_SUCCESS) {
     if (cb) cb->writeSuccess();
@@ -310,7 +312,7 @@ urma_status_t UrmaAsyncSocket::sendChain(WriteCallback* cb,
       (*sge_arr)[num_sge].addr = reinterpret_cast<uint64_t>(chain->writableData());
       (*sge_arr)[num_sge].len = static_cast<uint32_t>(iobuf_len);
       (*sge_arr)[num_sge].tseg = UrmaInit::getPoolTseg();
-      wr_chain_head->prependChain(chain->cloneCoalesced());
+      wr_chain_head->prependChain(chain->cloneOne());
       sge_total += iobuf_len;
       num_sge++;
       chain = chain->pop();
@@ -363,7 +365,10 @@ void UrmaAsyncSocket::handlePendingWrites() noexcept {
       // SQ 满:剩余 chain 放回当前节点,武装 TX JFCE 中断
       pw->buf = std::move(chain);
       if (res_.tx_jfc) {
-        urma_rearm_jfc(res_.tx_jfc, false);
+        urma_status_t rearm_ret = urma_rearm_jfc(res_.tx_jfc, false);
+        if (rearm_ret != URMA_SUCCESS) {
+          XLOG(ERR) << "UrmaAsyncSocket: urma_rearm_jfc(tx) failed, status=" << rearm_ret;
+        }
       }
       return;
     }
@@ -401,9 +406,9 @@ void UrmaAsyncSocket::onRxBuf(std::unique_ptr<IOBuf> data) noexcept {
 
 // 交付缓存数据给当前 read_cb_
 // 支持 isBufferMovable (readBufferAvailable) 和非 movable (getReadBuffer + readDataAvailable)
+// 使用递归而非 while 循环:read_cb_ 可能在回调中变化(TransportPeeker → PreReceivedData → Parser)
+// 每次递归重新检查 isBufferMovable(),确保用正确模式交付数据
 void UrmaAsyncSocket::deliverReadData() noexcept {
-  if (!read_cb_ || read_queue_.empty()) return;
-
   if (read_cb_->isBufferMovable()) {
     // 零拷贝模式(Rocket Parser / Header TAsyncTransportHandler)
     // 一次性交付整个 IOBuf chain
@@ -411,20 +416,25 @@ void UrmaAsyncSocket::deliverReadData() noexcept {
     read_cb_->readBufferAvailable(std::move(buf));
   } else {
     // 传统模式(TransportPeeker)
-    // getReadBuffer → memcpy → readDataAvailable,可能多次调用
-    while (!read_queue_.empty()) {
-      void* buf = nullptr;
-      size_t buf_len = 0;
-      read_cb_->getReadBuffer(&buf, &buf_len);
-      if (!buf || buf_len == 0) break;
+    // getReadBuffer → memcpy → readDataAvailable,每次只交付一块
+    void* buf = nullptr;
+    size_t buf_len = 0;
+    read_cb_->getReadBuffer(&buf, &buf_len);
+    if (!buf || buf_len == 0) return;
 
-      auto front = read_queue_.front();
-      if (!front) break;
-      size_t copy_len = std::min(front->length(), buf_len);
-      memcpy(buf, front->data(), copy_len);
-      read_queue_.trimStart(copy_len);
-      read_cb_->readDataAvailable(copy_len);
-    }
+    auto front = read_queue_.front();
+    if (!front) return;
+    size_t copy_len = std::min(front->length(), buf_len);
+    memcpy(buf, front->data(), copy_len);
+    read_queue_.trimStart(copy_len);
+    read_cb_->readDataAvailable(copy_len);
+  }
+
+  // 递归:read_cb_ 可能在上面的回调中变化(TransportPeeker 收满 13B → peekSuccess
+  // → PreReceivedDataAsyncTransportWrapper → setReadCB → read_cb_ 变为 Parser)
+  // 重新检查 isBufferMovable() 确保用正确模式交付剩余数据
+  if (read_cb_ && !read_queue_.empty()) {
+    deliverReadData();
   }
 }
 

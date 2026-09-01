@@ -35,7 +35,6 @@ class UrmaCqHandler : public EventHandler {
         socket_(nullptr),
         is_tx_(false),
         is_fc_(is_fc) {
-    setEdgeTriggered();  // ET 模式:fd 状态变化时只触发一次(参照 brpc/UMQ EPOLLET)
     registerHandler(READ | PERSIST);
   }
 
@@ -46,7 +45,6 @@ class UrmaCqHandler : public EventHandler {
         socket_(socket),
         is_tx_(true),
         is_fc_(false) {
-    setEdgeTriggered();
     registerHandler(READ | PERSIST);
   }
 
