@@ -38,6 +38,7 @@
 #include <folly/lang/Ordering.h>
 #include <folly/portability/SysUio.h>
 #include <folly/synchronization/MicroSpinLock.h>
+#include <folly/memory/IoBufPool.h>
 
 // Ignore shadowing warnings within this file, so includers can use -Wshadow.
 FOLLY_PUSH_WARNING
@@ -260,6 +261,13 @@ class IOBuf {
    */
   static std::unique_ptr<IOBuf> create(std::size_t capacity);
   IOBuf(CreateOp, std::size_t capacity);
+
+  static void enableMemoryPool();
+  static void setBlockSize(std::size_t size);
+  static void setMaxBlocksPerThread(std::size_t n);
+  static bool isMemoryPoolEnabled() { return sMemoryPoolEnabled.load(std::memory_order_relaxed); }
+  static size_t getBlockSize();
+  static size_t getMaxBlocksPerThread();
 
   /**
    * Create a new IOBuf, using a single memory allocation to allocate space
@@ -1623,6 +1631,11 @@ class IOBuf {
 
   // Pack flags in least significant 2 bits, sharedInfo in the rest
   uintptr_t flagsAndSharedInfo_{0};
+
+
+  static std::unique_ptr<IOBuf> createFromPoolShared(std::size_t capacity);
+  static std::atomic<bool> sMemoryPoolEnabled;
+  static void poolReleaseFn(void* buf, void* userData);
 
   static inline uintptr_t packFlagsAndSharedInfo(
       uintptr_t flags, SharedInfo* info) noexcept {
