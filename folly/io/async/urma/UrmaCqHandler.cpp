@@ -18,8 +18,11 @@ namespace folly {
 
 void UrmaCqHandler::handlerReady(uint16_t /*events*/) noexcept {
   if (is_tx_) {
-    // TX JFCE: SQ 满(EAGAIN)后 CQE 到达 → pollTx 回收 sbuf_ + retryWrite
+    // TX JFCE: CQE 到达(READ completion 或 SQ 解除 EAGAIN) → ack + pollTx + retryWrite
     if (socket_) {
+      urma_jfc_t* jfcs[1] = {socket_->txJfc()};
+      uint32_t nevents[1] = {1};
+      urma_ack_jfc(jfcs, nevents, 1);
       socket_->pollTx();
       socket_->retryWrite();
     }

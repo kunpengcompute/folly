@@ -24,7 +24,7 @@
 #ifdef FOLLY_HAVE_URMA
 
 #include <folly/io/async/urma/UrmaConfig.h>
-#include <folly/io/async/urma/stub/urma_api.h>
+#include <ub/umdk/urma/urma_api.h>
 
 namespace folly {
 
@@ -52,6 +52,9 @@ class UrmaInit {
   static void* poolAlloc(size_t size);
   static void poolFree(void* ptr);
   static size_t poolBufSize(size_t requested_size);
+
+  // 判断指针是否在 MR 池 mmap 区间内(A-1 兜底用)
+  static bool isPoolBuffer(const void* ptr);
 
  private:
   UrmaInit() = delete;

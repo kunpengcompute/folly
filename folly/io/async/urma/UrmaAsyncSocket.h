@@ -6,24 +6,28 @@
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
- * UrmaAsyncSocket: AsyncTransport 实现,基于 URMA SEND/RECV。
+ * UrmaAsyncSocket: AsyncTransport 实现,基于 URMA SEND/RECV + 单边 READ。
  *
  *   客户端: TCP connect + 异步握手 → URMA_ON
  *   服务端: accept fd + 异步握手 → URMA_ON
  *
  *   writeChain: pollTx → 多 SGE 合并 → post SEND → EAGAIN 挂起
- *   onRxBuf: IOBuf::takeOwnership 零拷贝 → readCB
- *   pollTx: 回收 SEND completion → 释放 sbuf_ → retryWrite
+ *   >4KB 大包: sendBigMsgByRead(控制包 SEND_IMM + 对端 READ 拉取 + FREE 释放)
+ *   onRxBuf: IOBuf::takeOwnership 零拷贝 → read_queue_ → deliverReadData
+ *   onControlMsg: SEND_IMM 控制包(PULL/FREE)路由
+ *   pollTx: 回收 SEND/READ completion → 释放 sbuf_ → retryWrite
  *   EAGAIN: pending_write_ 挂起 → TX JFCE 中断 → retryWrite
- *
- *   Phase 2 简化: 无 credit 流控(remote_rq_window = tx_depth); >4KB writeError
  */
 #pragma once
 
 #ifdef FOLLY_HAVE_URMA
 
 #include <atomic>
+#include <chrono>
+#include <deque>
+#include <map>
 #include <memory>
+#include <queue>
 #include <vector>
 
 #include <folly/SocketAddress.h>
@@ -36,7 +40,7 @@
 #include <folly/net/NetworkSocket.h>
 #include <folly/io/async/urma/UrmaConfig.h>
 #include <folly/io/async/urma/UrmaResource.h>
-#include <folly/io/async/urma/stub/urma_api.h>
+#include <ub/umdk/urma/urma_api.h>
 
 namespace folly {
 
@@ -101,8 +105,13 @@ class UrmaAsyncSocket : public AsyncTransport {
   size_t getRawBytesReceived() const override { return bytes_received_; }
 
   // ---------- URMA 专属 ----------
-  // 接收数据(由 UrmaSharedJfr::pollAndDispatch 调用)
+  // 接收数据(由 UrmaSharedJfr::pollAndDispatch 调用,普通 SEND)
   void onRxBuf(std::unique_ptr<IOBuf> data) noexcept;
+
+  // 控制包/FREE 通知(由 UrmaSharedJfr::pollAndDispatch 按 imm_valid 路由,SEND_IMM)
+  // imm: 编码 msg_id | is_ctl<<56 | data_size<<16
+  // meta: 控制包(PULL)时指向 8 字节 remote_va(FREE 时忽略)
+  void onControlMsg(uint64_t imm, const void* meta) noexcept;
 
   // 交付缓存数据给当前 read_cb_(支持 movable 和非 movable 两种模式)
   void deliverReadData() noexcept;
@@ -111,32 +120,38 @@ class UrmaAsyncSocket : public AsyncTransport {
   void pollTx() noexcept;
   void retryWrite() noexcept;
 
-  // 发送单个 IOBuf chain(多 SGE 合并 → post SEND)
-  // 返回值: URMA_SUCCESS(全部发完) / URMA_EAGAIN(SQ 满,剩余 chain 通过 remaining �出)
+  // TX JFC 访问器(供 UrmaCqHandler::handlerReady 做 ack)
+  urma_jfc_t* txJfc() noexcept { return res_.tx_jfc; }
+
+  // 发送单个 IOBuf chain(多 SGE 合并 → post SEND,或 >4KB 走单边 READ)
+  // big_deferred: 本调用有单边 READ 大包发出,writeSuccess 延迟到对端 FREE
   urma_status_t sendChain(WriteCallback* cb,
                           std::unique_ptr<IOBuf>& chain,
-                          uint32_t& total_posted) noexcept;
+                          uint32_t& total_posted,
+                          bool& big_deferred) noexcept;
 
-  // 遍历 pending_write_head_ 链表逐个发送(参照 AsyncSocket::handleWrite)
-  // 用于握手完成后 flush / EAGAIN 恢复后重试
   void handlePendingWrites() noexcept;
 
-  // 握手数据透传(TCP fd 收到的数据转发给 UrmaHandshake)
   void onHandshakeData(const uint8_t* data, size_t len);
 
-  // TCP connect 回调
   struct ConnectCallback : AsyncSocket::ConnectCallback {
     UrmaAsyncSocket* self;
     void connectSuccess() noexcept override;
     void connectErr(const AsyncSocketException&) noexcept override;
   };
 
+  static UniquePtr newSocket(
+    EventBase* evb,
+    const folly::SocketAddress& address) {
+    return UniquePtr{new UrmaAsyncSocket(evb, address)};
+  }
+
  private:
   enum class State : uint8_t {
     kIdle,
-    kConnecting,    // TCP connecting
-    kHandshaking,   // URMA handshake
-    kOpen,          // URMA_ON
+    kConnecting,
+    kHandshaking,
+    kOpen,
     kClosing,
     kClosed,
     kError,
@@ -147,7 +162,6 @@ class UrmaAsyncSocket : public AsyncTransport {
   void onHandshakeError(const std::string& reason);
   void destroyUrmaResources();
 
-  // 握手期间监听 TCP fd 可读事件的内部 EventHandler
   class TcpHandshakeHandler : public EventHandler {
    public:
     TcpHandshakeHandler(EventBase* evb, int fd, UrmaAsyncSocket* socket)
@@ -161,36 +175,50 @@ class UrmaAsyncSocket : public AsyncTransport {
     UrmaAsyncSocket* socket_;
   };
 
+  // ── 单边 READ 内部函数 ──
+  bool sendBigMsgByRead(WriteCallback* cb, std::unique_ptr<IOBuf> node) noexcept;
+  bool postControlPacket(uint16_t msg_id, uint64_t remote_va,
+                         uint32_t data_size) noexcept;
+  bool startRead(uint16_t msg_id, uint64_t remote_va, uint32_t data_size) noexcept;
+  bool postFreeNotify(uint16_t msg_id) noexcept;
+  void onReadComplete() noexcept;
+  void onReadFailed(urma_status_t status) noexcept;
+  void scanBigMsgTimeout() noexcept;
+  void drainRxPendingQueue() noexcept;
+  static uint64_t encodeBigMsgImm(uint16_t msg_id, uint8_t is_ctl, uint32_t data_size) {
+    return (static_cast<uint64_t>(msg_id)) |
+           (static_cast<uint64_t>(is_ctl) << 56) |
+           (static_cast<uint64_t>(data_size) << 16);
+  }
+  static void decodeBigMsgImm(uint64_t imm, uint16_t& msg_id, uint8_t& is_ctl, uint32_t& data_size) {
+    msg_id = static_cast<uint16_t>(imm & 0xFFFF);
+    is_ctl = static_cast<uint8_t>((imm >> 56) & 0xFF);
+    data_size = static_cast<uint32_t>((imm >> 16) & 0xFFFFFFFF);
+  }
+
   EventBase* evb_;
   int tcp_fd_{-1};
   State state_{State::kIdle};
   ReadCallback* read_cb_{nullptr};
 
-  // 接收数据缓存(URMA 数据到达后缓存,逐块交付给 read_cb_)
   folly::IOBufQueue read_queue_;
 
-  // TCP connect
   std::unique_ptr<ConnectCallback> connect_cb_;
-  AsyncSocket::UniquePtr tcp_socket_;  // 用于 TCP connect + 握手数据传输
+  AsyncSocket::UniquePtr tcp_socket_;
 
-  // URMA 资源(握手完成后填充)
   UrmaSharedJfr* shared_{nullptr};
   UrmaHandshake* handshake_{nullptr};
   UrmaResource res_;
   uint32_t peer_rx_buf_size_{4096};
 
-  // 握手期间监听 TCP fd 的 EventHandler
   std::unique_ptr<TcpHandshakeHandler> tcp_handshake_handler_;
 
-  // 发送状态
-  // sbuf_: per-WR 引用(SGE 数组 + IOBuf 链),持有直到 SEND completion
   struct WrRefs {
     std::shared_ptr<std::vector<urma_sge_t>> sge;
     std::shared_ptr<IOBuf> bufs;
   };
   std::vector<WrRefs> sbuf_;
 
-  // 排队的写请求(连接中/握手中/EAGAIN 挂起,参照 AsyncSocket writeReqHead_)
   struct PendingWrite {
     WriteCallback* cb;
     std::unique_ptr<IOBuf> buf;
@@ -199,8 +227,43 @@ class UrmaAsyncSocket : public AsyncTransport {
   std::unique_ptr<PendingWrite> pending_write_head_;
   PendingWrite* pending_write_tail_{nullptr};
 
-  // TX JFCE handler (EAGAIN 中断: SQ 满时 urma_rearm_jfc 武装, CQE 到达唤醒 retryWrite)
   UrmaCqHandler* tx_cq_handler_{nullptr};
+
+  // ── 单边 READ 状态 ──
+  static constexpr uint64_t kCtrlUserCtx = 0xFFFFFFFFFFFFFFFFULL;
+  static constexpr uint64_t kReadUserCtxBase = 0x8000000000000000ULL;
+  static constexpr uint8_t kCtrlTypePull = 1;
+  static constexpr uint8_t kCtrlTypeFree = 2;
+  static constexpr int kCtrlMsgMaxRetries = 3;
+
+  struct PendingBigMsg {
+    std::shared_ptr<IOBuf> iobuf;
+    std::chrono::steady_clock::time_point post_time;
+    uint8_t retries{0};
+    bool is_free{false};
+    WriteCallback* cb{nullptr};  // 延迟 writeSuccess/writeErr 用
+  };
+  std::map<uint16_t, PendingBigMsg> pending_big_msg_;
+
+  struct RxBufItem {
+    bool is_control = false;
+    uint16_t msg_id = 0;
+    uint64_t remote_va = 0;
+    uint32_t data_size = 0;
+    std::unique_ptr<IOBuf> data;
+  };
+  std::queue<RxBufItem> rx_pending_queue_;
+
+  bool has_pending_read_{false};
+  uint16_t pending_read_msg_id_{0};
+  std::unique_ptr<IOBuf> pending_read_buf_;
+  std::shared_ptr<std::vector<urma_sge_t>> pending_read_sge_;
+
+  uint16_t next_msg_id_{1};
+  // 控制包 8 字节 remote_va 的固定 MR buffer(每连接复用,B-6)
+  void* ctrl_meta_mr_{nullptr};
+  // 控制包/FREE 的 sge 引用(FIFO,pollTx 里 kCtrlUserCtx 时 pop_front)
+  std::deque<std::shared_ptr<std::vector<urma_sge_t>>> ctrl_sge_refs_;
 
   uint32_t send_timeout_ms_{0};
   size_t bytes_written_{0};

@@ -12,11 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 include(CheckCXXSourceCompiles)
 include(CheckCXXSymbolExists)
 include(CheckIncludeFileCXX)
 include(CheckFunctionExists)
 include(CMakePushCheckState)
+
 
 set(
   BOOST_LINK_STATIC "auto"
@@ -35,6 +37,7 @@ else()
 endif()
 set(Boost_USE_STATIC_LIBS "${FOLLY_BOOST_LINK_STATIC}")
 
+
 find_package(Boost 1.51.0 MODULE
   COMPONENTS
     context
@@ -48,9 +51,11 @@ find_package(Boost 1.51.0 MODULE
 list(APPEND FOLLY_LINK_LIBRARIES ${Boost_LIBRARIES})
 list(APPEND FOLLY_INCLUDE_DIRECTORIES ${Boost_INCLUDE_DIRS})
 
+
 find_package(DoubleConversion MODULE REQUIRED)
 list(APPEND FOLLY_LINK_LIBRARIES ${DOUBLE_CONVERSION_LIBRARY})
 list(APPEND FOLLY_INCLUDE_DIRECTORIES ${DOUBLE_CONVERSION_INCLUDE_DIR})
+
 
 find_package(Gflags MODULE)
 set(FOLLY_HAVE_LIBGFLAGS ${LIBGFLAGS_FOUND})
@@ -61,14 +66,17 @@ if(LIBGFLAGS_FOUND)
   set(FOLLY_LIBGFLAGS_INCLUDE ${LIBGFLAGS_INCLUDE_DIR})
 endif()
 
+
 find_package(Glog MODULE)
 set(FOLLY_HAVE_LIBGLOG ${GLOG_FOUND})
 list(APPEND FOLLY_LINK_LIBRARIES ${GLOG_LIBRARY})
 list(APPEND FOLLY_INCLUDE_DIRECTORIES ${GLOG_INCLUDE_DIR})
 
+
 find_package(LibEvent MODULE REQUIRED)
 list(APPEND FOLLY_LINK_LIBRARIES ${LIBEVENT_LIB})
 list(APPEND FOLLY_INCLUDE_DIRECTORIES ${LIBEVENT_INCLUDE_DIR})
+
 
 find_package(ZLIB MODULE)
 set(FOLLY_HAVE_LIBZ ${ZLIB_FOUND})
@@ -77,6 +85,7 @@ if (ZLIB_FOUND)
   list(APPEND FOLLY_LINK_LIBRARIES ${ZLIB_LIBRARIES})
   list(APPEND CMAKE_REQUIRED_LIBRARIES ${ZLIB_LIBRARIES})
 endif()
+
 
 find_package(OpenSSL 1.1.1 MODULE REQUIRED)
 list(APPEND FOLLY_LINK_LIBRARIES ${OPENSSL_LIBRARIES})
@@ -90,12 +99,14 @@ if (ZLIB_FOUND)
     list(REMOVE_ITEM CMAKE_REQUIRED_LIBRARIES ${ZLIB_LIBRARIES})
 endif()
 
+
 find_package(BZip2 MODULE)
 set(FOLLY_HAVE_LIBBZ2 ${BZIP2_FOUND})
 if (BZIP2_FOUND)
   list(APPEND FOLLY_INCLUDE_DIRECTORIES ${BZIP2_INCLUDE_DIRS})
   list(APPEND FOLLY_LINK_LIBRARIES ${BZIP2_LIBRARIES})
 endif()
+
 
 find_package(LibLZMA MODULE)
 set(FOLLY_HAVE_LIBLZMA ${LIBLZMA_FOUND})
@@ -104,12 +115,14 @@ if (LIBLZMA_FOUND)
   list(APPEND FOLLY_LINK_LIBRARIES ${LIBLZMA_LIBRARIES})
 endif()
 
+
 find_package(LZ4 MODULE)
 set(FOLLY_HAVE_LIBLZ4 ${LZ4_FOUND})
 if (LZ4_FOUND)
   list(APPEND FOLLY_INCLUDE_DIRECTORIES ${LZ4_INCLUDE_DIR})
   list(APPEND FOLLY_LINK_LIBRARIES ${LZ4_LIBRARY})
 endif()
+
 
 find_package(Zstd MODULE)
 set(FOLLY_HAVE_LIBZSTD ${ZSTD_FOUND})
@@ -118,6 +131,7 @@ if(ZSTD_FOUND)
   list(APPEND FOLLY_LINK_LIBRARIES ${ZSTD_LIBRARY})
 endif()
 
+
 find_package(Snappy MODULE)
 set(FOLLY_HAVE_LIBSNAPPY ${SNAPPY_FOUND})
 if (SNAPPY_FOUND)
@@ -125,33 +139,41 @@ if (SNAPPY_FOUND)
   list(APPEND FOLLY_LINK_LIBRARIES ${SNAPPY_LIBRARY})
 endif()
 
+
 find_package(LibDwarf)
 list(APPEND FOLLY_LINK_LIBRARIES ${LIBDWARF_LIBRARIES})
 list(APPEND FOLLY_INCLUDE_DIRECTORIES ${LIBDWARF_INCLUDE_DIRS})
+
 
 find_package(Libiberty)
 list(APPEND FOLLY_LINK_LIBRARIES ${LIBIBERTY_LIBRARIES})
 list(APPEND FOLLY_INCLUDE_DIRECTORIES ${LIBIBERTY_INCLUDE_DIRS})
 
+
 find_package(LibAIO)
 list(APPEND FOLLY_LINK_LIBRARIES ${LIBAIO_LIBRARIES})
 list(APPEND FOLLY_INCLUDE_DIRECTORIES ${LIBAIO_INCLUDE_DIRS})
+
 
 find_package(LibUring)
 list(APPEND FOLLY_LINK_LIBRARIES ${LIBURING_LIBRARIES})
 list(APPEND FOLLY_INCLUDE_DIRECTORIES ${LIBURING_INCLUDE_DIRS})
 
+
 find_package(Libsodium)
 list(APPEND FOLLY_LINK_LIBRARIES ${LIBSODIUM_LIBRARIES})
 list(APPEND FOLLY_INCLUDE_DIRECTORIES ${LIBSODIUM_INCLUDE_DIRS})
 
+
 list(APPEND FOLLY_LINK_LIBRARIES ${CMAKE_DL_LIBS})
 list(APPEND CMAKE_REQUIRED_LIBRARIES ${CMAKE_DL_LIBS})
+
 
 if (PYTHON_EXTENSIONS)
   find_package(PythonInterp 3.6 REQUIRED)
   find_package(Cython 0.26 REQUIRED)
 endif ()
+
 
 find_package(LibUnwind)
 list(APPEND FOLLY_LINK_LIBRARIES ${LIBUNWIND_LIBRARIES})
@@ -163,14 +185,17 @@ if (CMAKE_SYSTEM_NAME MATCHES "FreeBSD")
   list(APPEND FOLLY_LINK_LIBRARIES "execinfo")
 endif ()
 
+
 cmake_push_check_state()
 set(CMAKE_REQUIRED_DEFINITIONS -D_XOPEN_SOURCE)
 check_cxx_symbol_exists(swapcontext ucontext.h FOLLY_HAVE_SWAPCONTEXT)
 cmake_pop_check_state()
 
+
 set(FOLLY_USE_SYMBOLIZER OFF)
 CHECK_INCLUDE_FILE_CXX(elf.h FOLLY_HAVE_ELF)
 find_package(Backtrace)
+
 
 set(FOLLY_HAVE_BACKTRACE ${Backtrace_FOUND})
 set(FOLLY_HAVE_DWARF ${LIBDWARF_FOUND})
@@ -180,6 +205,7 @@ endif()
 message(STATUS "Setting FOLLY_USE_SYMBOLIZER: ${FOLLY_USE_SYMBOLIZER}")
 message(STATUS "Setting FOLLY_HAVE_ELF: ${FOLLY_HAVE_ELF}")
 message(STATUS "Setting FOLLY_HAVE_DWARF: ${FOLLY_HAVE_DWARF}")
+
 
 # Using clang with libstdc++ requires explicitly linking against libatomic
 check_cxx_source_compiles("
@@ -210,6 +236,7 @@ if(NOT FOLLY_CPP_ATOMIC_BUILTIN)
     )
   endif()
 endif()
+
 
 check_cxx_source_compiles("
   #include <type_traits>
@@ -247,10 +274,12 @@ check_cxx_source_compiles("
   FOLLY_STDLIB_LIBCPP
 )
 
+
 if (APPLE)
   list (APPEND CMAKE_REQUIRED_LIBRARIES c++abi)
   list (APPEND FOLLY_LINK_LIBRARIES c++abi)
 endif ()
+
 
 if (FOLLY_STDLIB_LIBSTDCXX AND NOT FOLLY_STDLIB_LIBSTDCXX_GE_9)
   list (APPEND CMAKE_REQUIRED_LIBRARIES stdc++fs)
@@ -261,16 +290,19 @@ if (FOLLY_STDLIB_LIBCXX AND NOT FOLLY_STDLIB_LIBCXX_GE_9)
   list (APPEND FOLLY_LINK_LIBRARIES c++fs)
 endif ()
 
+
 option(
   FOLLY_LIBRARY_SANITIZE_ADDRESS
   "Build folly with Address Sanitizer enabled."
   OFF
 )
 
+
 if ($ENV{WITH_ASAN})
   message(STATUS "ENV WITH_ASAN is set")
   set (FOLLY_LIBRARY_SANITIZE_ADDRESS ON)
 endif()
+
 
 if (FOLLY_LIBRARY_SANITIZE_ADDRESS)
   if ("${CMAKE_CXX_COMPILER_ID}" MATCHES GNU)
@@ -297,7 +329,9 @@ if (FOLLY_LIBRARY_SANITIZE_ADDRESS)
   endif()
 endif()
 
+
 add_library(folly_deps INTERFACE)
+
 
 find_package(fmt CONFIG)
 if (NOT DEFINED fmt_CONFIG)
@@ -306,40 +340,34 @@ if (NOT DEFINED fmt_CONFIG)
 endif()
 target_link_libraries(folly_deps INTERFACE fmt::fmt)
 
+
 # ---- URMA (UB hardware offload, direct URMA C API) ----
-# 默认使用 urma_stub/(stub 实现),无需真实 liburma.so 即可编译链接。
-# 若需链接真实 URMA 库,设置 -DURMA_USE_REAL_LIB=ON
-set(URMA_USE_REAL_LIB OFF CACHE BOOL "Link real liburma.so instead of urma_stub.cpp")
-set(URMA_ROOT "" CACHE PATH "Path to URMA include/lib directory (contains urma_api.h)")
-if (NOT URMA_ROOT)
-    set(URMA_ROOT "${FOLLY_DIR}/io/async/urma/stub")  # 默认:内置 stub
-endif()
+
+
 find_path(URMA_INCLUDE_DIR urma_api.h
-    PATHS "${URMA_ROOT}" "${URMA_ROOT}/include"
-    NO_DEFAULT_PATH
+    PATHS "/usr/include"
+    PATH_SUFFIXES "ub/umdk/urma"
 )
-if (URMA_INCLUDE_DIR)
+
+
+find_library(URMA_LIBRARY NAMES urma
+    PATHS "/usr/lib64" "/usr/lib"
+)
+
+
+if (URMA_INCLUDE_DIR AND URMA_LIBRARY)
     message(STATUS "Found URMA headers: ${URMA_INCLUDE_DIR}")
+    message(STATUS "Found URMA library: ${URMA_LIBRARY}")
     target_compile_definitions(folly_deps INTERFACE FOLLY_HAVE_URMA)
     target_include_directories(folly_deps SYSTEM INTERFACE
         $<BUILD_INTERFACE:${URMA_INCLUDE_DIR}>)
-    if (URMA_USE_REAL_LIB)
-        find_library(URMA_LIBRARY NAMES urma
-            PATHS "${URMA_ROOT}/lib" "${URMA_ROOT}/build/lib"
-            NO_DEFAULT_PATH
-        )
-        if (URMA_LIBRARY)
-            message(STATUS "Linking real URMA library: ${URMA_LIBRARY}")
-            target_link_libraries(folly_deps INTERFACE ${URMA_LIBRARY})
-        else()
-            message(FATAL_ERROR "URMA_USE_REAL_LIB=ON but liburma.so not found")
-        endif()
-    else()
-        message(STATUS "Using urma_stub.cpp (default). Set -DURMA_USE_REAL_LIB=ON to link real liburma.so.")
-    endif()
+    target_link_libraries(folly_deps INTERFACE ${URMA_LIBRARY})
+elseif (URMA_INCLUDE_DIR)
+    message(WARNING "URMA headers found but liburma.so not found; URMA support disabled.")
 else()
-    message(STATUS "URMA headers not found (URMA_ROOT=${URMA_ROOT}); URMA support disabled.")
+    message(STATUS "URMA headers not found; URMA support disabled.")
 endif()
+
 
 list(REMOVE_DUPLICATES FOLLY_INCLUDE_DIRECTORIES)
 target_include_directories(folly_deps INTERFACE ${FOLLY_INCLUDE_DIRECTORIES})

@@ -21,7 +21,7 @@
 #include <cstdint>
 #include <string>
 
-#include <folly/io/async/urma/stub/urma_api.h>
+#include <ub/umdk/urma/urma_api.h>
 #include <folly/logging/xlog.h>
 
 namespace folly {

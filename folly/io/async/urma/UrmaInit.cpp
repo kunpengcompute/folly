@@ -77,7 +77,8 @@ static int poolTier(size_t size) {
   if (size <= URMA_SMALL_BUF_SIZE) return 0;
   if (size <= URMA_MEDIUM_BUF_SIZE) return 1;
   if (size <= URMA_BIG_BUF_SIZE) return 2;
-  return 3;
+  if (size <= URMA_LARGE_BUF_SIZE) return 3;
+  return -1;
 }
 
 // 按 tier stride 移位,使连续 buffer 均匀落到不同 shard
@@ -183,6 +184,10 @@ void UrmaInit::finiMrPool() {
 
 void* UrmaInit::poolAlloc(size_t size) {
   int tier = poolTier(size);
+  if (tier < 0) {
+    XLOG(WARN) << "UrmaInit: poolAlloc size=" << size << " exceeds max tier (1MB), rejected";
+    return nullptr;
+  }
   // 用线程 ID 选起始 shard,优先查自己的 shard,miss 后 steal 其余 shard
   size_t start = allocShardIndex();
   for (size_t i = 0; i < URMA_NUM_SHARDS; ++i) {
@@ -218,7 +223,15 @@ void UrmaInit::poolFree(void* ptr) {
 }
 
 size_t UrmaInit::poolBufSize(size_t requested_size) {
-  return TIER_SIZES[poolTier(requested_size)];
+  int tier = poolTier(requested_size);
+  if (tier < 0) return 0;
+  return TIER_SIZES[tier];
+}
+
+bool UrmaInit::isPoolBuffer(const void* ptr) {
+  if (!s_mmap_base || !ptr) return false;
+  auto p = static_cast<const char*>(ptr);
+  return p >= s_mmap_base && p < s_mmap_base + s_mmap_size;
 }
 
 void UrmaInit::init(const UrmaConfig& config) {
@@ -254,6 +267,9 @@ void UrmaInit::init(const UrmaConfig& config) {
   }
   if (!found) {
     XLOG(ERR) << "UrmaInit: URMA device not found: " << s_config.dev_name;
+    for (int i = 0; i < ndev; ++i) {
+      XLOG(ERR) << "UrmaInit: available device[" << i << "]: " << devs[i]->name;
+    }
     urma_free_device_list(devs);
     urma_uninit();
     return;
