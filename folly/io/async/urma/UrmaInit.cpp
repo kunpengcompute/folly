@@ -228,12 +228,6 @@ size_t UrmaInit::poolBufSize(size_t requested_size) {
   return TIER_SIZES[tier];
 }
 
-bool UrmaInit::isPoolBuffer(const void* ptr) {
-  if (!s_mmap_base || !ptr) return false;
-  auto p = static_cast<const char*>(ptr);
-  return p >= s_mmap_base && p < s_mmap_base + s_mmap_size;
-}
-
 void UrmaInit::init(const UrmaConfig& config) {
   if (s_inited_) {
     XLOG(WARN) << "UrmaInit::init already called, skipping";

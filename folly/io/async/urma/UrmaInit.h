@@ -53,9 +53,6 @@ class UrmaInit {
   static void poolFree(void* ptr);
   static size_t poolBufSize(size_t requested_size);
 
-  // 判断指针是否在 MR 池 mmap 区间内(A-1 兜底用)
-  static bool isPoolBuffer(const void* ptr);
-
  private:
   UrmaInit() = delete;
 

@@ -50,6 +50,7 @@ class UrmaCqHandler;
 
 class UrmaAsyncSocket : public AsyncTransport {
   friend class UrmaHandshake;
+  struct BigMsgGroup;  // 前向声明(定义见 private 区,供 sendChain 签名使用)
  public:
   // 客户端构造
   UrmaAsyncSocket(EventBase* evb, const SocketAddress& addr);
@@ -128,7 +129,8 @@ class UrmaAsyncSocket : public AsyncTransport {
   urma_status_t sendChain(WriteCallback* cb,
                           std::unique_ptr<IOBuf>& chain,
                           uint32_t& total_posted,
-                          bool& big_deferred) noexcept;
+                          bool& big_deferred,
+                          const std::shared_ptr<BigMsgGroup>& group) noexcept;
 
   void handlePendingWrites() noexcept;
 
@@ -176,7 +178,8 @@ class UrmaAsyncSocket : public AsyncTransport {
   };
 
   // ── 单边 READ 内部函数 ──
-  bool sendBigMsgByRead(WriteCallback* cb, std::unique_ptr<IOBuf> node) noexcept;
+  bool sendBigMsgByRead(WriteCallback* cb, std::unique_ptr<IOBuf> node,
+                        const std::shared_ptr<BigMsgGroup>& group) noexcept;
   bool postControlPacket(uint16_t msg_id, uint64_t remote_va,
                          uint32_t data_size) noexcept;
   bool startRead(uint16_t msg_id, uint64_t remote_va, uint32_t data_size) noexcept;
@@ -219,9 +222,17 @@ class UrmaAsyncSocket : public AsyncTransport {
   };
   std::vector<WrRefs> sbuf_;
 
+  // 一个 writeChain 内多个大包共享的完成组:
+  // writeSuccess 只在组内所有大包都收到对端 FREE 后回调一次
+  struct BigMsgGroup {
+    uint32_t remaining{0};  // 本 writeChain 尚未收到 FREE 的大包数
+    bool done{false};       // 已回调 writeSuccess/writeErr
+  };
+
   struct PendingWrite {
     WriteCallback* cb;
     std::unique_ptr<IOBuf> buf;
+    std::shared_ptr<BigMsgGroup> big_group;  // 跨 EAGAIN 复用同一个组
     std::unique_ptr<PendingWrite> next;
   };
   std::unique_ptr<PendingWrite> pending_write_head_;
@@ -242,6 +253,7 @@ class UrmaAsyncSocket : public AsyncTransport {
     uint8_t retries{0};
     bool is_free{false};
     WriteCallback* cb{nullptr};  // 延迟 writeSuccess/writeErr 用
+    std::shared_ptr<BigMsgGroup> group;  // 所属 writeChain 完成组
   };
   std::map<uint16_t, PendingBigMsg> pending_big_msg_;
 

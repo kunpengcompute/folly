@@ -25,6 +25,20 @@
 
 namespace folly {
 
+// 统计 IOBuf chain 中 >peer_rx_buf_size_ 的大包数量(用于 writeChain 完成组计数)
+static uint32_t countBigMsgs(const IOBuf* head, uint32_t peer_rx_buf_size) {
+  uint32_t n = 0;
+  if (!head) return 0;
+  const IOBuf* b = head;
+  do {
+    if (b->length() > peer_rx_buf_size) {
+      ++n;
+    }
+    b = b->next();
+  } while (b != head);
+  return n;
+}
+
 // ── TcpHandshakeHandler ──
 
 void UrmaAsyncSocket::TcpHandshakeHandler::handlerReady(
@@ -199,10 +213,15 @@ void UrmaAsyncSocket::writeChain(WriteCallback* cb, std::unique_ptr<IOBuf>&& cha
     return;
   }
 
+  // 本 writeChain 的完成组:组内所有大包收到对端 FREE 后 writeSuccess 只回调一次
+  auto group = std::make_shared<BigMsgGroup>();
+  group->remaining = countBigMsgs(chain.get(), peer_rx_buf_size_);
+
   if (pending_write_head_) {
     auto pw = std::make_unique<PendingWrite>();
     pw->cb = cb;
     pw->buf = std::move(chain);
+    pw->big_group = group;
     pw->next = nullptr;
     pending_write_tail_->next = std::move(pw);
     pending_write_tail_ = pending_write_tail_->next.get();
@@ -213,6 +232,7 @@ void UrmaAsyncSocket::writeChain(WriteCallback* cb, std::unique_ptr<IOBuf>&& cha
     auto pw = std::make_unique<PendingWrite>();
     pw->cb = cb;
     pw->buf = std::move(chain);
+    pw->big_group = group;
     pw->next = nullptr;
     pending_write_head_ = std::move(pw);
     pending_write_tail_ = pending_write_head_.get();
@@ -223,11 +243,15 @@ void UrmaAsyncSocket::writeChain(WriteCallback* cb, std::unique_ptr<IOBuf>&& cha
 
   uint32_t total_posted = 0;
   bool big_deferred = false;
-  urma_status_t ret = sendChain(cb, chain, total_posted, big_deferred);
+  urma_status_t ret = sendChain(cb, chain, total_posted, big_deferred, group);
   if (ret == URMA_EAGAIN) {
+    XLOG(INFO) << "[URMA] writeChain EAGAIN queued total=" << total_posted
+               << " big_deferred=" << big_deferred
+               << " pending_big=" << pending_big_msg_.size();
     auto pw = std::make_unique<PendingWrite>();
     pw->cb = cb;
     pw->buf = std::move(chain);
+    pw->big_group = group;
     pw->next = nullptr;
     pending_write_head_ = std::move(pw);
     pending_write_tail_ = pending_write_head_.get();
@@ -238,7 +262,11 @@ void UrmaAsyncSocket::writeChain(WriteCallback* cb, std::unique_ptr<IOBuf>&& cha
       }
     }
   } else if (ret == URMA_SUCCESS) {
-    if (cb && !big_deferred) cb->writeSuccess();
+    XLOG(INFO) << "[URMA] writeChain done total=" << total_posted
+               << " big_deferred=" << big_deferred
+               << " pending_big=" << pending_big_msg_.size();
+    // 组内大包未全部 FREE 时延迟 writeSuccess(跨 EAGAIN 拆分的多次 sendChain 也成立)
+    if (cb && group->remaining == 0) cb->writeSuccess();
     bytes_written_ += total_posted;
   }
 }
@@ -258,11 +286,16 @@ void UrmaAsyncSocket::pollTx() noexcept {
         if (!ctrl_sge_refs_.empty()) {
           ctrl_sge_refs_.pop_front();
         }
+        XLOG(INFO) << "[URMA] cqeCtrl st=" << static_cast<int>(cr[i].status)
+                   << " ctrl_inflight=" << ctrl_sge_refs_.size();
         continue;
       }
       if (ctx & kReadUserCtxBase) {
         // B-4: 校验 CQE msg_id,跳过旧 READ 的重复 CQE
         uint16_t cqe_msg_id = static_cast<uint16_t>(ctx & 0xFFFF);
+        XLOG(INFO) << "[URMA] cqeRead msg_id=" << cqe_msg_id
+                   << " st=" << static_cast<int>(cr[i].status)
+                   << " expect=" << pending_read_msg_id_;
         if (cqe_msg_id != pending_read_msg_id_) {
           XLOG(WARN) << "[URMA] pollTx: stale READ cqe msg_id=" << cqe_msg_id
                      << " expect=" << pending_read_msg_id_;
@@ -277,6 +310,8 @@ void UrmaAsyncSocket::pollTx() noexcept {
       }
       // SEND completion:释放 sbuf_
       uint64_t idx = ctx;
+      XLOG(INFO) << "[URMA] cqeSend idx=" << idx
+                 << " st=" << static_cast<int>(cr[i].status);
       if (idx < sbuf_.size()) {
         sbuf_[idx] = {};
       }
@@ -292,7 +327,8 @@ void UrmaAsyncSocket::retryWrite() noexcept {
 urma_status_t UrmaAsyncSocket::sendChain(WriteCallback* cb,
                                           std::unique_ptr<IOBuf>& chain,
                                           uint32_t& total_posted,
-                                          bool& big_deferred) noexcept {
+                                          bool& big_deferred,
+                                          const std::shared_ptr<BigMsgGroup>& group) noexcept {
   total_posted = 0;
   big_deferred = false;
   if (state_ != State::kOpen) {
@@ -320,13 +356,14 @@ urma_status_t UrmaAsyncSocket::sendChain(WriteCallback* cb,
         auto big = std::move(chain);
         size_t big_len = big->length();
         chain = big->pop();  // 剩余 chain 返回
-        if (sendBigMsgByRead(cb, std::move(big))) {
-          big_deferred = true;  // writeSuccess 延迟到对端 FREE
+        if (sendBigMsgByRead(cb, std::move(big), group)) {
+          big_deferred = true;  // writeSuccess 延迟到组内所有大包 FREE
           total_posted += static_cast<uint32_t>(big_len);
           continue;
         }
         if (cb) cb->writeErr(total_posted, AsyncSocketException(
             AsyncSocketException::UNKNOWN, "sendBigMsgByRead failed"));
+        if (group) group->done = true;  // 防止已发大包后续 FREE 再回调 writeSuccess
         return URMA_FAIL;
       }
       (*sge_arr)[num_sge].addr = reinterpret_cast<uint64_t>(chain->writableData());
@@ -364,6 +401,7 @@ urma_status_t UrmaAsyncSocket::sendChain(WriteCallback* cb,
     XLOG(ERR) << "UrmaAsyncSocket: post failed, status=" << ret;
     if (cb) cb->writeErr(total_posted, AsyncSocketException(
         AsyncSocketException::UNKNOWN, "urma_post_jetty_send_wr failed"));
+    if (group) group->done = true;  // 防止已发大包后续 FREE 再回调 writeSuccess
     return URMA_FAIL;
   }
   return URMA_SUCCESS;
@@ -378,7 +416,14 @@ void UrmaAsyncSocket::handlePendingWrites() noexcept {
     uint32_t total_posted = 0;
     bool big_deferred = false;
 
-    urma_status_t ret = sendChain(pw->cb, chain, total_posted, big_deferred);
+    // 防御:老路径可能没建完成组,补一个(计数仅覆盖剩余 chain)
+    if (!pw->big_group) {
+      pw->big_group = std::make_shared<BigMsgGroup>();
+      pw->big_group->remaining = countBigMsgs(chain.get(), peer_rx_buf_size_);
+    }
+
+    urma_status_t ret = sendChain(pw->cb, chain, total_posted, big_deferred,
+                                  pw->big_group);
     if (ret == URMA_EAGAIN) {
       pw->buf = std::move(chain);
       if (res_.tx_jfc) {
@@ -391,14 +436,19 @@ void UrmaAsyncSocket::handlePendingWrites() noexcept {
     }
     if (ret == URMA_SUCCESS) {
       WriteCallback* cb = pw->cb;
+      auto big_group = pw->big_group;  // pw 即将销毁,先保存完成组
       pending_write_head_ = std::move(pending_write_head_->next);
       if (!pending_write_head_) {
         pending_write_tail_ = nullptr;
       }
-      if (cb && !big_deferred) cb->writeSuccess();
+      XLOG(INFO) << "[URMA] pendingWrite done total=" << total_posted
+                 << " big_deferred=" << big_deferred
+                 << " pending_big=" << pending_big_msg_.size();
+      if (cb && big_group->remaining == 0) cb->writeSuccess();
       bytes_written_ += total_posted;
     }
     if (ret == URMA_FAIL) {
+      XLOG(ERR) << "[URMA] pendingWrite FAIL total=" << total_posted;
       pending_write_head_ = std::move(pending_write_head_->next);
       if (!pending_write_head_) {
         pending_write_tail_ = nullptr;
@@ -410,21 +460,9 @@ void UrmaAsyncSocket::handlePendingWrites() noexcept {
 // ── 单边 READ:发送方 ──
 
 bool UrmaAsyncSocket::sendBigMsgByRead(WriteCallback* cb,
-                                       std::unique_ptr<IOBuf> node) noexcept {
+                                       std::unique_ptr<IOBuf> node,
+                                       const std::shared_ptr<BigMsgGroup>& group) noexcept {
   uint32_t data_size = static_cast<uint32_t>(node->length());
-
-  // A-1: 非 MR 内存先 memcpy 一次到 MR buffer 兜底
-  if (!UrmaInit::isPoolBuffer(node->data())) {
-    void* mr_buf = UrmaInit::poolAlloc(data_size);
-    if (!mr_buf) {
-      XLOG(ERR) << "[URMA] sendBig: poolAlloc fallback failed size=" << data_size;
-      return false;
-    }
-    std::memcpy(mr_buf, node->data(), data_size);
-    node = IOBuf::takeOwnership(
-        mr_buf, data_size,
-        [](void* ptr, void*) { UrmaInit::poolFree(ptr); });
-  }
 
   // C-3: msg_id 回绕后跳过仍在途的
   uint16_t msg_id = next_msg_id_;
@@ -434,8 +472,6 @@ bool UrmaAsyncSocket::sendBigMsgByRead(WriteCallback* cb,
   next_msg_id_ = msg_id + 1;
 
   uint64_t remote_va = reinterpret_cast<uint64_t>(node->data());
-  XLOG(INFO) << "[URMA] sendBig msg_id=" << msg_id << " size=" << data_size
-             << " remote_va=" << remote_va;
 
   PendingBigMsg p;
   p.iobuf = std::shared_ptr<IOBuf>(std::move(node));
@@ -443,7 +479,12 @@ bool UrmaAsyncSocket::sendBigMsgByRead(WriteCallback* cb,
   p.retries = 0;
   p.is_free = false;
   p.cb = cb;
+  p.group = group;
   pending_big_msg_.emplace(msg_id, std::move(p));
+
+  XLOG(INFO) << "[URMA] sendBig msg_id=" << msg_id << " size=" << data_size
+             << " remote_va=" << remote_va
+             << " inflight=" << pending_big_msg_.size();
 
   if (!postControlPacket(msg_id, remote_va, data_size)) {
     pending_big_msg_.erase(msg_id);
@@ -491,7 +532,9 @@ bool UrmaAsyncSocket::postControlPacket(uint16_t msg_id, uint64_t remote_va,
     ctrl_sge_refs_.pop_back();
   }
   XLOG(INFO) << "[URMA] ctrlPullPost msg_id=" << msg_id << " size=" << data_size
-             << " st=" << static_cast<int>(st);
+             << " st=" << static_cast<int>(st)
+             << " meta=" << reinterpret_cast<uintptr_t>(ctrl_meta_mr_)
+             << " ctrl_inflight=" << ctrl_sge_refs_.size();
   return st == URMA_SUCCESS;
 }
 
@@ -504,14 +547,23 @@ void UrmaAsyncSocket::onControlMsg(uint64_t imm, const void* meta) noexcept {
   decodeBigMsgImm(imm, msg_id, is_ctl, data_size);
 
   if (is_ctl == kCtrlTypeFree) {
-    // 发送方收到 FREE:释放大 buffer 并回调 writeSuccess(幂等,重复 FREE 忽略)
+    // 发送方收到 FREE:释放大 buffer。writeSuccess 只在组内全部大包 FREE 后回调一次
     auto it = pending_big_msg_.find(msg_id);
     XLOG(INFO) << "[URMA] ctrlFreeRecv msg_id=" << msg_id
-               << " found=" << (it != pending_big_msg_.end());
+               << " found=" << (it != pending_big_msg_.end())
+               << " inflight=" << pending_big_msg_.size();
     if (it != pending_big_msg_.end() && !it->second.is_free) {
+      auto group = it->second.group;
       WriteCallback* cb = it->second.cb;
       pending_big_msg_.erase(it);
-      if (cb) cb->writeSuccess();
+      if (group) {
+        if (!group->done && --group->remaining == 0) {
+          group->done = true;
+          if (cb) cb->writeSuccess();
+        }
+      } else if (cb) {
+        cb->writeSuccess();
+      }
     }
     return;
   }
@@ -537,6 +589,8 @@ void UrmaAsyncSocket::onControlMsg(uint64_t imm, const void* meta) noexcept {
     item.remote_va = remote_va;
     item.data_size = data_size;
     rx_pending_queue_.push(std::move(item));
+    XLOG(INFO) << "[URMA] ctrlPullQueued msg_id=" << msg_id
+               << " size=" << data_size << " qsize=" << rx_pending_queue_.size();
     return;
   }
 
@@ -657,6 +711,9 @@ void UrmaAsyncSocket::drainRxPendingQueue() noexcept {
       XLOG(INFO) << "[URMA] drainCtrl msg_id=" << item.msg_id
                  << " size=" << item.data_size << " qsize=" << rx_pending_queue_.size();
       has_pending_read_ = startRead(item.msg_id, item.remote_va, item.data_size);
+      if (!has_pending_read_) {
+        XLOG(ERR) << "[URMA] drainCtrl startRead failed msg_id=" << item.msg_id;
+      }
       return;
     }
     XLOG(INFO) << "[URMA] drainData len=" << item.data->length();
@@ -686,10 +743,19 @@ void UrmaAsyncSocket::scanBigMsgTimeout() noexcept {
     if (p.retries >= kCtrlMsgMaxRetries) {
       XLOG(ERR) << "[URMA] sendBig: msg " << it->first
                 << " timeout, giving up (is_free=" << p.is_free << ")";
+      auto group = p.group;
       WriteCallback* cb = p.cb;
       it = pending_big_msg_.erase(it);
-      // B-3: 回调 writeErr,上层可感知大包失败
-      if (cb) {
+      // B-3: 组内任一重发耗尽,整个 writeChain 只回调一次 writeErr
+      if (group) {
+        if (!group->done) {
+          group->done = true;
+          if (cb) {
+            cb->writeErr(0, AsyncSocketException(
+                AsyncSocketException::UNKNOWN, "big msg timeout after retries"));
+          }
+        }
+      } else if (cb) {
         cb->writeErr(0, AsyncSocketException(
             AsyncSocketException::UNKNOWN, "big msg timeout after retries"));
       }
