@@ -263,7 +263,7 @@ index af710faaff2756b65b7ba8c46d80aeebfeedcd51..ba4a9b10c554bfa3d5151d4673183ff8
  
  void AsyncIoUringSocket::closeProcessSubmit(struct io_uring_sqe* sqe) {
 diff --git a/folly/experimental/io/AsyncIoUringSocket.h b/folly/experimental/io/AsyncIoUringSocket.h
-index 5ef9a36ae091a84689f827f6cbfe28970a7f6524..fbccdd8a6de12ad361280da6016d12b1a8990152 100644
+index 5ef9a36ae091a84689f827f6cbfe28970a7f6524..562277615306f1e3ac5f03be51ce01222e5469e8 100644
 --- a/folly/experimental/io/AsyncIoUringSocket.h
 +++ b/folly/experimental/io/AsyncIoUringSocket.h
 @@ -46,6 +46,26 @@ namespace folly {
@@ -305,14 +305,14 @@ index 5ef9a36ae091a84689f827f6cbfe28970a7f6524..fbccdd8a6de12ad361280da6016d12b1
 +      bool useZeroCopy = false) {
 +      bool isConnected = false;
 +      folly::AsyncIoUringSocket::UniquePtr socket;
-+
++      
 +      SocketAddress sockAddr(ip, port);
 +      auto connCb = std::make_shared<ConnectCallback>(isConnected);
 +      evb->runInEventBaseThread([&socket, connCb, sockAddr, evb]{
 +        socket = folly::AsyncIoUringSocket::UniquePtr{new folly::AsyncIoUringSocket(evb)};
 +        socket->connect(connCb.get(), sockAddr);
 +      });
-+
++      
 +      while (!isConnected) {
 +        std::this_thread::yield();
 +      }
@@ -541,7 +541,7 @@ index 9d6e59717332f871dd891b8c515e1a2dc3b1fddd..5364c09a15d68aecd79ea71b2fe140dd
  BENCHMARK_RELATIVE_NAMED_PARAM(
      runIOUringTest, io_uring_no_batching_no_per, 1024, 1, false)
 diff --git a/folly/io/IOBuf.cpp b/folly/io/IOBuf.cpp
-index 831acd883e54aad07cff19160e72688de8de1bf8..dc701bd1948a6b6726ec45aa90e575e1a9d8c59c 100644
+index 831acd883e54aad07cff19160e72688de8de1bf8..9992cb34e989d2fa87690a46c9736262a797ca8b 100644
 --- a/folly/io/IOBuf.cpp
 +++ b/folly/io/IOBuf.cpp
 @@ -20,6 +20,7 @@
@@ -572,23 +572,24 @@ index 831acd883e54aad07cff19160e72688de8de1bf8..dc701bd1948a6b6726ec45aa90e575e1
  
    HeapStorage hs;
    SharedInfo shared;
-@@ -325,6 +327,15 @@ unique_ptr<IOBuf> IOBuf::create(std::size_t capacity) {
+@@ -325,6 +327,16 @@ unique_ptr<IOBuf> IOBuf::create(std::size_t capacity) {
      throw_exception<std::bad_alloc>();
    }
  
 +  if (sMemoryPoolEnabled.load(std::memory_order_acquire)) {
-+    size_t blockDataCap = detail::gIoBufBlockSize.load(std::memory_order_relaxed) - sizeof(IoBufBlock);
-+    if (capacity <= blockDataCap) {
++    const size_t blockSize =
++        detail::gIoBufBlockSize.load(std::memory_order_relaxed);
++    if (blockSize >= sizeof(IoBufBlock) &&
++        capacity <= blockSize - sizeof(IoBufBlock)) {
 +      return createFromPoolShared(capacity);
 +    }
-+    // For large capacities, fall through to original path
-+    // (createSeparate handles large allocations correctly)
++    // Invalid block sizes and large capacities use the original allocation path.
 +  }
 +
    // For smaller-sized buffers, allocate the IOBuf, SharedInfo, and the buffer
    // all with a single allocation.
    //
-@@ -390,6 +401,56 @@ unique_ptr<IOBuf> IOBuf::createSeparate(std::size_t capacity) {
+@@ -390,6 +402,56 @@ unique_ptr<IOBuf> IOBuf::createSeparate(std::size_t capacity) {
    return std::make_unique<IOBuf>(CREATE, capacity);
  }
  
@@ -645,7 +646,7 @@ index 831acd883e54aad07cff19160e72688de8de1bf8..dc701bd1948a6b6726ec45aa90e575e1
  unique_ptr<IOBuf> IOBuf::createChain(
      size_t totalCapacity, std::size_t maxBufCapacity) {
    unique_ptr<IOBuf> out =
-@@ -613,8 +674,6 @@ IOBuf::IOBuf(
+@@ -613,8 +675,6 @@ IOBuf::IOBuf(
        flagsAndSharedInfo_(flagsAndSharedInfo) {
    assert(data >= buf);
    assert(intptr_t(data) + length <= intptr_t(buf) + capacity);
@@ -694,10 +695,10 @@ index 9edfc723910939b96c94e439966c995082ce9bd0..e8a0b88d77eae31b91770cdfbfecb3e3
      uintptr_t uinfo = reinterpret_cast<uintptr_t>(info);
 diff --git a/folly/memory/IoBufPool.cpp b/folly/memory/IoBufPool.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..898ac3a2ac4f74c18efc1eae0025c47587a2ddce
+index 0000000000000000000000000000000000000000..bb5fe7a5c169f27ca82fe586f8ade29fc3f3f529
 --- /dev/null
 +++ b/folly/memory/IoBufPool.cpp
-@@ -0,0 +1,97 @@
+@@ -0,0 +1,105 @@
 +/*
 + * Copyright (c) Meta Platforms, Inc. and affiliates.
 + *
@@ -731,6 +732,9 @@ index 0000000000000000000000000000000000000000..898ac3a2ac4f74c18efc1eae0025c475
 +
 +static IoBufBlock* allocateFromSystem() {
 +  const size_t blockSize = gIoBufBlockSize.load(std::memory_order_relaxed);
++  if (blockSize < sizeof(IoBufBlock)) {
++    return nullptr;
++  }
 +  void* mem = std::malloc(blockSize);
 +  if (!mem) return nullptr;
 +  auto* b = static_cast<IoBufBlock*>(mem);
@@ -777,6 +781,11 @@ index 0000000000000000000000000000000000000000..898ac3a2ac4f74c18efc1eae0025c475
 +    c.current_share = nullptr;
 +  }
 +  c.current_share = ioBufBlockAllocate();
++  // A cached block may have been allocated with a different block size.
++  if (c.current_share != nullptr &&
++      c.current_share->remaining() < min_capacity) {
++    return nullptr;
++  }
 +  return c.current_share;
 +}
 +
@@ -797,7 +806,7 @@ index 0000000000000000000000000000000000000000..898ac3a2ac4f74c18efc1eae0025c475
 +} // namespace folly
 diff --git a/folly/memory/IoBufPool.h b/folly/memory/IoBufPool.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..97081751d9c28c009e6ba3d84188d8ce3558923e
+index 0000000000000000000000000000000000000000..91635536a8f6f0e405d43613eb4a446e16c1adf0
 --- /dev/null
 +++ b/folly/memory/IoBufPool.h
 @@ -0,0 +1,67 @@
@@ -828,7 +837,7 @@ index 0000000000000000000000000000000000000000..97081751d9c28c009e6ba3d84188d8ce
 +constexpr size_t kDefaultBlockSize = 8192;
 +constexpr size_t kMaxBlocksHardLimit = 256;
 +
-+struct IoBufBlock {
++struct alignas(16) IoBufBlock {
 +  static constexpr uint32_t kBlockMagic = 0x12345678;
 +
 +  uint32_t magic;
@@ -845,7 +854,7 @@ index 0000000000000000000000000000000000000000..97081751d9c28c009e6ba3d84188d8ce
 +  bool full() const { return data_len >= capacity; }
 +  size_t remaining() const { return capacity - data_len; }
 +};
-+static_assert(sizeof(IoBufBlock) == 24, "IoBufBlock must be 24 bytes");
++static_assert(sizeof(IoBufBlock) == 32, "IoBufBlock must be 32 bytes for 16-byte alignment");
 +
 +namespace detail {
 +
@@ -870,7 +879,7 @@ index 0000000000000000000000000000000000000000..97081751d9c28c009e6ba3d84188d8ce
 +} // namespace folly
 diff --git a/folly/memory/test/IoBufPoolTest.cpp b/folly/memory/test/IoBufPoolTest.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..436b7b07907ef0eb284eca23b120006fec7cefe4
+index 0000000000000000000000000000000000000000..b065337ca5c9650fc839ec59abe128b1b5d9b56f
 --- /dev/null
 +++ b/folly/memory/test/IoBufPoolTest.cpp
 @@ -0,0 +1,401 @@
@@ -984,10 +993,10 @@ index 0000000000000000000000000000000000000000..436b7b07907ef0eb284eca23b120006f
 +}
 +
 +TEST(IoBufPool, BlockSizes) {
-+  EXPECT_EQ(24u, sizeof(IoBufBlock));
++  EXPECT_EQ(32u, sizeof(IoBufBlock));
 +  EXPECT_EQ(8192u, kDefaultBlockSize);
 +  EXPECT_EQ(256u, kMaxBlocksHardLimit);
-+  EXPECT_EQ(8192u - 24u, kDefaultBlockSize - sizeof(IoBufBlock));
++  EXPECT_EQ(8192u - 32u, kDefaultBlockSize - sizeof(IoBufBlock));
 +}
 +
 +// =========================================================================
@@ -1247,7 +1256,7 @@ index 0000000000000000000000000000000000000000..436b7b07907ef0eb284eca23b120006f
 +TEST(IoBufPool, DefaultBlockSizeConstants) {
 +  EXPECT_EQ(8192u, kDefaultBlockSize);
 +  EXPECT_EQ(256u, kMaxBlocksHardLimit);
-+  EXPECT_EQ(24u, sizeof(IoBufBlock));
++  EXPECT_EQ(32u, sizeof(IoBufBlock));
 +}
 +
 +TEST(IoBufPool, IoBufBlockLayout) {
@@ -1270,8 +1279,8 @@ index 0000000000000000000000000000000000000000..436b7b07907ef0eb284eca23b120006f
 +TEST(IoBufPool, PayloadBeginAlignment) {
 +  IoBufBlock* b = folly::detail::ioBufBlockAllocate();
 +  ASSERT_NE(nullptr, b);
-+  // payloadBegin should be 8-byte aligned (after 24-byte header)
++  // payloadBegin should be 16-byte aligned (after 32-byte header)
 +  uintptr_t p = reinterpret_cast<uintptr_t>(b->payloadBegin());
-+  EXPECT_EQ(0u, p % 8);
++  EXPECT_EQ(0u, p % 16);
 +  folly::detail::ioBufBlockRelease(b);
 +}
