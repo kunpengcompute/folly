@@ -695,10 +695,10 @@ index 9edfc723910939b96c94e439966c995082ce9bd0..e8a0b88d77eae31b91770cdfbfecb3e3
      uintptr_t uinfo = reinterpret_cast<uintptr_t>(info);
 diff --git a/folly/memory/IoBufPool.cpp b/folly/memory/IoBufPool.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..bb5fe7a5c169f27ca82fe586f8ade29fc3f3f529
+index 0000000000000000000000000000000000000000..96e1f22595aa0fa1d8d7b80076282bf3e9b2f316
 --- /dev/null
 +++ b/folly/memory/IoBufPool.cpp
-@@ -0,0 +1,105 @@
+@@ -0,0 +1,114 @@
 +/*
 + * Copyright (c) Meta Platforms, Inc. and affiliates.
 + *
@@ -745,16 +745,25 @@ index 0000000000000000000000000000000000000000..bb5fe7a5c169f27ca82fe586f8ade29f
 +  return b;
 +}
 +
-+IoBufBlock* ioBufBlockAllocate() {
++static IoBufBlock* allocateBlock(size_t minCapacity) {
 +  TLSBlockCache& c = g_tls_cache;
-+  if (c.count > 0) {
++  while (c.count > 0) {
 +    IoBufBlock* b = c.blocks[--c.count];
 +    DCHECK_EQ(b->magic, IoBufBlock::kBlockMagic);
++    // Cached blocks are idle and may predate a block-size increase.
++    if (b->capacity < minCapacity) {
++      std::free(b);
++      continue;
++    }
 +    b->ref_count.store(1, std::memory_order_relaxed);
 +    b->data_len = 0;
 +    return b;
 +  }
 +  return allocateFromSystem();
++}
++
++IoBufBlock* ioBufBlockAllocate() {
++  return allocateBlock(0);
 +}
 +
 +void ioBufBlockRelease(IoBufBlock* b) {
@@ -780,8 +789,8 @@ index 0000000000000000000000000000000000000000..bb5fe7a5c169f27ca82fe586f8ade29f
 +    }
 +    c.current_share = nullptr;
 +  }
-+  c.current_share = ioBufBlockAllocate();
-+  // A cached block may have been allocated with a different block size.
++  c.current_share = allocateBlock(min_capacity);
++  // The configured block size may be too small even for a fresh allocation.
 +  if (c.current_share != nullptr &&
 +      c.current_share->remaining() < min_capacity) {
 +    return nullptr;
@@ -879,10 +888,10 @@ index 0000000000000000000000000000000000000000..91635536a8f6f0e405d43613eb4a446e
 +} // namespace folly
 diff --git a/folly/memory/test/IoBufPoolTest.cpp b/folly/memory/test/IoBufPoolTest.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..b065337ca5c9650fc839ec59abe128b1b5d9b56f
+index 0000000000000000000000000000000000000000..133fef846916ee644bf6f1f595832e4bcc091ed9
 --- /dev/null
 +++ b/folly/memory/test/IoBufPoolTest.cpp
-@@ -0,0 +1,401 @@
+@@ -0,0 +1,469 @@
 +/*
 + * Copyright (c) Meta Platforms, Inc. and affiliates.
 + *
@@ -997,6 +1006,74 @@ index 0000000000000000000000000000000000000000..b065337ca5c9650fc839ec59abe128b1
 +  EXPECT_EQ(8192u, kDefaultBlockSize);
 +  EXPECT_EQ(256u, kMaxBlocksHardLimit);
 +  EXPECT_EQ(8192u - 32u, kDefaultBlockSize - sizeof(IoBufBlock));
++}
++
++namespace {
++// Isolate the thread-local cache and restore the setting even after ASSERT_*.
++template <typename F>
++void withFreshBlockCache(F test) {
++  const auto savedSize = gIoBufBlockSize.load(std::memory_order_relaxed);
++  std::thread worker(test);
++  worker.join();
++  gIoBufBlockSize.store(savedSize, std::memory_order_relaxed);
++}
++} // namespace
++
++TEST(IoBufPool, ShareBlockSkipsUndersizedCachedBlocks) {
++  withFreshBlockCache([] {
++    gIoBufBlockSize.store(sizeof(IoBufBlock) + 1);
++    std::vector<IoBufBlock*> blocks;
++    for (size_t i = 0; i < 3; ++i) {
++      auto* block = folly::detail::ioBufBlockAllocate();
++      ASSERT_NE(nullptr, block);
++      blocks.push_back(block);
++    }
++    for (auto* block : blocks) {
++      folly::detail::ioBufBlockRelease(block);
++    }
++
++    gIoBufBlockSize.store(kDefaultBlockSize);
++    auto* block = folly::detail::share_block(512);
++    ASSERT_NE(nullptr, block);
++    EXPECT_GE(block->remaining(), 512u);
++    EXPECT_EQ(1, block->ref_count.load());
++    EXPECT_EQ(block, folly::detail::share_block(512));
++  });
++}
++
++TEST(IoBufPool, ShareBlockReusesAdequateBlockBelowUndersizedBlock) {
++  withFreshBlockCache([] {
++    gIoBufBlockSize.store(kDefaultBlockSize);
++    auto* adequate = folly::detail::ioBufBlockAllocate();
++    ASSERT_NE(nullptr, adequate);
++    gIoBufBlockSize.store(sizeof(IoBufBlock) + 1);
++    auto* small = folly::detail::ioBufBlockAllocate();
++    ASSERT_NE(nullptr, small);
++    folly::detail::ioBufBlockRelease(adequate);
++    folly::detail::ioBufBlockRelease(small);
++
++    gIoBufBlockSize.store(kDefaultBlockSize);
++    auto* block = folly::detail::share_block(512);
++    ASSERT_NE(nullptr, block);
++    EXPECT_EQ(adequate, block);
++    EXPECT_GE(block->remaining(), 512u);
++  });
++}
++
++TEST(IoBufPool, ShareBlockReplacesUndersizedCurrentBlock) {
++  withFreshBlockCache([] {
++    gIoBufBlockSize.store(sizeof(IoBufBlock) + 1);
++    ASSERT_NE(nullptr, folly::detail::share_block(1));
++
++    gIoBufBlockSize.store(kDefaultBlockSize);
++    for (size_t i = 0; i < 3; ++i) {
++      auto* block = folly::detail::share_block(512);
++      ASSERT_NE(nullptr, block);
++      EXPECT_GE(block->remaining(), 512u);
++      // Exhaust this block to exercise recycling on the following request.
++      block->data_len = block->capacity;
++    }
++  });
 +}
 +
 +// =========================================================================
