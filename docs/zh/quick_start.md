@@ -10,13 +10,15 @@
 
 ### 1.1 直接获取dev_iouring分支的优化源码
 
-dev_iouring分支已包含io_uring网络I/O优化、IOBuf TLS内存池及相关修复，可直接获取并编译。
+dev_iouring分支已包含io_uring网络I/O优化、IOBuf TLS内存池等优化内容。
 
 ```bash
 git clone --recurse-submodules --branch dev_iouring --single-branch \
   https://gitcode.com/boostkit/folly.git folly
 cd folly
 ```
+
+1.2~1.4均为补丁仓的获取与应用，若已获取优化源码，即可跳转至[第二章](#2-编译与安装)进行编译准备。
 
 ### 1.2 获取基线源码、补丁和校验文件
 
