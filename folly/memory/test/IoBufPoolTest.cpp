@@ -114,6 +114,74 @@ TEST(IoBufPool, BlockSizes) {
   EXPECT_EQ(8192u - 32u, kDefaultBlockSize - sizeof(IoBufBlock));
 }
 
+namespace {
+// Isolate the thread-local cache and restore the setting even after ASSERT_*.
+template <typename F>
+void withFreshBlockCache(F test) {
+  const auto savedSize = gIoBufBlockSize.load(std::memory_order_relaxed);
+  std::thread worker(test);
+  worker.join();
+  gIoBufBlockSize.store(savedSize, std::memory_order_relaxed);
+}
+} // namespace
+
+TEST(IoBufPool, ShareBlockSkipsUndersizedCachedBlocks) {
+  withFreshBlockCache([] {
+    gIoBufBlockSize.store(sizeof(IoBufBlock) + 1);
+    std::vector<IoBufBlock*> blocks;
+    for (size_t i = 0; i < 3; ++i) {
+      auto* block = folly::detail::ioBufBlockAllocate();
+      ASSERT_NE(nullptr, block);
+      blocks.push_back(block);
+    }
+    for (auto* block : blocks) {
+      folly::detail::ioBufBlockRelease(block);
+    }
+
+    gIoBufBlockSize.store(kDefaultBlockSize);
+    auto* block = folly::detail::share_block(512);
+    ASSERT_NE(nullptr, block);
+    EXPECT_GE(block->remaining(), 512u);
+    EXPECT_EQ(1, block->ref_count.load());
+    EXPECT_EQ(block, folly::detail::share_block(512));
+  });
+}
+
+TEST(IoBufPool, ShareBlockReusesAdequateBlockBelowUndersizedBlock) {
+  withFreshBlockCache([] {
+    gIoBufBlockSize.store(kDefaultBlockSize);
+    auto* adequate = folly::detail::ioBufBlockAllocate();
+    ASSERT_NE(nullptr, adequate);
+    gIoBufBlockSize.store(sizeof(IoBufBlock) + 1);
+    auto* small = folly::detail::ioBufBlockAllocate();
+    ASSERT_NE(nullptr, small);
+    folly::detail::ioBufBlockRelease(adequate);
+    folly::detail::ioBufBlockRelease(small);
+
+    gIoBufBlockSize.store(kDefaultBlockSize);
+    auto* block = folly::detail::share_block(512);
+    ASSERT_NE(nullptr, block);
+    EXPECT_EQ(adequate, block);
+    EXPECT_GE(block->remaining(), 512u);
+  });
+}
+
+TEST(IoBufPool, ShareBlockReplacesUndersizedCurrentBlock) {
+  withFreshBlockCache([] {
+    gIoBufBlockSize.store(sizeof(IoBufBlock) + 1);
+    ASSERT_NE(nullptr, folly::detail::share_block(1));
+
+    gIoBufBlockSize.store(kDefaultBlockSize);
+    for (size_t i = 0; i < 3; ++i) {
+      auto* block = folly::detail::share_block(512);
+      ASSERT_NE(nullptr, block);
+      EXPECT_GE(block->remaining(), 512u);
+      // Exhaust this block to exercise recycling on the following request.
+      block->data_len = block->capacity;
+    }
+  });
+}
+
 // =========================================================================
 // IOBuf memory pool integration tests
 // =========================================================================
