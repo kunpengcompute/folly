@@ -4,8 +4,8 @@
 
 ## 最新消息
 
-- 2026.09.30：发布Follyv1.1.0版本补丁，新增IOBuf TLS内存池，通过线程本地数据块复用和连续slice切分减少高QPS场景下的`malloc/free`。
-- 2026.03.30：发布Follyv1.0.0版本补丁仓，针对Folly异步网络io框架进行io_uring优化，提升网络io的稳定性与基线io性能。
+- 2026.09.30：发布Folly v1.1.0版本补丁，新增IOBuf TLS内存池，通过线程本地数据块复用和连续slice切分减少高QPS场景下的`malloc/free`。
+- 2026.03.30：发布Folly v1.0.0版本补丁仓，针对Folly异步网络io框架进行io_uring优化，提升网络io的稳定性与基线io性能。
 
 ## 项目介绍
 
@@ -13,7 +13,7 @@ Folly是Meta开源的一套高性能C++11/14/17组件库，直接针对大规模
 
 本项目面向Folly网络I/O和缓冲区分配路径进行性能优化。Folly v1.1.0新增IOBuf TLS内存池，仅池化数据块，不池化IOBuf对象本身。Folly v1.0.0采用io_uring混合模式：读操作使用multishot减少系统调用，写操作使用`send`接口，保证连续写的顺序和延迟稳定性。
 
-IOBuf TLS内存池的核心设计如下。
+IOBuf TLS内存池的核心设计如下：
 
 - 每个线程使用`TLSBlockCache`缓存空闲`IoBufBlock`，默认最多8个。
 - 默认数据块大小为8KB，从`current_share`连续切分互不重叠的slice。
@@ -43,11 +43,11 @@ fbthrift/
 
 ## 版本说明
 
-关于Folly优化补丁的版本更新情况请参见[版本说明书](docs/zh/release_notes.md)
+关于Folly优化补丁的版本更新情况请参见[版本说明书](docs/zh/release_notes.md)。
 
 ## 快速入门
 
-关于Folly的快速入门操作指导请参见[快速入门](docs/zh/quick_start.md)
+关于Folly的快速入门操作指导请参见[快速入门](docs/zh/quick_start.md)。
 
 ## 学习文档
 

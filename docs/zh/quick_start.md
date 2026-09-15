@@ -18,11 +18,11 @@ git clone --recurse-submodules --branch dev_iouring --single-branch \
 cd folly
 ```
 
-1.2~1.4均为补丁仓的获取与应用，若已获取优化源码，即可跳转至[第二章](#2-编译与安装)进行编译准备。
+1.2～1.4均为补丁仓的获取与应用，若已获取优化源码，即可跳转至[第二章](#2-编译与安装)进行编译准备。
 
 ### 1.2 获取基线源码、补丁和校验文件
 
-在选定的工作目录下执行以下命令。基线源码保存在folly目录，补丁和校验文件保存在同级的folly-patches目录。
+基线源码保存在folly目录，补丁和校验文件保存在同级的folly-patches目录。在选定的工作目录下执行以下命令：
 
 ```bash
 git clone --recurse-submodules --branch v2022.11.14.00 --single-branch \
@@ -49,7 +49,7 @@ SHA-256 校验用于验证文件完整性，不单独证明来源真实性。请
 
 **2. 校验步骤**
 
-将补丁和校验文件放在同一目录，在该目录下执行以下命令。按前面的步骤获取后，当前目录即为folly-patches。
+按前面的步骤获取后，当前目录即为folly-patches。将补丁和校验文件放在同一目录，在该目录下执行以下命令：
 
 ```bash
 sha256sum --check --strict folly_iobuf_iouring.patch.sha256
@@ -100,12 +100,12 @@ git apply ../folly-patches/folly_iobuf_iouring.patch
 - Clang 16或更高版本，所有依赖使用同一工具链。
 - 安装CMake、Boost、fmt、glog、libevent、liburing及压缩库开发包。
 
-Debian或Ubuntu执行以下命令。
+Debian或Ubuntu执行以下命令：
 
 ```bash
 sudo apt-get update
 sudo apt-get install -y \
-  git cmake build-essential liburing-dev libboost-all-dev \
+  git cmake build-essential clang-16 liburing-dev libboost-all-dev \
   libdouble-conversion-dev libgflags-dev libgoogle-glog-dev \
   libevent-dev libsodium-dev liblz4-dev libsnappy-dev libzstd-dev \
   libfmt-dev liblzma-dev libgtest-dev libgmock-dev libssl-dev \
@@ -149,7 +149,7 @@ fmt或其他依赖安装在自定义位置时，通过CMAKE_PREFIX_PATH或fmt_DI
   }
   ```
 
-- 启用后的IOBuf::create()路由如下。
+- 启用后的IOBuf::create()路由如下：
 
   ```text
   容量能够由池块容纳
@@ -161,7 +161,7 @@ fmt或其他依赖安装在自定义位置时，通过CMAKE_PREFIX_PATH或fmt_DI
 
 ### 3.2 配置建议
 
-- 默认每线程最多缓存8个空闲块，默认块大小为8KB,建议set至256KB。
+- 默认每线程最多缓存8个空闲块，默认块大小为8KB，建议set至256KB。
 - setBlockSize()只在启动阶段调用，不要在请求处理中动态修改。
 - 小请求占比较高时可提高块复用率；请求经常超过块容量时仍会走原有路径。
 - 线程数较多时，需要按“线程数 × 每线程缓存上限 × 块大小”评估内存上界。
@@ -169,13 +169,13 @@ fmt或其他依赖安装在自定义位置时，通过CMAKE_PREFIX_PATH或fmt_DI
 
 ### 3.3 正确性验证
 
-编译全部Folly测试并执行以下命令。
+编译全部Folly测试并执行以下命令：
 
 ```bash
 ctest --test-dir _build --output-on-failure
 ```
 
-内存池专项验证至少覆盖以下内容。
+内存池专项验证至少覆盖以下内容：
 
 - 未启用时保持原有IOBuf::create()路径。
 - 多个小IOBuf从同一块切分且slice互不重叠。
@@ -194,7 +194,7 @@ ctest --test-dir _build --output-on-failure
 ./_build/experimental/io/test/async_iouring_socket_test
 ```
 
-v1.0.0采用混合模式：读操作使用io_uring multishot，写操作使用开源send；send暂时不可写时由PollWriteSqe侦听socket fd并恢复发送。
+v1.1.0采用混合模式：读操作使用io_uring multishot，写操作使用开源send；send暂时不可写时由PollWriteSqe侦听socket fd并恢复发送。
 
 ### 4.2 测试Benchmark
 
@@ -231,7 +231,7 @@ v1.0.0采用混合模式：读操作使用io_uring multishot，写操作使用�
 
 ### 4.3 A/B测试原则
 
-使用同一份二进制，通过是否调用enableMemoryPool()切换内存池状态，保持线程数、连接数、Payload和CPU绑定一致。至少比较以下方面。
+使用同一份二进制，通过是否调用enableMemoryPool()切换内存池状态，保持线程数、连接数、Payload和CPU绑定一致。至少比较以下方面：
 
 - QPS与吞吐量。
 - 平均延迟及P99延迟。
