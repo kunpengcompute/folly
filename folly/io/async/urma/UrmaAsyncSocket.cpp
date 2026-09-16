@@ -18,11 +18,26 @@
 #include <folly/io/async/urma/UrmaCqHandler.h>
 #include <folly/io/async/urma/UrmaHandshake.h>
 #include <folly/io/async/urma/UrmaSharedJfr.h>
+#include <folly/io/async/urma/UrmaInit.h>
 #include <folly/logging/xlog.h>
 
 #include <unistd.h>
 
 namespace folly {
+
+// 统计 IOBuf chain 中 >peer_rx_buf_size_ 的大包数量(用于 writeChain 完成组计数)
+static uint32_t countBigMsgs(const IOBuf* head, uint32_t peer_rx_buf_size) {
+  uint32_t n = 0;
+  if (!head) return 0;
+  const IOBuf* b = head;
+  do {
+    if (b->length() > peer_rx_buf_size) {
+      ++n;
+    }
+    b = b->next();
+  } while (b != head);
+  return n;
+}
 
 // ── TcpHandshakeHandler ──
 
@@ -36,7 +51,7 @@ void UrmaAsyncSocket::TcpHandshakeHandler::handlerReady(
     socket_->onHandshakeError("TCP connection closed during handshake");
   } else {
     if (errno == EAGAIN || errno == EWOULDBLOCK) {
-      return;  // spurious 触发,忽略,等下次 epoll 事件
+      return;
     }
     socket_->onHandshakeError("TCP read error during handshake");
   }
@@ -45,7 +60,6 @@ void UrmaAsyncSocket::TcpHandshakeHandler::handlerReady(
 // ── ConnectCallback ──
 
 void UrmaAsyncSocket::ConnectCallback::connectSuccess() noexcept {
-  // detachNetworkSocket 转移 fd 所有权,之后 reset 不会关闭 fd
   self->tcp_fd_ = self->tcp_socket_->detachNetworkSocket().toFd();
   self->tcp_socket_.reset();
   self->startHandshake(true);
@@ -78,7 +92,6 @@ UrmaAsyncSocket::UrmaAsyncSocket(EventBase* evb, int fd,
       tcp_fd_(fd),
       state_(State::kHandshaking),
       handshake_(handshake) {
-  // 握手由外部启动
 }
 
 UrmaAsyncSocket::~UrmaAsyncSocket() {
@@ -98,7 +111,6 @@ void UrmaAsyncSocket::startHandshake(bool is_client) {
   handshake_->setHandshakeTimeoutMs(UrmaInit::getConfig().handshake_timeout_ms);
   state_ = State::kHandshaking;
 
-  // 注册 TCP fd 到 EventBase epoll,握手数据到达时触发 handlerReady
   tcp_handshake_handler_ = std::make_unique<TcpHandshakeHandler>(evb_, tcp_fd_, this);
 
   handshake_->start(
@@ -107,23 +119,20 @@ void UrmaAsyncSocket::startHandshake(bool is_client) {
 }
 
 void UrmaAsyncSocket::onHandshakeReady() {
-  // 握手完成,注销 TCP fd 的 epoll 监听(URMA 数据走 JFR/JFCE)
   tcp_handshake_handler_.reset();
 
-  // URMA 资源已由 handshake 直接写入 res_,无需接管拷贝
   res_.shared_io_jfr = shared_->ioJfr();
   res_.shared_io_jfc = shared_->ioJfc();
   res_.shared_fc_jfr = shared_->fcJfr();
   res_.shared_fc_jfc = shared_->fcJfc();
   peer_rx_buf_size_ = handshake_->peer_rx_buf_size_;
 
-  // TX JFCE handler: EAGAIN(SQ 满)时 urma_rearm_jfc 武装, CQE 到达唤醒 pollTx + retryWrite
+  // TX JFCE handler + 初始 arm(READ completion 也能异步唤醒 pollTx)
   if (res_.tx_jfce) {
     tx_cq_handler_ = new UrmaCqHandler(evb_, res_.tx_jfce->fd, this);
+    urma_rearm_jfc(res_.tx_jfc, false);
   }
 
-  // 注册 socket 到共享层路由表
-  // key = 远端 jetty_id.id(= CQE.remote_id.id),pollAndDispatch 按此路由
   if (res_.remote_jetty) {
     shared_->registerSocket(res_.remote_jetty->id.id, this);
   }
@@ -131,17 +140,18 @@ void UrmaAsyncSocket::onHandshakeReady() {
     shared_->registerFcSocket(res_.remote_fc_jetty->id.id, this);
   }
 
-  // TX JFCE handler: EAGAIN(SQ 满)时 urma_rearm_jfc 武装, CQE 到达唤醒 pollTx + retryWrite
-
-  // handshake 已完成,资源在 res_ 中,删除 handshake 对象
   delete handshake_;
   handshake_ = nullptr;
 
   state_ = State::kOpen;
 
-  // flush 握手期间排队的写请求
-  // pending_write_head_ 已包含排队节点,直接调用 handlePendingWrites 逐个发送
+
   handlePendingWrites();
+
+  // 启动大包超时扫描(100ms 周期,设计 §4.7.8)
+  if (evb_) {
+    evb_->runAfterDelay([this] { scanBigMsgTimeout(); }, 100);
+  }
 }
 
 void UrmaAsyncSocket::onHandshakeError(const std::string& reason) {
@@ -152,7 +162,6 @@ void UrmaAsyncSocket::onHandshakeError(const std::string& reason) {
     delete handshake_;
     handshake_ = nullptr;
   }
-  // 回调握手期间排队的写请求
   while (pending_write_head_) {
     auto pw = std::move(pending_write_head_);
     pending_write_head_ = std::move(pw->next);
@@ -176,7 +185,6 @@ void UrmaAsyncSocket::onHandshakeData(const uint8_t* data, size_t len) {
 
 void UrmaAsyncSocket::setReadCB(ReadCallback* callback) noexcept {
   read_cb_ = callback;
-  // 设置 read_cb_ 后,如果有缓存的未交付数据,立即触发交付
   if (read_cb_ && !read_queue_.empty()) {
     deliverReadData();
   }
@@ -204,40 +212,44 @@ void UrmaAsyncSocket::writeChain(WriteCallback* cb, std::unique_ptr<IOBuf>&& cha
     return;
   }
 
-  // 有挂起请求时(连接中/握手中/EAGAIN),新请求追加到链表尾部
+  // 本 writeChain 的完成组:组内所有大包收到对端 FREE 后 writeSuccess 只回调一次
+  auto group = std::make_shared<BigMsgGroup>();
+  group->remaining = countBigMsgs(chain.get(), peer_rx_buf_size_);
+
   if (pending_write_head_) {
     auto pw = std::make_unique<PendingWrite>();
     pw->cb = cb;
     pw->buf = std::move(chain);
+    pw->big_group = group;
     pw->next = nullptr;
     pending_write_tail_->next = std::move(pw);
     pending_write_tail_ = pending_write_tail_->next.get();
     return;
   }
 
-  // 没有挂起请求
-  // 连接中/握手中:挂到链表,等握手完成后 flush
   if (state_ != State::kOpen) {
     auto pw = std::make_unique<PendingWrite>();
     pw->cb = cb;
     pw->buf = std::move(chain);
+    pw->big_group = group;
     pw->next = nullptr;
     pending_write_head_ = std::move(pw);
     pending_write_tail_ = pending_write_head_.get();
     return;
   }
 
-  // kOpen 状态:直接发送
   pollTx();
 
-  // 没有挂起请求,直接发送
   uint32_t total_posted = 0;
-  urma_status_t ret = sendChain(cb, chain, total_posted);
+  bool big_deferred = false;
+  urma_status_t ret = sendChain(cb, chain, total_posted, big_deferred, group);
   if (ret == URMA_EAGAIN) {
-    // SQ 满:剩余 chain 挂到链表头,武装 TX JFCE 中断
+//                << " big_deferred=" << big_deferred
+//                << " pending_big=" << pending_big_msg_.size();
     auto pw = std::make_unique<PendingWrite>();
     pw->cb = cb;
     pw->buf = std::move(chain);
+    pw->big_group = group;
     pw->next = nullptr;
     pending_write_head_ = std::move(pw);
     pending_write_tail_ = pending_write_head_.get();
@@ -248,41 +260,71 @@ void UrmaAsyncSocket::writeChain(WriteCallback* cb, std::unique_ptr<IOBuf>&& cha
       }
     }
   } else if (ret == URMA_SUCCESS) {
-    if (cb) cb->writeSuccess();
+//                << " big_deferred=" << big_deferred
+//                << " pending_big=" << pending_big_msg_.size();
+    // 组内大包未全部 FREE 时延迟 writeSuccess(跨 EAGAIN 拆分的多次 sendChain 也成立)
+    if (cb && group->remaining == 0) cb->writeSuccess();
     bytes_written_ += total_posted;
   }
-  // 其他错误: sendChain 内部已回调 writeErr
 }
 
 // ── TX completion ──
 
 void UrmaAsyncSocket::pollTx() noexcept {
   if (!res_.tx_jfc) return;
+  if (state_ != State::kOpen) return;
   urma_cr_t cr[POLL_BATCH_MAX];
   int n;
-  // 循环 poll 直到 CQE 全部回收
   while ((n = urma_poll_jfc(res_.tx_jfc, POLL_BATCH_MAX, cr)) > 0) {
     for (int i = 0; i < n; ++i) {
-      // 按 user_ctx 精确释放对应 WR 的 SGE 数组 + IOBuf 链
-      uint64_t idx = cr[i].user_ctx;
+      uint64_t ctx = cr[i].user_ctx;
+      if (ctx == kCtrlUserCtx) {
+        // 控制包/FREE 的 TX completion:释放 sge 引用
+        if (!ctrl_sge_refs_.empty()) {
+          ctrl_sge_refs_.pop_front();
+        }
+//                    << " ctrl_inflight=" << ctrl_sge_refs_.size();
+        continue;
+      }
+      if (ctx & kReadUserCtxBase) {
+        // B-4: 校验 CQE msg_id,跳过旧 READ 的重复 CQE
+        uint16_t cqe_msg_id = static_cast<uint16_t>(ctx & 0xFFFF);
+//                    << " st=" << static_cast<int>(cr[i].status)
+//                    << " expect=" << pending_read_msg_id_;
+        if (cqe_msg_id != pending_read_msg_id_) {
+          XLOG(WARN) << "[URMA] pollTx: stale READ cqe msg_id=" << cqe_msg_id
+                     << " expect=" << pending_read_msg_id_;
+          continue;
+        }
+        if (cr[i].status == URMA_CR_SUCCESS) {
+          onReadComplete();
+        } else {
+          onReadFailed(cr[i].status);
+        }
+        continue;
+      }
+      // SEND completion:释放 sbuf_
+      uint64_t idx = ctx;
+//                  << " st=" << static_cast<int>(cr[i].status);
       if (idx < sbuf_.size()) {
-        sbuf_[idx] = {};  // 释放 shared_ptr(NIC DMA 已完成)
+        sbuf_[idx] = {};
       }
     }
   }
+  urma_rearm_jfc(res_.tx_jfc, false);
 }
 
 void UrmaAsyncSocket::retryWrite() noexcept {
   handlePendingWrites();
 }
 
-// 发送单个 IOBuf chain(多 SGE 合并 → post SEND)
-// 返回值: URMA_SUCCESS(全部发完) / URMA_EAGAIN(SQ 满,chain 中剩余部分通过 chain 引用返回) / URMA_FAIL(已回调 writeErr)
 urma_status_t UrmaAsyncSocket::sendChain(WriteCallback* cb,
                                           std::unique_ptr<IOBuf>& chain,
-                                          uint32_t& total_posted) noexcept {
+                                          uint32_t& total_posted,
+                                          bool& big_deferred,
+                                          const std::shared_ptr<BigMsgGroup>& group) noexcept {
   total_posted = 0;
-  // 握手/连接未完成:返回 EAGAIN,chain 保留在调用方,等握手完成后 flush
+  big_deferred = false;
   if (state_ != State::kOpen) {
     return URMA_EAGAIN;
   }
@@ -304,9 +346,18 @@ urma_status_t UrmaAsyncSocket::sendChain(WriteCallback* cb,
         break;
       }
       if (iobuf_len > peer_rx_buf_size_) {
+        // §4.7 大包:走单边 READ(控制包 SEND_IMM + 对端 READ 拉取 + FREE)
+        auto big = std::move(chain);
+        size_t big_len = big->length();
+        chain = big->pop();  // 剩余 chain 返回
+        if (sendBigMsgByRead(cb, std::move(big), group)) {
+          big_deferred = true;  // writeSuccess 延迟到组内所有大包 FREE
+          total_posted += static_cast<uint32_t>(big_len);
+          continue;
+        }
         if (cb) cb->writeErr(total_posted, AsyncSocketException(
-            AsyncSocketException::UNKNOWN,
-            "IOBuf > peer_rx_buf_size not supported in Phase 2"));
+            AsyncSocketException::UNKNOWN, "sendBigMsgByRead failed"));
+        if (group) group->done = true;  // 防止已发大包后续 FREE 再回调 writeSuccess
         return URMA_FAIL;
       }
       (*sge_arr)[num_sge].addr = reinterpret_cast<uint64_t>(chain->writableData());
@@ -339,19 +390,17 @@ urma_status_t UrmaAsyncSocket::sendChain(WriteCallback* cb,
     }
     sbuf_.pop_back();
     if (ret == URMA_EAGAIN) {
-      // SQ 满:剩余 chain 通过引用返回给调用方
       return URMA_EAGAIN;
     }
     XLOG(ERR) << "UrmaAsyncSocket: post failed, status=" << ret;
     if (cb) cb->writeErr(total_posted, AsyncSocketException(
         AsyncSocketException::UNKNOWN, "urma_post_jetty_send_wr failed"));
+    if (group) group->done = true;  // 防止已发大包后续 FREE 再回调 writeSuccess
     return URMA_FAIL;
   }
   return URMA_SUCCESS;
 }
 
-// 遍历 pending_write_head_ 链表逐个发送(参照 AsyncSocket::handleWrite)
-// 用于握手完成后 flush / EAGAIN 恢复后重试
 void UrmaAsyncSocket::handlePendingWrites() noexcept {
   pollTx();
 
@@ -359,10 +408,17 @@ void UrmaAsyncSocket::handlePendingWrites() noexcept {
     auto* pw = pending_write_head_.get();
     std::unique_ptr<IOBuf> chain = std::move(pw->buf);
     uint32_t total_posted = 0;
+    bool big_deferred = false;
 
-    urma_status_t ret = sendChain(pw->cb, chain, total_posted);
+    // 防御:老路径可能没建完成组,补一个(计数仅覆盖剩余 chain)
+    if (!pw->big_group) {
+      pw->big_group = std::make_shared<BigMsgGroup>();
+      pw->big_group->remaining = countBigMsgs(chain.get(), peer_rx_buf_size_);
+    }
+
+    urma_status_t ret = sendChain(pw->cb, chain, total_posted, big_deferred,
+                                  pw->big_group);
     if (ret == URMA_EAGAIN) {
-      // SQ 满:剩余 chain 放回当前节点,武装 TX JFCE 中断
       pw->buf = std::move(chain);
       if (res_.tx_jfc) {
         urma_status_t rearm_ret = urma_rearm_jfc(res_.tx_jfc, false);
@@ -373,17 +429,19 @@ void UrmaAsyncSocket::handlePendingWrites() noexcept {
       return;
     }
     if (ret == URMA_SUCCESS) {
-      // 当前节点全部发完,从链表移除,回调 writeSuccess
       WriteCallback* cb = pw->cb;
+      auto big_group = pw->big_group;  // pw 即将销毁,先保存完成组
       pending_write_head_ = std::move(pending_write_head_->next);
       if (!pending_write_head_) {
         pending_write_tail_ = nullptr;
       }
-      if (cb) cb->writeSuccess();
+//                  << " big_deferred=" << big_deferred
+//                  << " pending_big=" << pending_big_msg_.size();
+      if (cb && big_group->remaining == 0) cb->writeSuccess();
       bytes_written_ += total_posted;
     }
-    // URMA_FAIL: sendChain 内部已回调 writeErr,从链表移除当前节点
     if (ret == URMA_FAIL) {
+      XLOG(ERR) << "[URMA] pendingWrite FAIL total=" << total_posted;
       pending_write_head_ = std::move(pending_write_head_->next);
       if (!pending_write_head_) {
         pending_write_tail_ = nullptr;
@@ -392,31 +450,346 @@ void UrmaAsyncSocket::handlePendingWrites() noexcept {
   }
 }
 
-// ── 接收 ──
+// ── 单边 READ:发送方 ──
+
+bool UrmaAsyncSocket::sendBigMsgByRead(WriteCallback* cb,
+                                       std::unique_ptr<IOBuf> node,
+                                       const std::shared_ptr<BigMsgGroup>& group) noexcept {
+  uint32_t data_size = static_cast<uint32_t>(node->length());
+
+  // C-3: msg_id 回绕后跳过仍在途的
+  uint16_t msg_id = next_msg_id_;
+  while (pending_big_msg_.count(msg_id)) {
+    ++msg_id;
+  }
+  next_msg_id_ = msg_id + 1;
+
+  uint64_t remote_va = reinterpret_cast<uint64_t>(node->data());
+
+  PendingBigMsg p;
+  p.iobuf = std::shared_ptr<IOBuf>(std::move(node));
+  p.post_time = std::chrono::steady_clock::now();
+  p.retries = 0;
+  p.is_free = false;
+  p.cb = cb;
+  p.group = group;
+  pending_big_msg_.emplace(msg_id, std::move(p));
+
+//              << " remote_va=" << remote_va
+//              << " inflight=" << pending_big_msg_.size();
+
+  if (!postControlPacket(msg_id, remote_va, data_size)) {
+    pending_big_msg_.erase(msg_id);
+    return false;
+  }
+  return true;
+}
+
+bool UrmaAsyncSocket::postControlPacket(uint16_t msg_id, uint64_t remote_va,
+                                        uint32_t data_size) noexcept {
+  if (!res_.remote_jetty) return false;
+  // inline=1: 元数据(8 字节 remote_va)在栈上,NIC post 时内联拷贝,不走 DMA/MR
+  uint64_t meta_va = remote_va;
+  urma_sge_t ctrl_sge = {};
+  ctrl_sge.addr = reinterpret_cast<uint64_t>(&meta_va);
+  ctrl_sge.len = sizeof(uint64_t);
+  ctrl_sge.tseg = nullptr;  // inline 模式不走 tseg
+
+  urma_jfs_wr_t wr = {};
+  wr.opcode = URMA_OPC_SEND_IMM;
+  wr.tjetty = res_.remote_jetty;
+  wr.flag.bs.complete_enable = 1;
+  wr.flag.bs.inline_flag = 1;
+  wr.send.src.sge = &ctrl_sge;
+  wr.send.src.num_sge = 1;
+  wr.send.imm_data = encodeBigMsgImm(msg_id, kCtrlTypePull, data_size);
+  wr.user_ctx = kCtrlUserCtx;
+  wr.next = nullptr;
+
+  urma_jfs_wr_t* bad_wr = nullptr;
+  urma_status_t st = urma_post_jetty_send_wr(res_.io_jetty, &wr, &bad_wr);
+  if (st != URMA_SUCCESS) {
+    XLOG(ERR) << "[URMA] ctrlPullPost FAIL msg_id=" << msg_id
+              << " size=" << data_size << " st=" << static_cast<int>(st);
+    return false;
+  }
+//              << " st=" << static_cast<int>(st);
+  return st == URMA_SUCCESS;
+}
+
+// ── 单边 READ:接收方 ──
+
+void UrmaAsyncSocket::onControlMsg(uint64_t imm, const void* meta) noexcept {
+  uint16_t msg_id;
+  uint8_t is_ctl;
+  uint32_t data_size;
+  decodeBigMsgImm(imm, msg_id, is_ctl, data_size);
+
+  if (is_ctl == kCtrlTypeFree) {
+    // 发送方收到 FREE:释放大 buffer。writeSuccess 只在组内全部大包 FREE 后回调一次
+    auto it = pending_big_msg_.find(msg_id);
+//                << " found=" << (it != pending_big_msg_.end())
+//                << " inflight=" << pending_big_msg_.size();
+    if (it != pending_big_msg_.end() && !it->second.is_free) {
+      auto group = it->second.group;
+      WriteCallback* cb = it->second.cb;
+      pending_big_msg_.erase(it);
+      if (group) {
+        if (!group->done && --group->remaining == 0) {
+          group->done = true;
+          if (cb) cb->writeSuccess();
+        }
+      } else if (cb) {
+        cb->writeSuccess();
+      }
+    }
+    return;
+  }
+
+  if (is_ctl != kCtrlTypePull) {
+    return;
+  }
+
+  // PULL:解码元数据(8 字节 remote_va)
+  uint64_t remote_va = 0;
+  if (meta) {
+    std::memcpy(&remote_va, meta, sizeof(remote_va));
+  }
+//              << " remote_va=" << remote_va << " pending=" << has_pending_read_
+//              << " is_ctl=" << static_cast<int>(is_ctl);
+
+  if (has_pending_read_) {
+    // 有 READ 在途:控制包进保序队列(等当前 READ 完成)
+    RxBufItem item;
+    item.is_control = true;
+    item.msg_id = msg_id;
+    item.remote_va = remote_va;
+    item.data_size = data_size;
+    rx_pending_queue_.push(std::move(item));
+//                << " size=" << data_size << " qsize=" << rx_pending_queue_.size();
+    return;
+  }
+
+  has_pending_read_ = startRead(msg_id, remote_va, data_size);
+}
+
+bool UrmaAsyncSocket::startRead(uint16_t msg_id, uint64_t remote_va,
+                                uint32_t data_size) noexcept {
+  void* buf = UrmaInit::poolAlloc(data_size);
+  if (!buf) {
+    XLOG(ERR) << "startRead: poolAlloc failed for " << data_size << " msg_id=" << msg_id;
+    return false;
+  }
+  auto iobuf = IOBuf::takeOwnership(
+      buf, data_size,
+      [](void* ptr, void*) { UrmaInit::poolFree(ptr); });
+
+  auto sge_arr = std::make_shared<std::vector<urma_sge_t>>(2);
+  (*sge_arr)[0].addr = remote_va;
+  (*sge_arr)[0].len = data_size;
+  (*sge_arr)[0].tseg = res_.remote_seg;
+  (*sge_arr)[1].addr = reinterpret_cast<uint64_t>(iobuf->writableData());
+  (*sge_arr)[1].len = data_size;
+  (*sge_arr)[1].tseg = UrmaInit::getPoolTseg();
+
+  urma_jfs_wr_t wr = {};
+  wr.opcode = URMA_OPC_READ;
+  wr.tjetty = res_.remote_jetty;
+  wr.flag.bs.complete_enable = 1;
+  wr.rw.src.sge = &(*sge_arr)[0];
+  wr.rw.src.num_sge = 1;
+  wr.rw.dst.sge = &(*sge_arr)[1];
+  wr.rw.dst.num_sge = 1;
+  wr.user_ctx = kReadUserCtxBase | msg_id;
+  wr.next = nullptr;
+
+  pending_read_msg_id_ = msg_id;
+  pending_read_buf_ = std::move(iobuf);
+  pending_read_sge_ = sge_arr;
+
+  urma_jfs_wr_t* bad_wr = nullptr;
+  urma_status_t st = urma_post_jetty_send_wr(res_.io_jetty, &wr, &bad_wr);
+  if (st != URMA_SUCCESS) {
+    pending_read_sge_.reset();
+    pending_read_buf_.reset();
+    XLOG(ERR) << "startRead: post READ failed, status=" << st << " msg_id=" << msg_id;
+    return false;
+  }
+//              << " remote_va=" << remote_va << " st=" << static_cast<int>(st);
+  return true;
+}
+
+void UrmaAsyncSocket::onReadComplete() noexcept {
+  if (!pending_read_buf_) {
+    XLOG(WARN) << "[URMA] readDone: pending_read_buf_ already reset, skip";
+    return;
+  }
+  auto data = std::move(pending_read_buf_);
+  pending_read_sge_.reset();
+  has_pending_read_ = false;
+  bytes_received_ += data->length();
+//              << " len=" << data->length();
+
+  read_queue_.append(std::move(data));
+  if (read_cb_) {
+    deliverReadData();
+  }
+
+  // 连接已关闭时不 post FREE(remote_jetty 可能已 null)
+  if (state_ != State::kOpen) {
+    return;
+  }
+
+  if (!postFreeNotify(pending_read_msg_id_)) {
+    XLOG(WARN) << "UrmaAsyncSocket: postFreeNotify failed for msg_id="
+               << pending_read_msg_id_;
+  }
+
+  // 串行保序:从队列按序取出(控制包→发起新 READ 后停止,小包→交付)
+  drainRxPendingQueue();
+}
+
+void UrmaAsyncSocket::onReadFailed(urma_status_t status) noexcept {
+  XLOG(ERR) << "UrmaAsyncSocket: READ failed, msg_id=" << pending_read_msg_id_
+            << " status=" << status;
+  pending_read_buf_.reset();
+  pending_read_sge_.reset();
+  has_pending_read_ = false;
+  drainRxPendingQueue();
+}
+
+bool UrmaAsyncSocket::postFreeNotify(uint16_t msg_id) noexcept {
+  if (!res_.remote_jetty) return false;
+  urma_jfs_wr_t wr = {};
+  wr.opcode = URMA_OPC_SEND_IMM;
+  wr.tjetty = res_.remote_jetty;
+  wr.flag.bs.complete_enable = 1;
+  wr.flag.bs.inline_flag = 1;  // ctrl packet inline
+  wr.send.src.num_sge = 0;
+  wr.send.imm_data = encodeBigMsgImm(msg_id, kCtrlTypeFree, 0);
+  wr.user_ctx = kCtrlUserCtx;
+  wr.next = nullptr;
+
+  urma_jfs_wr_t* bad_wr = nullptr;
+  urma_status_t st = urma_post_jetty_send_wr(res_.io_jetty, &wr, &bad_wr);
+  return st == URMA_SUCCESS;
+}
+
+void UrmaAsyncSocket::drainRxPendingQueue() noexcept {
+  while (!rx_pending_queue_.empty()) {
+    RxBufItem item = std::move(rx_pending_queue_.front());
+    rx_pending_queue_.pop();
+    if (item.is_control) {
+      // 串行保序:遇到控制包,发起新 READ 后停止取出
+//                  << " size=" << item.data_size << " qsize=" << rx_pending_queue_.size();
+      has_pending_read_ = startRead(item.msg_id, item.remote_va, item.data_size);
+      if (!has_pending_read_) {
+        XLOG(ERR) << "[URMA] drainCtrl startRead failed msg_id=" << item.msg_id;
+      }
+      return;
+    }
+    read_queue_.append(std::move(item.data));
+    if (read_cb_) {
+      deliverReadData();
+    }
+  }
+  has_pending_read_ = false;
+}
+
+// ── 单边 READ:超时重发 ──
+
+void UrmaAsyncSocket::scanBigMsgTimeout() noexcept {
+  if (state_ != State::kOpen) return;
+
+  auto now = std::chrono::steady_clock::now();
+  auto timeout = std::chrono::milliseconds(7000);  // 7s 超时(设计 §4.7.8)
+
+  for (auto it = pending_big_msg_.begin(); it != pending_big_msg_.end();) {
+    auto& p = it->second;
+    if (now - p.post_time < timeout) {
+      ++it;
+      continue;
+    }
+
+    if (p.retries >= kCtrlMsgMaxRetries) {
+      XLOG(ERR) << "[URMA] sendBig: msg " << it->first
+                << " timeout, giving up (is_free=" << p.is_free << ")";
+      auto group = p.group;
+      WriteCallback* cb = p.cb;
+      it = pending_big_msg_.erase(it);
+      // B-3: 组内任一重发耗尽,整个 writeChain 只回调一次 writeErr
+      if (group) {
+        if (!group->done) {
+          group->done = true;
+          if (cb) {
+            cb->writeErr(0, AsyncSocketException(
+                AsyncSocketException::UNKNOWN, "big msg timeout after retries"));
+          }
+        }
+      } else if (cb) {
+        cb->writeErr(0, AsyncSocketException(
+            AsyncSocketException::UNKNOWN, "big msg timeout after retries"));
+      }
+      continue;
+    }
+
+    if (p.is_free) {
+      // FREE 重发(发送方未确认释放)
+      if (postFreeNotify(it->first)) {
+        p.retries++;
+        p.post_time = now;
+        XLOG(WARN) << "[URMA] sendBig: resend FREE msg_id=" << it->first
+                   << " retries=" << (int)p.retries;
+      } else {
+        p.retries = kCtrlMsgMaxRetries;
+      }
+    } else {
+      // 控制包重发
+      uint64_t remote_va = reinterpret_cast<uint64_t>(p.iobuf->data());
+      uint32_t data_size = static_cast<uint32_t>(p.iobuf->length());
+      if (postControlPacket(static_cast<uint16_t>(it->first), remote_va,
+                            data_size)) {
+        p.retries++;
+        p.post_time = now;
+        XLOG(WARN) << "UrmaAsyncSocket: resend control msg_id=" << it->first
+                   << " retries=" << (int)p.retries << " size=" << data_size;
+      } else {
+        p.retries = kCtrlMsgMaxRetries;
+      }
+    }
+    ++it;
+  }
+
+  // 重新调度(100ms 周期,设计 §4.7.8 UrmaIdleMonitor 量级)
+  if (evb_ && state_ == State::kOpen) {
+    evb_->runAfterDelay([this] { scanBigMsgTimeout(); }, 100);
+  }
+}
+
+// ── 接收(普通 SEND 数据) ──
 
 void UrmaAsyncSocket::onRxBuf(std::unique_ptr<IOBuf> data) noexcept {
   bytes_received_ += data->length();
-  // 追加到接收缓存队列
+//              << " pending=" << has_pending_read_;
+  if (has_pending_read_) {
+    RxBufItem item;
+    item.is_control = false;
+    item.data = std::move(data);
+    rx_pending_queue_.push(std::move(item));
+    return;
+  }
   read_queue_.append(std::move(data));
-  // 如果 read_cb_ 已设置,立即交付
   if (read_cb_) {
     deliverReadData();
   }
 }
 
-// 交付缓存数据给当前 read_cb_
-// 支持 isBufferMovable (readBufferAvailable) 和非 movable (getReadBuffer + readDataAvailable)
-// 使用递归而非 while 循环:read_cb_ 可能在回调中变化(TransportPeeker → PreReceivedData → Parser)
-// 每次递归重新检查 isBufferMovable(),确保用正确模式交付数据
 void UrmaAsyncSocket::deliverReadData() noexcept {
+  if (!read_cb_ || read_queue_.empty()) return;
   if (read_cb_->isBufferMovable()) {
-    // 零拷贝模式(Rocket Parser / Header TAsyncTransportHandler)
-    // 一次性交付整个 IOBuf chain
     auto buf = read_queue_.move();
     read_cb_->readBufferAvailable(std::move(buf));
   } else {
-    // 传统模式(TransportPeeker)
-    // getReadBuffer → memcpy → readDataAvailable,每次只交付一块
     void* buf = nullptr;
     size_t buf_len = 0;
     read_cb_->getReadBuffer(&buf, &buf_len);
@@ -430,9 +803,6 @@ void UrmaAsyncSocket::deliverReadData() noexcept {
     read_cb_->readDataAvailable(copy_len);
   }
 
-  // 递归:read_cb_ 可能在上面的回调中变化(TransportPeeker 收满 13B → peekSuccess
-  // → PreReceivedDataAsyncTransportWrapper → setReadCB → read_cb_ 变为 Parser)
-  // 重新检查 isBufferMovable() 确保用正确模式交付剩余数据
   if (read_cb_ && !read_queue_.empty()) {
     deliverReadData();
   }
@@ -452,21 +822,15 @@ void UrmaAsyncSocket::closeNow() {
 }
 
 void UrmaAsyncSocket::shutdownWrite() {
-  // 等待 in-flight SEND completion(SQ 中所有 WR 完成)
   if (res_.tx_jfc) {
     pollTx();
   }
 }
 
 void UrmaAsyncSocket::shutdownWriteNow() {
-  // 立即关闭,不等 completion
 }
 
 void UrmaAsyncSocket::destroyUrmaResources() {
-  // 参照 brpc: 不在析构中删除 URMA 硬件资源(jetty/JFC/JFCE)
-  // 原因:urma_delete_jetty 会阻塞等待硬件 flush;urma_delete_jfc 会阻塞等待 CQE 消费
-  // 进程退出时内核自动回收所有 URMA 资源
-  // 仅清理用户态资源(CqHandler/路由表/sbuf/pending/read_queue)
   if (tx_cq_handler_) {
     delete tx_cq_handler_;
     tx_cq_handler_ = nullptr;
@@ -479,7 +843,17 @@ void UrmaAsyncSocket::destroyUrmaResources() {
       shared_->unregisterFcSocket(res_.remote_fc_jetty->id.id);
     }
   }
-  // unimport 远端 jetty/seg(解除 TP 路由引用)
+  pending_big_msg_.clear();
+  pending_read_buf_.reset();
+  pending_read_sge_.reset();
+  if (ctrl_meta_mr_) {
+    UrmaInit::poolFree(ctrl_meta_mr_);
+    ctrl_meta_mr_ = nullptr;
+  }
+  // 清空保序队列
+  while (!rx_pending_queue_.empty()) {
+    rx_pending_queue_.pop();
+  }
   if (res_.remote_fc_jetty) {
     urma_unimport_jetty(res_.remote_fc_jetty);
     res_.remote_fc_jetty = nullptr;
@@ -492,21 +866,18 @@ void UrmaAsyncSocket::destroyUrmaResources() {
     urma_unimport_seg(res_.remote_seg);
     res_.remote_seg = nullptr;
   }
-  // jetty/JFC/JFCE 不删除——依赖进程退出时内核回收
   sbuf_.clear();
   pending_write_head_.reset();
   pending_write_tail_ = nullptr;
-  read_queue_.move();  // 清空接收缓存
+  read_queue_.move();
 }
 
 // ── 其他 ──
 
 void UrmaAsyncSocket::attachEventBase(EventBase* /*eventBase*/) {
-  // Phase 4 实现
 }
 
 void UrmaAsyncSocket::detachEventBase() {
-  // Phase 4 实现
 }
 
 void UrmaAsyncSocket::setSendTimeout(uint32_t milliseconds) {
@@ -514,11 +885,9 @@ void UrmaAsyncSocket::setSendTimeout(uint32_t milliseconds) {
 }
 
 void UrmaAsyncSocket::getLocalAddress(SocketAddress* /*address*/) const {
-  // Phase 4 从 tcp_fd_ 获取
 }
 
 void UrmaAsyncSocket::getPeerAddress(SocketAddress* /*address*/) const {
-  // Phase 4 从 tcp_fd_ 获取
 }
 
 } // namespace folly

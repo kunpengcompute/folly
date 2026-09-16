@@ -231,6 +231,7 @@ void UrmaHandshake::allocateResources() {
   io_cfg.jfs_cfg.depth = config_.tx_depth;
   io_cfg.jfs_cfg.trans_mode = URMA_TM_RM;
   io_cfg.jfs_cfg.max_sge = UrmaInit::getMaxJfsSge();
+  io_cfg.jfs_cfg.max_inline_data = UrmaInit::getMaxJfsInlineLen();
   io_cfg.jfs_cfg.rnr_retry = URMA_DEFAULT_RNR_RETRY;
   io_cfg.jfs_cfg.err_timeout = URMA_DEFAULT_ERR_TIMEOUT;
   io_cfg.jfs_cfg.jfc = res.tx_jfc;
@@ -258,6 +259,7 @@ void UrmaHandshake::allocateResources() {
   fc_cfg.jfs_cfg.depth = 2;
   fc_cfg.jfs_cfg.trans_mode = URMA_TM_RM;
   fc_cfg.jfs_cfg.max_sge = 1;  // FC 消息用 1 个 SGE(4B inline)
+  fc_cfg.jfs_cfg.max_inline_data = UrmaInit::getMaxJfsInlineLen();
   fc_cfg.jfs_cfg.rnr_retry = URMA_DEFAULT_RNR_RETRY;
   fc_cfg.jfs_cfg.err_timeout = URMA_DEFAULT_ERR_TIMEOUT;
   fc_cfg.jfs_cfg.jfc = res.fc_tx_jfc;

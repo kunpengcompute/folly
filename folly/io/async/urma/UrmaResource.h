@@ -16,7 +16,7 @@
 
 #ifdef FOLLY_HAVE_URMA
 
-#include <folly/io/async/urma/stub/urma_api.h>
+#include <ub/umdk/urma/urma_api.h>
 
 namespace folly {
 

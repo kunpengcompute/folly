@@ -214,24 +214,36 @@ void UrmaSharedJfr::pollAndDispatch() noexcept {
       uint32_t slot = static_cast<uint32_t>(cr[i].user_ctx);
       auto it = socket_map_.find(cr[i].remote_id.id);
       if (it == socket_map_.end()) {
+//                    << " slot=" << slot << " opcode=" << static_cast<int>(cr[i].opcode);
         replenishRxBuf(slot);
         continue;
       }
       UrmaAsyncSocket* socket = it->second;
-      auto data = IOBuf::takeOwnership(
-          rx_bufs_[slot].data, cr[i].completion_len,
-          [](void* /*buf*/, void* userData) {
-            auto* self = static_cast<UrmaSharedJfr*>(
-                reinterpret_cast<void*>(
-                    reinterpret_cast<uintptr_t>(userData) >> 16));
-            uint32_t s = static_cast<uint32_t>(
-                reinterpret_cast<uintptr_t>(userData) & 0xFFFF);
-            self->replenishRxBuf(s);
-            self->recharge();
-          },
-          reinterpret_cast<void*>(
-              (reinterpret_cast<uintptr_t>(this) << 16) | slot));
-      socket->onRxBuf(std::move(data));
+      if (cr[i].opcode == URMA_CR_OPC_SEND_WITH_IMM) {
+        // SEND_IMM 控制包:imm_data 编码 msg_id|is_ctl|data_size
+        // RX buffer 含 8 字节 meta(remote_va for PULL)
+//                    << " imm=" << cr[i].imm_data;
+        socket->onControlMsg(cr[i].imm_data, rx_bufs_[slot].data);
+        replenishRxBuf(slot);
+        recharge();
+      } else {
+        // 普通 SEND 数据
+//                    << " remote=" << cr[i].remote_id.id;
+        auto data = IOBuf::takeOwnership(
+            rx_bufs_[slot].data, cr[i].completion_len,
+            [](void* /*buf*/, void* userData) {
+              auto* self = static_cast<UrmaSharedJfr*>(
+                  reinterpret_cast<void*>(
+                      reinterpret_cast<uintptr_t>(userData) >> 16));
+              uint32_t s = static_cast<uint32_t>(
+                  reinterpret_cast<uintptr_t>(userData) & 0xFFFF);
+              self->replenishRxBuf(s);
+              self->recharge();
+            },
+            reinterpret_cast<void*>(
+                (reinterpret_cast<uintptr_t>(this) << 16) | slot));
+        socket->onRxBuf(std::move(data));
+      }
     }
   }
   // poll 后 ack + rearm(参照 brpc: poll → ack → rearm)

@@ -307,38 +307,27 @@ endif()
 target_link_libraries(folly_deps INTERFACE fmt::fmt)
 
 # ---- URMA (UB hardware offload, direct URMA C API) ----
-# 默认使用 urma_stub/(stub 实现),无需真实 liburma.so 即可编译链接。
-# 若需链接真实 URMA 库,设置 -DURMA_USE_REAL_LIB=ON
-set(URMA_USE_REAL_LIB OFF CACHE BOOL "Link real liburma.so instead of urma_stub.cpp")
-set(URMA_ROOT "" CACHE PATH "Path to URMA include/lib directory (contains urma_api.h)")
-if (NOT URMA_ROOT)
-    set(URMA_ROOT "${FOLLY_DIR}/io/async/urma/stub")  # 默认:内置 stub
-endif()
+
 find_path(URMA_INCLUDE_DIR urma_api.h
-    PATHS "${URMA_ROOT}" "${URMA_ROOT}/include"
-    NO_DEFAULT_PATH
+    PATHS "/usr/include"
+    PATH_SUFFIXES "ub/umdk/urma"
 )
-if (URMA_INCLUDE_DIR)
+
+find_library(URMA_LIBRARY NAMES urma
+    PATHS "/usr/lib64" "/usr/lib"
+)
+
+if (URMA_INCLUDE_DIR AND URMA_LIBRARY)
     message(STATUS "Found URMA headers: ${URMA_INCLUDE_DIR}")
+    message(STATUS "Found URMA library: ${URMA_LIBRARY}")
     target_compile_definitions(folly_deps INTERFACE FOLLY_HAVE_URMA)
     target_include_directories(folly_deps SYSTEM INTERFACE
         $<BUILD_INTERFACE:${URMA_INCLUDE_DIR}>)
-    if (URMA_USE_REAL_LIB)
-        find_library(URMA_LIBRARY NAMES urma
-            PATHS "${URMA_ROOT}/lib" "${URMA_ROOT}/build/lib"
-            NO_DEFAULT_PATH
-        )
-        if (URMA_LIBRARY)
-            message(STATUS "Linking real URMA library: ${URMA_LIBRARY}")
-            target_link_libraries(folly_deps INTERFACE ${URMA_LIBRARY})
-        else()
-            message(FATAL_ERROR "URMA_USE_REAL_LIB=ON but liburma.so not found")
-        endif()
-    else()
-        message(STATUS "Using urma_stub.cpp (default). Set -DURMA_USE_REAL_LIB=ON to link real liburma.so.")
-    endif()
+    target_link_libraries(folly_deps INTERFACE ${URMA_LIBRARY})
+elseif (URMA_INCLUDE_DIR)
+    message(WARNING "URMA headers found but liburma.so not found; URMA support disabled.")
 else()
-    message(STATUS "URMA headers not found (URMA_ROOT=${URMA_ROOT}); URMA support disabled.")
+    message(STATUS "URMA headers not found; URMA support disabled.")
 endif()
 
 list(REMOVE_DUPLICATES FOLLY_INCLUDE_DIRECTORIES)
