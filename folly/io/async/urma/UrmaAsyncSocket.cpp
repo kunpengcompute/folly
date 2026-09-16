@@ -145,7 +145,7 @@ void UrmaAsyncSocket::onHandshakeReady() {
 
   state_ = State::kOpen;
 
-  XLOG(INFO) << "[URMA] handshakeReady state->kOpen";
+//   XLOG(INFO) << "[URMA] handshakeReady state->kOpen";
 
   handlePendingWrites();
 
@@ -245,9 +245,9 @@ void UrmaAsyncSocket::writeChain(WriteCallback* cb, std::unique_ptr<IOBuf>&& cha
   bool big_deferred = false;
   urma_status_t ret = sendChain(cb, chain, total_posted, big_deferred, group);
   if (ret == URMA_EAGAIN) {
-    XLOG(INFO) << "[URMA] writeChain EAGAIN queued total=" << total_posted
-               << " big_deferred=" << big_deferred
-               << " pending_big=" << pending_big_msg_.size();
+//     XLOG(INFO) << "[URMA] writeChain EAGAIN queued total=" << total_posted
+//                << " big_deferred=" << big_deferred
+//                << " pending_big=" << pending_big_msg_.size();
     auto pw = std::make_unique<PendingWrite>();
     pw->cb = cb;
     pw->buf = std::move(chain);
@@ -262,9 +262,9 @@ void UrmaAsyncSocket::writeChain(WriteCallback* cb, std::unique_ptr<IOBuf>&& cha
       }
     }
   } else if (ret == URMA_SUCCESS) {
-    XLOG(INFO) << "[URMA] writeChain done total=" << total_posted
-               << " big_deferred=" << big_deferred
-               << " pending_big=" << pending_big_msg_.size();
+//     XLOG(INFO) << "[URMA] writeChain done total=" << total_posted
+//                << " big_deferred=" << big_deferred
+//                << " pending_big=" << pending_big_msg_.size();
     // 组内大包未全部 FREE 时延迟 writeSuccess(跨 EAGAIN 拆分的多次 sendChain 也成立)
     if (cb && group->remaining == 0) cb->writeSuccess();
     bytes_written_ += total_posted;
@@ -286,16 +286,16 @@ void UrmaAsyncSocket::pollTx() noexcept {
         if (!ctrl_sge_refs_.empty()) {
           ctrl_sge_refs_.pop_front();
         }
-        XLOG(INFO) << "[URMA] cqeCtrl st=" << static_cast<int>(cr[i].status)
-                   << " ctrl_inflight=" << ctrl_sge_refs_.size();
+//         XLOG(INFO) << "[URMA] cqeCtrl st=" << static_cast<int>(cr[i].status)
+//                    << " ctrl_inflight=" << ctrl_sge_refs_.size();
         continue;
       }
       if (ctx & kReadUserCtxBase) {
         // B-4: 校验 CQE msg_id,跳过旧 READ 的重复 CQE
         uint16_t cqe_msg_id = static_cast<uint16_t>(ctx & 0xFFFF);
-        XLOG(INFO) << "[URMA] cqeRead msg_id=" << cqe_msg_id
-                   << " st=" << static_cast<int>(cr[i].status)
-                   << " expect=" << pending_read_msg_id_;
+//         XLOG(INFO) << "[URMA] cqeRead msg_id=" << cqe_msg_id
+//                    << " st=" << static_cast<int>(cr[i].status)
+//                    << " expect=" << pending_read_msg_id_;
         if (cqe_msg_id != pending_read_msg_id_) {
           XLOG(WARN) << "[URMA] pollTx: stale READ cqe msg_id=" << cqe_msg_id
                      << " expect=" << pending_read_msg_id_;
@@ -310,8 +310,8 @@ void UrmaAsyncSocket::pollTx() noexcept {
       }
       // SEND completion:释放 sbuf_
       uint64_t idx = ctx;
-      XLOG(INFO) << "[URMA] cqeSend idx=" << idx
-                 << " st=" << static_cast<int>(cr[i].status);
+//       XLOG(INFO) << "[URMA] cqeSend idx=" << idx
+//                  << " st=" << static_cast<int>(cr[i].status);
       if (idx < sbuf_.size()) {
         sbuf_[idx] = {};
       }
@@ -441,9 +441,9 @@ void UrmaAsyncSocket::handlePendingWrites() noexcept {
       if (!pending_write_head_) {
         pending_write_tail_ = nullptr;
       }
-      XLOG(INFO) << "[URMA] pendingWrite done total=" << total_posted
-                 << " big_deferred=" << big_deferred
-                 << " pending_big=" << pending_big_msg_.size();
+//       XLOG(INFO) << "[URMA] pendingWrite done total=" << total_posted
+//                  << " big_deferred=" << big_deferred
+//                  << " pending_big=" << pending_big_msg_.size();
       if (cb && big_group->remaining == 0) cb->writeSuccess();
       bytes_written_ += total_posted;
     }
@@ -482,9 +482,9 @@ bool UrmaAsyncSocket::sendBigMsgByRead(WriteCallback* cb,
   p.group = group;
   pending_big_msg_.emplace(msg_id, std::move(p));
 
-  XLOG(INFO) << "[URMA] sendBig msg_id=" << msg_id << " size=" << data_size
-             << " remote_va=" << remote_va
-             << " inflight=" << pending_big_msg_.size();
+//   XLOG(INFO) << "[URMA] sendBig msg_id=" << msg_id << " size=" << data_size
+//              << " remote_va=" << remote_va
+//              << " inflight=" << pending_big_msg_.size();
 
   if (!postControlPacket(msg_id, remote_va, data_size)) {
     pending_big_msg_.erase(msg_id);
@@ -496,45 +496,33 @@ bool UrmaAsyncSocket::sendBigMsgByRead(WriteCallback* cb,
 bool UrmaAsyncSocket::postControlPacket(uint16_t msg_id, uint64_t remote_va,
                                         uint32_t data_size) noexcept {
   if (!res_.remote_jetty) return false;
-  // B-6: 控制包 8 字节 remote_va 用每连接固定的 MR buffer(DMA 可读,复用不动态申请)
-  if (!ctrl_meta_mr_) {
-    ctrl_meta_mr_ = UrmaInit::poolAlloc(sizeof(uint64_t));
-    if (!ctrl_meta_mr_) {
-      XLOG(ERR) << "[URMA] ctrlPullPost: poolAlloc ctrl_meta failed";
-      return false;
-    }
-  }
-  *reinterpret_cast<uint64_t*>(ctrl_meta_mr_) = remote_va;
-  // sge 必须在堆上(URMA 驱动异步 DMA 读 sge,栈变量 post 后悬垂)
-  auto sge_arr = std::make_shared<std::vector<urma_sge_t>>(1);
-  (*sge_arr)[0].addr = reinterpret_cast<uint64_t>(ctrl_meta_mr_);
-  (*sge_arr)[0].len = sizeof(uint64_t);
-  (*sge_arr)[0].tseg = UrmaInit::getPoolTseg();
+  // inline=1: 元数据(8 字节 remote_va)在栈上,NIC post 时内联拷贝,不走 DMA/MR
+  uint64_t meta_va = remote_va;
+  urma_sge_t ctrl_sge = {};
+  ctrl_sge.addr = reinterpret_cast<uint64_t>(&meta_va);
+  ctrl_sge.len = sizeof(uint64_t);
+  ctrl_sge.tseg = nullptr;  // inline 模式不走 tseg
 
   urma_jfs_wr_t wr = {};
   wr.opcode = URMA_OPC_SEND_IMM;
   wr.tjetty = res_.remote_jetty;
   wr.flag.bs.complete_enable = 1;
-  wr.flag.bs.inline_flag = 0;
-  wr.send.src.sge = sge_arr->data();
+  wr.flag.bs.inline_flag = 1;
+  wr.send.src.sge = &ctrl_sge;
   wr.send.src.num_sge = 1;
   wr.send.imm_data = encodeBigMsgImm(msg_id, kCtrlTypePull, data_size);
   wr.user_ctx = kCtrlUserCtx;
   wr.next = nullptr;
 
-  // 持有 sge 到 SEND completion(pollTx 里 kCtrlUserCtx 跳过释放,
-  // 这里用 ctrl_sge_refs_ 存)
-  ctrl_sge_refs_.push_back(sge_arr);
-
   urma_jfs_wr_t* bad_wr = nullptr;
   urma_status_t st = urma_post_jetty_send_wr(res_.io_jetty, &wr, &bad_wr);
   if (st != URMA_SUCCESS) {
-    ctrl_sge_refs_.pop_back();
+    XLOG(ERR) << "[URMA] ctrlPullPost FAIL msg_id=" << msg_id
+              << " size=" << data_size << " st=" << static_cast<int>(st);
+    return false;
   }
-  XLOG(INFO) << "[URMA] ctrlPullPost msg_id=" << msg_id << " size=" << data_size
-             << " st=" << static_cast<int>(st)
-             << " meta=" << reinterpret_cast<uintptr_t>(ctrl_meta_mr_)
-             << " ctrl_inflight=" << ctrl_sge_refs_.size();
+//   XLOG(INFO) << "[URMA] ctrlPullPost msg_id=" << msg_id << " size=" << data_size
+//              << " st=" << static_cast<int>(st);
   return st == URMA_SUCCESS;
 }
 
@@ -549,9 +537,9 @@ void UrmaAsyncSocket::onControlMsg(uint64_t imm, const void* meta) noexcept {
   if (is_ctl == kCtrlTypeFree) {
     // 发送方收到 FREE:释放大 buffer。writeSuccess 只在组内全部大包 FREE 后回调一次
     auto it = pending_big_msg_.find(msg_id);
-    XLOG(INFO) << "[URMA] ctrlFreeRecv msg_id=" << msg_id
-               << " found=" << (it != pending_big_msg_.end())
-               << " inflight=" << pending_big_msg_.size();
+//     XLOG(INFO) << "[URMA] ctrlFreeRecv msg_id=" << msg_id
+//                << " found=" << (it != pending_big_msg_.end())
+//                << " inflight=" << pending_big_msg_.size();
     if (it != pending_big_msg_.end() && !it->second.is_free) {
       auto group = it->second.group;
       WriteCallback* cb = it->second.cb;
@@ -577,9 +565,9 @@ void UrmaAsyncSocket::onControlMsg(uint64_t imm, const void* meta) noexcept {
   if (meta) {
     std::memcpy(&remote_va, meta, sizeof(remote_va));
   }
-  XLOG(INFO) << "[URMA] ctrlPullRecv msg_id=" << msg_id << " size=" << data_size
-             << " remote_va=" << remote_va << " pending=" << has_pending_read_
-             << " is_ctl=" << static_cast<int>(is_ctl);
+//   XLOG(INFO) << "[URMA] ctrlPullRecv msg_id=" << msg_id << " size=" << data_size
+//              << " remote_va=" << remote_va << " pending=" << has_pending_read_
+//              << " is_ctl=" << static_cast<int>(is_ctl);
 
   if (has_pending_read_) {
     // 有 READ 在途:控制包进保序队列(等当前 READ 完成)
@@ -589,8 +577,8 @@ void UrmaAsyncSocket::onControlMsg(uint64_t imm, const void* meta) noexcept {
     item.remote_va = remote_va;
     item.data_size = data_size;
     rx_pending_queue_.push(std::move(item));
-    XLOG(INFO) << "[URMA] ctrlPullQueued msg_id=" << msg_id
-               << " size=" << data_size << " qsize=" << rx_pending_queue_.size();
+//     XLOG(INFO) << "[URMA] ctrlPullQueued msg_id=" << msg_id
+//                << " size=" << data_size << " qsize=" << rx_pending_queue_.size();
     return;
   }
 
@@ -639,8 +627,8 @@ bool UrmaAsyncSocket::startRead(uint16_t msg_id, uint64_t remote_va,
     XLOG(ERR) << "startRead: post READ failed, status=" << st << " msg_id=" << msg_id;
     return false;
   }
-  XLOG(INFO) << "[URMA] readPost msg_id=" << msg_id << " size=" << data_size
-             << " remote_va=" << remote_va << " st=" << static_cast<int>(st);
+//   XLOG(INFO) << "[URMA] readPost msg_id=" << msg_id << " size=" << data_size
+//              << " remote_va=" << remote_va << " st=" << static_cast<int>(st);
   return true;
 }
 
@@ -653,8 +641,8 @@ void UrmaAsyncSocket::onReadComplete() noexcept {
   pending_read_sge_.reset();
   has_pending_read_ = false;
   bytes_received_ += data->length();
-  XLOG(INFO) << "[URMA] readDone msg_id=" << pending_read_msg_id_
-             << " len=" << data->length();
+//   XLOG(INFO) << "[URMA] readDone msg_id=" << pending_read_msg_id_
+//              << " len=" << data->length();
 
   read_queue_.append(std::move(data));
   if (read_cb_) {
@@ -690,7 +678,7 @@ bool UrmaAsyncSocket::postFreeNotify(uint16_t msg_id) noexcept {
   wr.opcode = URMA_OPC_SEND_IMM;
   wr.tjetty = res_.remote_jetty;
   wr.flag.bs.complete_enable = 1;
-  wr.flag.bs.inline_flag = 0;  // ctrl packet inline
+  wr.flag.bs.inline_flag = 1;  // ctrl packet inline
   wr.send.src.num_sge = 0;
   wr.send.imm_data = encodeBigMsgImm(msg_id, kCtrlTypeFree, 0);
   wr.user_ctx = kCtrlUserCtx;
@@ -698,7 +686,7 @@ bool UrmaAsyncSocket::postFreeNotify(uint16_t msg_id) noexcept {
 
   urma_jfs_wr_t* bad_wr = nullptr;
   urma_status_t st = urma_post_jetty_send_wr(res_.io_jetty, &wr, &bad_wr);
-  XLOG(INFO) << "[URMA] freePost msg_id=" << msg_id << " st=" << static_cast<int>(st);
+//   XLOG(INFO) << "[URMA] freePost msg_id=" << msg_id << " st=" << static_cast<int>(st);
   return st == URMA_SUCCESS;
 }
 
@@ -708,15 +696,15 @@ void UrmaAsyncSocket::drainRxPendingQueue() noexcept {
     rx_pending_queue_.pop();
     if (item.is_control) {
       // 串行保序:遇到控制包,发起新 READ 后停止取出
-      XLOG(INFO) << "[URMA] drainCtrl msg_id=" << item.msg_id
-                 << " size=" << item.data_size << " qsize=" << rx_pending_queue_.size();
+//       XLOG(INFO) << "[URMA] drainCtrl msg_id=" << item.msg_id
+//                  << " size=" << item.data_size << " qsize=" << rx_pending_queue_.size();
       has_pending_read_ = startRead(item.msg_id, item.remote_va, item.data_size);
       if (!has_pending_read_) {
         XLOG(ERR) << "[URMA] drainCtrl startRead failed msg_id=" << item.msg_id;
       }
       return;
     }
-    XLOG(INFO) << "[URMA] drainData len=" << item.data->length();
+//     XLOG(INFO) << "[URMA] drainData len=" << item.data->length();
     read_queue_.append(std::move(item.data));
     if (read_cb_) {
       deliverReadData();
@@ -799,8 +787,8 @@ void UrmaAsyncSocket::scanBigMsgTimeout() noexcept {
 
 void UrmaAsyncSocket::onRxBuf(std::unique_ptr<IOBuf> data) noexcept {
   bytes_received_ += data->length();
-  XLOG(INFO) << "[URMA] rxSmall len=" << data->length()
-             << " pending=" << has_pending_read_;
+//   XLOG(INFO) << "[URMA] rxSmall len=" << data->length()
+//              << " pending=" << has_pending_read_;
   if (has_pending_read_) {
     RxBufItem item;
     item.is_control = false;

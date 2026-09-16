@@ -43,6 +43,7 @@ class UrmaInit {
 
   // 硬件能力(init 时查询,供 UrmaAsyncSocket 等使用)
   static uint8_t getMaxJfsSge() { return s_max_jfs_sge; }
+  static uint32_t getMaxJfsInlineLen() { return s_max_jfs_inline_len; }
   static const UrmaConfig& getConfig() { return s_config; }
 
   // 本地 EID(init 时从 urma_get_eid_list 获取,供 UrmaHandshake 填充 HelloMessage)
@@ -64,6 +65,7 @@ class UrmaInit {
   static urma_target_seg_t* s_pool_seg;
   static UrmaConfig s_config;
   static uint8_t s_max_jfs_sge;
+  static uint32_t s_max_jfs_inline_len;
   static urma_eid_t s_local_eid;  // 硬件 max_jfs_sge(init 时查询)
 };
 
@@ -72,12 +74,17 @@ constexpr size_t URMA_SMALL_BUF_SIZE = 4096;
 constexpr size_t URMA_MEDIUM_BUF_SIZE = 16384;
 constexpr size_t URMA_BIG_BUF_SIZE = 65536;
 constexpr size_t URMA_LARGE_BUF_SIZE = 1048576;
+constexpr size_t URMA_HUGE_BUF_SIZE = 9 * 1024 * 1024; // 9MB,容纳 8MB payload + thrift header
+constexpr size_t URMA_NUM_TIERS = 5;
 constexpr size_t URMA_NUM_SHARDS = 64;
 
 // JFS/JFR RNR 重试参数(参照 UMQ umq_ub.c:21-23,内部固定不暴露给用户)
 constexpr uint8_t URMA_DEFAULT_RNR_RETRY = 6;       // 硬件自动重试次数
 constexpr uint8_t URMA_DEFAULT_MIN_RNR_TIMER = 19;   // 每次重试间隔 2μs×2^19 ≈ 1.05s
-constexpr uint8_t URMA_DEFAULT_ERR_TIMEOUT = 2;      // jetty 错误超时 4.096×2^2 = 16.4ms
+// 8MB READ 在 1000 连接高并发下 DMA 传输/排队可超 16.4ms(原值=2),导致 URMA_CR_ACK_TIMEOUT_ERR
+// (status=9)。err_timeout=10 -> 4.096x2^10 ~= 4.2s:大于并发排队时间(<1s),小于客户端
+// scanBigMsgTimeout 7s 重发周期,保证重发 PULL 前服务端 READ 已失败并进入 drainRxPendingQueue。
+constexpr uint8_t URMA_DEFAULT_ERR_TIMEOUT = 10;     // jetty 错误超时 4.096x2^10 ~= 4.2s
 
 } // namespace folly
 

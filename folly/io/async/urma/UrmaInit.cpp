@@ -28,6 +28,7 @@ urma_context_t* UrmaInit::s_ctx = nullptr;
 urma_target_seg_t* UrmaInit::s_pool_seg = nullptr;
 UrmaConfig UrmaInit::s_config;
 uint8_t UrmaInit::s_max_jfs_sge = 6;
+uint32_t UrmaInit::s_max_jfs_inline_len = 8;
 urma_eid_t UrmaInit::s_local_eid = {};
 
 static void* s_mmap_base = nullptr;
@@ -55,36 +56,40 @@ struct ShardPool {
   std::mutex mtx;
 };
 
-static ShardPool g_pools[4][URMA_NUM_SHARDS];
+static ShardPool g_pools[URMA_NUM_TIERS][URMA_NUM_SHARDS];
 
 // 各级 buffer 大小(= IoBufBlock payload 大小,IoBufBlock header 24B 在 buffer 内)
-static constexpr size_t TIER_SIZES[4] = {
-    URMA_SMALL_BUF_SIZE, URMA_MEDIUM_BUF_SIZE, URMA_BIG_BUF_SIZE, URMA_LARGE_BUF_SIZE};
+static constexpr size_t TIER_SIZES[URMA_NUM_TIERS] = {
+    URMA_SMALL_BUF_SIZE, URMA_MEDIUM_BUF_SIZE, URMA_BIG_BUF_SIZE,
+    URMA_LARGE_BUF_SIZE, URMA_HUGE_BUF_SIZE};
 // 各级 stride = buffer 大小(无额外 header 开销)
-static constexpr size_t TIER_STRIDES[4] = {
-    URMA_SMALL_BUF_SIZE, URMA_MEDIUM_BUF_SIZE, URMA_BIG_BUF_SIZE, URMA_LARGE_BUF_SIZE};
+static constexpr size_t TIER_STRIDES[URMA_NUM_TIERS] = {
+    URMA_SMALL_BUF_SIZE, URMA_MEDIUM_BUF_SIZE, URMA_BIG_BUF_SIZE,
+    URMA_LARGE_BUF_SIZE, URMA_HUGE_BUF_SIZE};
 
-// 各级占比,按设计文档 §4.2.2,用公分母 16 直接表示:
-//   Small=12/16(75%), Medium=1/16(6.25%), Big=1/16(6.25%), Large=2/16(12.5%)
-static constexpr uint32_t TIER_NUMERATOR[4] = {12, 1, 1, 2};
+// 各级占比,用公分母 16 直接表示:
+//   Small=1/16, Medium=1/16, Big=1/16, Large(1MB)=1/16, Huge(9MB)=12/16
+static constexpr uint32_t TIER_NUMERATOR[URMA_NUM_TIERS] = {1, 1, 1, 1, 12};
 static constexpr uint32_t TIER_DENOMINATOR = 16;
 
 // 各级在 mmap 中的起始地址和 buffer 数量(运行时由 initMrPool 填充)
-static char* g_tier_base[4] = {};
-static size_t g_tier_count[4] = {};
+static char* g_tier_base[URMA_NUM_TIERS] = {};
+static size_t g_tier_count[URMA_NUM_TIERS] = {};
 
 static int poolTier(size_t size) {
   if (size <= URMA_SMALL_BUF_SIZE) return 0;
   if (size <= URMA_MEDIUM_BUF_SIZE) return 1;
   if (size <= URMA_BIG_BUF_SIZE) return 2;
   if (size <= URMA_LARGE_BUF_SIZE) return 3;
+  if (size <= URMA_HUGE_BUF_SIZE) return 4;
   return -1;
 }
 
 // 按 tier stride 移位,使连续 buffer 均匀落到不同 shard
-// shift = log2(stride): Small=12(4KB), Medium=14(16KB), Big=16(64KB), Large=20(1MB)
+// shift = log2(stride): Small=12(4KB), Medium=14(16KB), Big=16(64KB),
+//                        Large=20(1MB), Huge=23(9MB)
 // 移位后连续 buffer 恰好差 1,% 64 得到 0,1,2,...,63 均匀循环
-static constexpr int TIER_SHIFTS[4] = {12, 14, 16, 20};
+static constexpr int TIER_SHIFTS[URMA_NUM_TIERS] = {12, 14, 16, 20, 23};
 
 static size_t shardIndex(void* ptr, int tier) {
   return (reinterpret_cast<uintptr_t>(ptr) >> TIER_SHIFTS[tier]) % URMA_NUM_SHARDS;
@@ -100,7 +105,7 @@ static size_t allocShardIndex() {
 // 从 buffer 指针反查 tier(按地址范围)
 static int tierFromPtr(void* ptr) {
   auto p = reinterpret_cast<char*>(ptr);
-  for (int t = 3; t >= 0; --t) {
+  for (int t = URMA_NUM_TIERS - 1; t >= 0; --t) {
     if (p >= g_tier_base[t]) return t;
   }
   return 0;
@@ -137,10 +142,10 @@ void UrmaInit::initMrPool() {
     return;
   }
 
-  // 按比例切分 mmap 区域为 4 级子池
+  // 按比例切分 mmap 区域为分级子池
   char* base = static_cast<char*>(s_mmap_base);
   size_t offset = 0;
-  for (int t = 0; t < 4; ++t) {
+  for (int t = 0; t < URMA_NUM_TIERS; ++t) {
     size_t tier_total = (s_mmap_size * TIER_NUMERATOR[t]) / TIER_DENOMINATOR;
     size_t count = tier_total / TIER_STRIDES[t];
     g_tier_base[t] = base + offset;
@@ -173,7 +178,7 @@ void UrmaInit::finiMrPool() {
     munmap(s_mmap_base, s_mmap_size);
     s_mmap_base = nullptr;
   }
-  for (int t = 0; t < 4; ++t) {
+  for (int t = 0; t < URMA_NUM_TIERS; ++t) {
     g_tier_base[t] = nullptr;
     g_tier_count[t] = 0;
     for (size_t s = 0; s < URMA_NUM_SHARDS; ++s) {
@@ -185,7 +190,7 @@ void UrmaInit::finiMrPool() {
 void* UrmaInit::poolAlloc(size_t size) {
   int tier = poolTier(size);
   if (tier < 0) {
-    XLOG(WARN) << "UrmaInit: poolAlloc size=" << size << " exceeds max tier (1MB), rejected";
+    XLOG(WARN) << "UrmaInit: poolAlloc size=" << size << " exceeds max tier (9MB), rejected";
     return nullptr;
   }
   // 用线程 ID 选起始 shard,优先查自己的 shard,miss 后 steal 其余 shard
@@ -280,6 +285,7 @@ void UrmaInit::init(const UrmaConfig& config) {
   }
   s_config.validateAndClamp(dev_attr.dev_cap, 0, 0);
   s_max_jfs_sge = dev_attr.dev_cap.max_jfs_sge > 0 ? dev_attr.dev_cap.max_jfs_sge : 6;
+  s_max_jfs_inline_len = dev_attr.dev_cap.max_jfs_inline_len > 0 ? dev_attr.dev_cap.max_jfs_inline_len : 8;
 
   // 4. EID 发现(参照 brpc urma_get_eid_list)
   uint32_t eid_cnt = 0;

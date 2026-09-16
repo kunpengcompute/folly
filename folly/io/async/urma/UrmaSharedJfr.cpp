@@ -202,7 +202,7 @@ void UrmaSharedJfr::fillFcRxBuf() noexcept {
 void UrmaSharedJfr::pollAndDispatch() noexcept {
   urma_jfc_t* wait_jfcs[1] = {io_jfc_};
   int wait_ret = urma_wait_jfc(io_jfce_, 1, 0, wait_jfcs);
-  XLOG(INFO) << "[URMA] jfrWait ret=" << wait_ret;
+//   XLOG(INFO) << "[URMA] jfrWait ret=" << wait_ret;
   if (wait_ret < 0) {
     XLOG(ERR) << "UrmaSharedJfr: urma_wait_jfc failed, ret=" << wait_ret;
     urma_rearm_jfc(io_jfc_, false);
@@ -211,13 +211,13 @@ void UrmaSharedJfr::pollAndDispatch() noexcept {
   urma_cr_t cr[POLL_BATCH_MAX];
   int n;
   while ((n = urma_poll_jfc(io_jfc_, POLL_BATCH_MAX, cr)) > 0) {
-    XLOG(INFO) << "[URMA] jfrPoll n=" << n;
+//     XLOG(INFO) << "[URMA] jfrPoll n=" << n;
     for (int i = 0; i < n; ++i) {
       uint32_t slot = static_cast<uint32_t>(cr[i].user_ctx);
       auto it = socket_map_.find(cr[i].remote_id.id);
       if (it == socket_map_.end()) {
-        XLOG(INFO) << "[URMA] jfrNoSocket remote_id=" << cr[i].remote_id.id
-                   << " slot=" << slot << " opcode=" << static_cast<int>(cr[i].opcode);
+//         XLOG(INFO) << "[URMA] jfrNoSocket remote_id=" << cr[i].remote_id.id
+//                    << " slot=" << slot << " opcode=" << static_cast<int>(cr[i].opcode);
         replenishRxBuf(slot);
         continue;
       }
@@ -225,15 +225,15 @@ void UrmaSharedJfr::pollAndDispatch() noexcept {
       if (cr[i].opcode == URMA_CR_OPC_SEND_WITH_IMM) {
         // SEND_IMM 控制包:imm_data 编码 msg_id|is_ctl|data_size
         // RX buffer 含 8 字节 meta(remote_va for PULL)
-        XLOG(INFO) << "[URMA] jfrImm slot=" << slot << " remote=" << cr[i].remote_id.id
-                   << " imm=" << cr[i].imm_data;
+//         XLOG(INFO) << "[URMA] jfrImm slot=" << slot << " remote=" << cr[i].remote_id.id
+//                    << " imm=" << cr[i].imm_data;
         socket->onControlMsg(cr[i].imm_data, rx_bufs_[slot].data);
         replenishRxBuf(slot);
         recharge();
       } else {
         // 普通 SEND 数据
-        XLOG(INFO) << "[URMA] jfrSend slot=" << slot << " len=" << cr[i].completion_len
-                   << " remote=" << cr[i].remote_id.id;
+//         XLOG(INFO) << "[URMA] jfrSend slot=" << slot << " len=" << cr[i].completion_len
+//                    << " remote=" << cr[i].remote_id.id;
         auto data = IOBuf::takeOwnership(
             rx_bufs_[slot].data, cr[i].completion_len,
             [](void* /*buf*/, void* userData) {

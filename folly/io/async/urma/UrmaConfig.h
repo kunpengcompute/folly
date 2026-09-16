@@ -31,7 +31,7 @@ constexpr uint32_t kUrmaDefaultRxDepth = 1024;
 constexpr uint32_t kUrmaDefaultFcRxDepth = 1024;
 constexpr uint32_t kUrmaDefaultTxDepth = 1024;
 constexpr uint32_t kUrmaDefaultIdleTimeoutMs = 10;
-constexpr uint64_t kUrmaDefaultPoolSize = 512ULL * 1024 * 1024; // 512MB
+constexpr uint64_t kUrmaDefaultPoolSize = 64ULL * 1024 * 1024 * 1024; // 64GB
 
 // ── 硬件限制校验常量 ──
 constexpr uint32_t kUrmaJfrPerIoThread = 2;    // IO + FC,每 IO 线程 2 个 JFR
