@@ -2,7 +2,7 @@
 
 ## Folly v1.1.0：IOBuf TLS内存池接口说明
 
-本章介绍Folly v1.1.0新增的IOBuf TLS内存池接口和生命周期规则。该能力默认不改变原有分配行为，调用enableMemoryPool()后才会进入池化路径。
+本文档介绍Folly v1.1.0新增的IOBuf TLS内存池接口和生命周期规则。该能力默认不改变原有分配行为，调用enableMemoryPool()后才会进入池化路径。
 
 ### 接口概览
 
@@ -16,7 +16,7 @@
 |ioBufBlockRelease|内部接口|将空闲块放回TLS缓存或释放给系统。|
 |share_block|内部接口|获取能够容纳指定容量的当前共享块。|
 
-### `IOBuf::enableMemoryPool`
+### IOBuf::enableMemoryPool
 
 #### IOBuf::enableMemoryPool函数功能
 
@@ -34,7 +34,7 @@ static void folly::IOBuf::enableMemoryPool();
 - 未调用时保持原有createCombined()或createSeparate()行为。
 - 启用后仍保留大容量请求和池化失败的回退路径。
 
-### `IOBuf::setBlockSize`
+### IOBuf::setBlockSize
 
 #### IOBuf::setBlockSize函数功能
 
@@ -48,13 +48,13 @@ static void folly::IOBuf::setBlockSize(std::size_t size);
 
 #### IOBuf::setBlockSize函数参数说明
 
-|参数名|描述|输入/输出|
+|参数名|说明|输入/输出|
 |--|--|--|
 |size|新建池块的总字节数|输入|
 
 该配置影响后续新建数据块，不应在请求处理中频繁修改。建议在调用enableMemoryPool()前完成设置，并结合请求大小分布评估内存占用。
 
-### `IOBuf::create`路由
+### IOBuf::create路由
 
 #### IOBuf::create函数定义
 
@@ -67,11 +67,11 @@ folly::IOBuf::create(std::size_t capacity);
 
 ```text
 IOBuf::create(capacity)
-├── 内存池未启用
-│   └── 原有createCombined/createSeparate路径
-├── capacity超过池块数据区容量
-│   └── 原有createCombined/createSeparate路径
-└── capacity能够由池块容纳
+├── 内存池未启用。
+│   └── 原有createCombined/createSeparate路径。
+├── capacity超过池块数据区容量。
+│   └── 原有createCombined/createSeparate路径。
+└── capacity能够由池块容纳。
     └── createFromPoolShared(capacity)
 ```
 
@@ -79,31 +79,31 @@ IOBuf::create(capacity)
 
 ### 内部数据结构与接口
 
-#### `IoBufBlock`
+#### IoBufBlock
 
 IoBufBlock是自描述的池化数据块。
 
 ```text
 IoBufBlock
-├── magic：校验块类型和有效性
-├── capacity：数据区容量
-├── ref_count：TLS持有与全部IOBuf引用计数
-├── share_count：引用该块的IOBuf数量
-├── data_len：已经切分的数据长度
-└── payloadBegin()：数据区起点
+├── magic：校验块类型和有效性。
+├── capacity：数据区容量。
+├── ref_count：TLS持有与全部IOBuf引用计数。
+├── share_count：引用该块的IOBuf数量。
+├── data_len：已经切分的数据长度。
+└── payloadBegin()：数据区起点。
 ```
 
 默认块大小为8KB。数据区按data_len连续推进，保证同一个块内的slice互不重叠。
 
-#### `TLSBlockCache`
+#### TLSBlockCache
 
 每个线程维护独立的TLSBlockCache。
 
 ```text
 TLSBlockCache
-├── blocks[8]：空闲块数组
-├── count：当前空闲块数量
-└── current_share：当前用于切分slice的块
+├── blocks[8]：空闲块数组。
+├── count：当前空闲块数量。
+└── current_share：当前用于切分slice的块。
 ```
 
 空闲块使用LIFO方式复用。current_share的data_len只由所属线程推进，避免为slice分配增加共享锁。
@@ -175,9 +175,9 @@ IoBufBlock
 
 ## Folly v1.0.0：io_uring混合读写接口说明
 
-> 本节保留Folly v1.0.0提供的io_uring混合读写接口，与Folly v1.1.0的IOBuf TLS内存池分开说明。
+> ![表示说明的图片](./public_sys-resources/icon-note.gif)**说明**：本节保留Folly v1.0.0提供的io_uring混合读写接口，与Folly v1.1.0的IOBuf TLS内存池分开说明。
 
-### 接口概览
+### Folly v1.0.0：io_uring混合读写接口概览
 
 |名称|说明|
 |--|--|
@@ -185,7 +185,7 @@ IoBufBlock
 |writeChain|将写请求按顺序存入写队列，通过开源send执行发送。|
 |PollWriteSqe|通过io_uring接收socket可写通知。|
 
-### `AsyncIoUringSocket::writeChain`
+### AsyncIoUringSocket::writeChain
 
 #### 函数功能
 
@@ -202,16 +202,16 @@ void AsyncIoUringSocket::writeChain(
 
 #### 参数说明
 
-|参数名|描述|输入/输出|
+|参数名|说明|输入/输出|
 |--|--|--|
 |callback|写完成回调|输入|
 |buf|待发送的IOBuf链|输入|
 |flags|写操作标志|输入|
 
-该函数无返回值。当send因缓冲区不足无法继续发送时，结合PollWriteSqe监听socket fd的可写事件，并在可写后恢复发送。
+该函数无返回值。当send因缓冲区不足无法继续发送时，结合PollWriteSqe侦听socket fd的可写事件，并在可写后恢复发送。
 
 ## 修订记录
 
 |文档版本|发布日期|修改说明|
-| :---| :---| :---|
+|:---|:---|:---|
 |01|2026-9-30|第一次正式发布。|
