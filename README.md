@@ -13,7 +13,7 @@ Folly是Meta开源的一套高性能C++11/14/17组件库，直接针对大规模
 
 本项目面向Folly网络I/O和缓冲区分配路径进行性能优化。Folly v1.1.0新增IOBuf TLS内存池，仅池化数据块，不池化IOBuf对象本身。Folly v1.0.0采用io_uring混合模式：读操作使用multishot减少系统调用，写操作使用`send`系统调用保证连续写的顺序和延迟稳定性。
 
-IOBuf TLS内存池的核心设计如下：
+IOBuf TLS内存池的核心设计如下。
 
 - 每个线程使用`TLSBlockCache`缓存空闲`IoBufBlock`，默认最多8个。
 - 默认数据块大小为8KB，从`current_share`连续切分互不重叠的slice。
