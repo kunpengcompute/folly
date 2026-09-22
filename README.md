@@ -1,17 +1,17 @@
 # Folly性能优化补丁介绍
 
-简体中文|[English]()
+简体中文|[English](./README_en.md)
 
 ## 最新消息
 
-- 2026.09.30：发布Folly v1.1.0版本补丁，新增IOBuf TLS内存池，通过线程本地数据块复用和连续slice切分减少高QPS场景下的`malloc/free`。
-- 2026.03.30：发布Folly v1.0.0版本补丁仓，针对Folly异步网络io框架进行io_uring优化，提升网络io的稳定性与基线io性能。
+- [2026.09.30]：发布Folly v1.1.0版本补丁，新增IOBuf TLS内存池，通过线程本地数据块复用和连续slice切分减少高QPS场景下的`malloc/free`。
+- [2026.06.30]：发布Folly v1.0.0版本补丁仓，针对Folly异步网络io框架进行io_uring优化，提升网络io的稳定性与基线io性能。
 
 ## 项目介绍
 
 Folly是Meta开源的一套高性能C++11/14/17组件库，直接针对大规模、高并发、低延迟的服务器端应用场景而设计。
 
-本项目面向Folly网络I/O和缓冲区分配路径进行性能优化。Folly v1.1.0新增IOBuf TLS内存池，仅池化数据块，不池化IOBuf对象本身。Folly v1.0.0采用io_uring混合模式：读操作使用multishot减少系统调用，写操作使用`send`接口，保证连续写的顺序和延迟稳定性。
+本项目面向Folly网络I/O和缓冲区分配路径进行性能优化。Folly v1.1.0新增IOBuf TLS内存池，仅池化数据块，不池化IOBuf对象本身。Folly v1.0.0采用io_uring混合模式：读操作使用multishot减少系统调用，写操作使用`send`系统调用保证连续写的顺序和延迟稳定性。
 
 IOBuf TLS内存池的核心设计如下：
 
@@ -26,7 +26,7 @@ IOBuf TLS内存池的核心设计如下：
 ```text
 fbthrift/
 ├── docs/                           # 文档目录
-│   ├── en/                         # 英文文档 English documents
+│   ├── en/                         # English documents
 │   │   ├── api_reference.md        # API reference sheet
 │   │   ├── quick_start.md          # Menu for beginners
 │   │   └── release_notes.md        # Release notes
@@ -51,11 +51,11 @@ fbthrift/
 
 ## 学习文档
 
-| 学习资源名称 | 资源简介 |
+| 学习文档名称 | 内容简介 |
 | --------- | --------- |
-| [快速入门](docs/zh/quick_start.md) | 提供io_uring与IOBuf TLS内存池的编译、启用和验证指导。 |
-| [版本说明书](docs/zh/release_notes.md) | 提供Folly v1.1.0版本信息、兼容性约束和特性更新。 |
-| [API参考](docs/zh/api_reference.md) | 按版本提供TLS内存池和io_uring相关接口说明。 |
+| [《快速入门》](docs/zh/quick_start.md) | 提供io_uring与IOBuf TLS内存池的编译、启用和验证指导。 |
+| [《版本说明书》](docs/zh/release_notes.md) | 提供Folly v1.1.0版本信息、兼容性约束和特性更新。 |
+| [《API参考》](docs/zh/api_reference.md) | 按版本提供TLS内存池和io_uring相关接口说明。 |
 
 ## 免责声明
 

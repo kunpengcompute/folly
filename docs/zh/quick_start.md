@@ -1,100 +1,12 @@
 # 快速入门
 
-> 适用版本：Folly v1.1.0
-
 本文指导用户编译Folly优化版本、启用IOBuf TLS内存池，并验证原有io_uring混合读写路径。
 
-## 1. 获取优化源码
+> ![表示说明的图片](./public_sys-resources/icon-note.gif)**说明**：本文档适用版本：Folly v1.1.0。
 
-本项目提供两种获取优化源码的方式：按1.1节直接获取优化源码，或依次按1.2～1.4节获取基线源码、校验并应用补丁。完成后，进入第2章编译与安装。
+## 环境准备
 
-### 1.1 直接获取dev_iouring分支的优化源码
-
-dev_iouring分支已包含io_uring网络I/O优化、IOBuf TLS内存池等优化内容。
-
-```bash
-git clone --recurse-submodules --branch dev_iouring --single-branch \
-  https://gitcode.com/boostkit/folly.git folly
-cd folly
-```
-
-1.2～1.4均为补丁仓的获取与应用，若已获取优化源码，即可跳转至[第二章](#2-编译与安装)进行编译准备。
-
-### 1.2 获取基线源码、补丁和校验文件
-
-基线源码保存在folly目录，补丁和校验文件保存在同级的folly-patches目录。在选定的工作目录下执行以下命令：
-
-```bash
-git clone --recurse-submodules --branch v2022.11.14.00 --single-branch \
-  https://github.com/facebook/folly.git folly
-git clone --branch master --single-branch \
-  https://gitcode.com/boostkit/folly.git folly-patches
-cd folly-patches
-```
-
-### 1.3 软件包完整性校验
-
-本项目以补丁文件形式提供 Folly 性能优化功能，采用 **SHA-256 校验**确认补丁在下载、传输和存储过程中是否发生变化。
-
-SHA-256 校验用于验证文件完整性，不单独证明来源真实性。请从 [Folly 官方仓库](https://gitcode.com/boostkit/folly)获取补丁及同一版本的校验文件。
-
-**1. 校验文件**
-
-| 文件名称 | 说明 |
-| --- | --- |
-| `folly_iobuf_iouring.patch` | Folly 性能优化补丁 |
-| `folly_iobuf_iouring.patch.sha256` | 记录上述补丁文件名及 SHA-256 摘要值的校验文件 |
-
-补丁与校验文件应来自同一发布版本。补丁更新时，应同步更新校验文件。
-
-**2. 校验步骤**
-
-按前面的步骤获取后，当前目录即为folly-patches。将补丁和校验文件放在同一目录，在该目录下执行以下命令：
-
-```bash
-sha256sum --check --strict folly_iobuf_iouring.patch.sha256
-```
-
-该命令读取校验文件中的摘要值，与实际补丁的 SHA-256 摘要进行比较，并检查校验文件格式。[命令说明](https://www.gnu.org/software/coreutils/manual/html_node/sha2-utilities.html)
-
-校验通过时，输出如下：
-
-```text
-folly_iobuf_iouring.patch: OK
-```
-
-中文环境可能显示“成功”。应确认输出对应的文件名为 `folly_iobuf_iouring.patch`，且命令没有报告失败或格式错误。
-
-**3. 结果判定**
-
-| 校验结果 | 判定及处理 |
-| --- | --- |
-| 显示 `OK` 或“成功”，且无错误提示 | 补丁与校验文件中的摘要一致，完整性校验通过，可继续应用补丁 |
-| 显示 `FAILED` 或“失败” | 补丁内容与预期不一致，停止使用并重新获取 |
-| 提示文件不存在或无法读取 | 检查当前目录、文件名及文件是否下载完整 |
-| 提示校验文件格式错误 | 重新获取发布方提供的校验文件 |
-
-**4. 异常处理**
-
-校验失败时，请从官方仓库重新获取同一版本的补丁和校验文件，再次执行校验。
-
-不要通过修改校验文件中的摘要值使校验通过。如重新获取后仍然失败，请向发布方反馈补丁版本、文件名和完整的校验输出。
-
-### 1.4 应用优化补丁
-
-校验通过后，从补丁目录切换到基线源码目录，检查并应用补丁：
-
-```bash
-cd ../folly
-git apply --check ../folly-patches/folly_iobuf_iouring.patch
-git apply ../folly-patches/folly_iobuf_iouring.patch
-```
-
-补丁只需应用一次。完成后，在当前folly源码目录继续执行第2章的编译与安装步骤。
-
-## 2. 编译与安装
-
-### 2.1 环境要求与依赖准备
+### 环境要求
 
 - Linux系统，推荐Debian 12或openEuler。
 - Clang 16或更高版本，所有依赖使用同一工具链。
@@ -113,7 +25,26 @@ sudo apt-get install -y \
   zlib1g-dev libbz2-dev
 ```
 
-### 2.2 编译与安装
+### 获取并应用优化补丁
+
+1. 获取优化补丁代码。
+
+   ```bash
+   git clone --recurse-submodules --branch dev_iouring --single-branch \
+   https://gitcode.com/boostkit/folly.git
+   cd folly
+   ```
+
+2. IOBuf TLS内存池需要由v1.1.0优化补丁提供。源码尚未包含对应实现时，在配置前应用补丁。
+
+   ```bash
+   git apply --check /path/to/folly_iobuf_tls_pool.patch
+   git apply --3way /path/to/folly_iobuf_tls_pool.patch
+   ```
+
+   如git apply --reverse --check能够成功，说明补丁已经应用，不应重复执行。
+
+## 编译与安装
 
 ```bash
 export CC=/usr/bin/clang-16
@@ -134,9 +65,9 @@ cmake --install _build
 
 fmt或其他依赖安装在自定义位置时，通过CMAKE_PREFIX_PATH或fmt_DIR传入实际CMake package路径。
 
-## 3. 启用IOBuf TLS内存池
+## 启用IOBuf TLS内存池
 
-### 3.1 启动阶段配置
+### 启动阶段配置
 
 - 内存池默认不改变原有IOBuf分配行为。建议在创建工作线程前完成配置。
 
@@ -159,15 +90,15 @@ fmt或其他依赖安装在自定义位置时，通过CMAKE_PREFIX_PATH或fmt_DI
   └── 回退到Folly原有createCombined/createSeparate路径
   ```
 
-### 3.2 配置建议
+### 配置建议
 
-- 默认每线程最多缓存8个空闲块，默认块大小为8KB，建议set至256KB。
+- 默认每线程最多缓存8个空闲块，默认块大小为8KB,建议将块大小设置为256KB。
 - setBlockSize()只在启动阶段调用，不要在请求处理中动态修改。
 - 小请求占比较高时可提高块复用率；请求经常超过块容量时仍会走原有路径。
 - 线程数较多时，需要按“线程数 × 每线程缓存上限 × 块大小”评估内存上界。
 - IOBuf可能跨线程释放，数据块可进入最终释放线程的TLS缓存，应观察线程间缓存分布。
 
-### 3.3 正确性验证
+### 正确性验证
 
 编译全部Folly测试并执行以下命令：
 
@@ -184,9 +115,9 @@ ctest --test-dir _build --output-on-failure
 - reserveSlow()离开池slice时不释放其他IOBuf共享的数据块。
 - 线程退出和跨线程析构后无泄漏、重复释放或悬空引用。
 
-## 4. 验证与测试io_uring与Benchmark
+## 验证与测试io_uring与Benchmark
 
-### 4.1 测试开源io_uring
+### 测试开源io_uring
 
 构建时启用BUILD_TESTS后，可运行AsyncIoUringSocket测试。
 
@@ -196,9 +127,9 @@ ctest --test-dir _build --output-on-failure
 
 v1.1.0采用混合模式：读操作使用io_uring multishot，写操作使用开源send；send暂时不可写时由PollWriteSqe侦听socket fd并恢复发送。
 
-### 4.2 测试Benchmark
+### 测试Benchmark
 
-1. 获取Benchmrk代码
+1. 获取Benchmark代码。
 
    ```bash
    git clone https://gitcode.com/donghuanan/AccLibBenchmark.git
@@ -229,7 +160,7 @@ v1.1.0采用混合模式：读操作使用io_uring multishot，写操作使用�
    --total_requests 100000
    ```
 
-### 4.3 A/B测试原则
+### A/B测试原则
 
 使用同一份二进制，通过是否调用enableMemoryPool()切换内存池状态，保持线程数、连接数、Payload和CPU绑定一致。至少比较以下方面：
 
@@ -244,5 +175,5 @@ v1.1.0采用混合模式：读操作使用io_uring multishot，写操作使用�
 ## 修订记录
 
 |文档版本|发布日期|修改说明|
-| :---| :---| :---|
+|:---|:---|:---|
 |01|2026-9-30|第一次正式发布。|
