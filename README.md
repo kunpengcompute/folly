@@ -43,11 +43,11 @@ fbthrift/
 
 ## 版本说明
 
-关于Folly优化补丁的版本更新情况请参见[版本说明书](docs/zh/release_notes.md)
+关于Folly优化补丁的版本更新情况请参见[版本说明书](docs/zh/release_notes.md)。
 
 ## 快速入门
 
-关于Folly的快速入门操作指导请参见[快速入门](docs/zh/quick_start.md)
+关于Folly的快速入门操作指导请参见[快速入门](docs/zh/quick_start.md)。
 
 ## 学习文档
 

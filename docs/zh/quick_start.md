@@ -17,7 +17,7 @@ Debian或Ubuntu执行以下命令。
 ```bash
 sudo apt-get update
 sudo apt-get install -y \
-  git cmake build-essential liburing-dev libboost-all-dev \
+  git cmake build-essential clang-16 liburing-dev libboost-all-dev \
   libdouble-conversion-dev libgflags-dev libgoogle-glog-dev \
   libevent-dev libsodium-dev liblz4-dev libsnappy-dev libzstd-dev \
   libfmt-dev liblzma-dev libgtest-dev libgmock-dev libssl-dev \
@@ -25,25 +25,96 @@ sudo apt-get install -y \
   zlib1g-dev libbz2-dev
 ```
 
-### 获取并应用优化补丁
+### 获取优化源码
 
-1. 获取优化补丁代码。
+ 本项目提供两种获取优化源码的方式：按方式一直接获取优化源码；或按方式二依次按获取基线源码、校验并应用补丁，完成后，进入下一章[编译与安装](#编译与安装)。
+
+#### 方式一：直接获取dev_iouring分支的优化源码
+
+   dev_iouring分支已包含io_uring网络I/O优化、IOBuf TLS内存池等优化内容。 
 
    ```bash
    git clone --recurse-submodules --branch dev_iouring --single-branch \
    https://gitcode.com/boostkit/folly.git
    cd folly
    ```
+   
+若已获取优化源码，即可跳转至下一章[编译与安装](#编译与安装)进行编译准备。
 
-2. IOBuf TLS内存池需要由v1.1.0优化补丁提供。源码尚未包含对应实现时，在配置前应用补丁。
+#### 方式二：获取基线源码、校验并应用补丁
 
-   ```bash
-   git apply --check /path/to/folly_iobuf_tls_pool.patch
-   git apply --3way /path/to/folly_iobuf_tls_pool.patch
-   ```
-
-   如git apply --reverse --check能够成功，说明补丁已经应用，不应重复执行。
-
+   **获取基线源码、补丁和校验文件**
+    
+   基线源码保存在folly目录，补丁和校验文件保存在同级的folly-patches目录。在选定的工作目录下执行以下命令。
+    
+   ```bash 
+   git clone --recurse-submodules --branch v2022.11.14.00 --single-branch \ 
+     https://github.com/facebook/folly.git folly 
+   git clone --branch master --single-branch \ 
+     https://gitcode.com/boostkit/folly.git folly-patches 
+   cd folly-patches 
+   ``` 
+   
+   **软件包完整性校验**
+    
+   本项目以补丁文件形式提供Folly性能优化功能，采用**SHA-256校验**确认补丁在下载、传输和存储过程中是否发生变化。 
+   
+   SHA-256校验用于验证文件完整性，不单独证明来源真实性。请从[Folly官方仓库](https://gitcode.com/boostkit/folly)获取补丁及同一版本的校验文件。
+   
+   **校验文件** 
+   
+   | 文件名称 | 说明 | 
+   | --- | --- | 
+   | folly_iobuf_iouring.patch | Folly性能优化补丁 | 
+   | folly_iobuf_iouring.patch.sha256 | 记录上述补丁文件名及SHA-256摘要值的校验文件 | 
+   
+   补丁与校验文件应来自同一发布版本。补丁更新时，应同步更新校验文件。 
+   
+   **校验步骤** 
+   
+   按前面的步骤获取后，当前目录即为folly-patches。
+   
+   1. 将补丁和校验文件放在同一目录，在该目录下执行以下命令。
+   
+         ```bash 
+         sha256sum --check --strict folly_iobuf_iouring.patch.sha256 
+         ``` 
+   
+   2. 该[命令](https://www.gnu.org/software/coreutils/manual/html_node/sha2-utilities.html)读取校验文件中的摘要值，与实际补丁的SHA-256摘要进行比较，并检查校验文件格式。校验通过时，输出如下。
+   
+         ```output
+         folly_iobuf_iouring.patch: OK 
+         ``` 
+   
+      中文环境可能显示“成功”。应确认输出对应的文件名为`folly_iobuf_iouring.patch`，且命令没有报告失  败或格式错误。 
+   
+   **结果判定** 
+   
+   | 校验结果 | 判定及处理 | 
+   | --- | --- | 
+   | 显示`OK`或“成功”，且无错误提示 | 补丁与校验文件中的摘要一致，完整性校验通过，可继续应用补丁 | 
+   | 显示`FAILED`或“失败” | 补丁内容与预期不一致，停止使用并重新获取 | 
+   | 提示文件不存在或无法读取 | 检查当前目录、文件名及文件是否下载完整 | 
+   | 提示校验文件格式错误 | 重新获取发布方提供的校验文件 | 
+   
+   **异常处理** 
+   
+   校验失败时，请从官方仓库重新获取同一版本的补丁和校验文件，再次执行校验。 
+   
+   不要通过修改校验文件中的摘要值使校验通过。如重新获取后仍然失败，请向发布方反馈补丁版本、文件名和完整的校验输出。
+   
+   **应用优化补丁** 
+    
+   校验通过后，从补丁目录切换到基线源码目录，检查并应用补丁。 
+   
+   ```bash 
+   cd ../folly 
+   git apply --check ../folly-patches/folly_iobuf_iouring.patch 
+   git apply ../folly-patches/folly_iobuf_iouring.patch 
+   ``` 
+   
+   补丁只需应用一次。完成后，在当前folly源码目录继续执行下一章的编译与安装步骤。
+   
 ## 编译与安装
 
 ```bash
@@ -106,7 +177,7 @@ fmt或其他依赖安装在自定义位置时，通过CMAKE_PREFIX_PATH或fmt_DI
 ctest --test-dir _build --output-on-failure
 ```
 
-内存池专项验证至少覆盖以下内容。
+内存池专项验证至少覆盖以下内容：
 
 - 未启用时保持原有IOBuf::create()路径。
 - 多个小IOBuf从同一块切分且slice互不重叠。
@@ -125,7 +196,7 @@ ctest --test-dir _build --output-on-failure
 ./_build/experimental/io/test/async_iouring_socket_test
 ```
 
-v1.0.0采用混合模式：读操作使用io_uring multishot，写操作使用开源send；send暂时不可写时由PollWriteSqe侦听socket fd并恢复发送。
+v1.0.0采用混合模式：读操作使用io_uring multishot，写操作使用系统调用send；当send暂时不可写时，由PollWriteSqe侦听socket fd并恢复发送。
 
 ### 测试Benchmark
 
