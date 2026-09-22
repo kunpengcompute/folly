@@ -27,9 +27,9 @@ sudo apt-get install -y \
 
 ### 获取优化源码
 
- 本项目提供两种获取优化源码的方式：按1.1节直接获取优化源码，或依次按获取基线源码、校验并应用补丁。完成后，进入下一章[编译与安装](#编译与安装)。
+ 本项目提供两种获取优化源码的方式：按方式一直接获取优化源码；或按方式二依次按获取基线源码、校验并应用补丁，完成后，进入下一章[编译与安装](#编译与安装)。
 
-1. 直接获取dev_iouring分支的优化源码。
+#### 方式一：直接获取dev_iouring分支的优化源码
 
    dev_iouring分支已包含io_uring网络I/O优化、IOBuf TLS内存池等优化内容。 
 
@@ -38,12 +38,13 @@ sudo apt-get install -y \
    https://gitcode.com/boostkit/folly.git
    cd folly
    ```
+若已获取优化源码，即可跳转至下一章[编译与安装](#编译与安装)进行编译准备。
 
-2. 本章节剩余内容均为补丁仓的获取与应用，若已获取优化源码，即可跳转至下一章[编译与安装](#编译与安装)进行编译准备。
+#### 方式二：获取基线源码、校验并应用补丁
 
    **获取基线源码、补丁和校验文件**
     
-    基线源码保存在folly目录，补丁和校验文件保存在同级的folly-patches目录。在选定的工作目录下执行以下命令。
+   基线源码保存在folly目录，补丁和校验文件保存在同级的folly-patches目录。在选定的工作目录下执行以下命令。
     
    ```bash 
    git clone --recurse-submodules --branch v2022.11.14.00 --single-branch \ 
@@ -53,38 +54,38 @@ sudo apt-get install -y \
    cd folly-patches 
    ``` 
    
-    **软件包完整性校验**
+   **软件包完整性校验**
     
    本项目以补丁文件形式提供Folly性能优化功能，采用**SHA-256校验**确认补丁在下载、传输和存储过程中是否发生变化。 
    
-   SHA-256校验用于验证文件完整性，不单独证明来源真实性。请从 [Folly官方仓库](https://gitcode.com/boostkit/folly)获取补丁及同一版本的校验文件。
+   SHA-256校验用于验证文件完整性，不单独证明来源真实性。请从[Folly官方仓库](https://gitcode.com/boostkit/folly)获取补丁及同一版本的校验文件。
    
    **校验文件** 
    
    | 文件名称 | 说明 | 
    | --- | --- | 
-   | `folly_iobuf_iouring.patch` | Folly性能优化补丁 | 
-   | `folly_iobuf_iouring.patch.sha256` | 记录上述补丁文件名及SHA-256摘要值的校验文件 | 
+   | folly_iobuf_iouring.patch | Folly性能优化补丁 | 
+   | folly_iobuf_iouring.patch.sha256 | 记录上述补丁文件名及SHA-256摘要值的校验文件 | 
    
    补丁与校验文件应来自同一发布版本。补丁更新时，应同步更新校验文件。 
    
    **校验步骤** 
    
-   按前面的步骤获取后，当前目录即为folly-patches。将补丁和校验文件放在同一目录，在该目录下执行以下命令： 
+   按前面的步骤获取后，当前目录即为folly-patches。
    
-   ```bash 
-   sha256sum --check --strict folly_iobuf_iouring.patch.sha256 
-   ``` 
+   1. 将补丁和校验文件放在同一目录，在该目录下执行以下命令。
    
-   该[命令](https://www.gnu.org/software/coreutils/manual/html_node/sha2-utilities.html)读取校验文件中的摘要值，与实际补丁的SHA-256摘要进行比较，并检查校验文件格式。
+         ```bash 
+         sha256sum --check --strict folly_iobuf_iouring.patch.sha256 
+         ``` 
    
-   校验通过时，输出如下。
+   2. 该[命令](https://www.gnu.org/software/coreutils/manual/html_node/sha2-utilities.html)读取校验文件中的摘要值，与实际补丁的SHA-256摘要进行比较，并检查校验文件格式。校验通过时，输出如下。
    
-   ```text 
-   folly_iobuf_iouring.patch: OK 
-   ``` 
+         ```output
+         folly_iobuf_iouring.patch: OK 
+         ``` 
    
-   中文环境可能显示“成功”。应确认输出对应的文件名为`folly_iobuf_iouring.patch`，且命令没有报告失败或格式错误。 
+      中文环境可能显示“成功”。应确认输出对应的文件名为`folly_iobuf_iouring.patch`，且命令没有报告失  败或格式错误。 
    
    **结果判定** 
    
