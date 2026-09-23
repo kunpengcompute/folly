@@ -328,12 +328,13 @@ unique_ptr<IOBuf> IOBuf::create(std::size_t capacity) {
   }
 
   if (sMemoryPoolEnabled.load(std::memory_order_acquire)) {
-    size_t blockDataCap = detail::gIoBufBlockSize.load(std::memory_order_relaxed) - sizeof(IoBufBlock);
-    if (capacity <= blockDataCap) {
+    const size_t blockSize =
+        detail::gIoBufBlockSize.load(std::memory_order_relaxed);
+    if (blockSize >= sizeof(IoBufBlock) &&
+        capacity <= blockSize - sizeof(IoBufBlock)) {
       return createFromPoolShared(capacity);
     }
-    // For large capacities, fall through to original path
-    // (createSeparate handles large allocations correctly)
+    // Invalid block sizes and large capacities use the original allocation path.
   }
 
   // For smaller-sized buffers, allocate the IOBuf, SharedInfo, and the buffer

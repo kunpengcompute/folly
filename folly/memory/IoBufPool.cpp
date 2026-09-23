@@ -31,6 +31,9 @@ thread_local TLSBlockCache g_tls_cache;
 
 static IoBufBlock* allocateFromSystem() {
   const size_t blockSize = gIoBufBlockSize.load(std::memory_order_relaxed);
+  if (blockSize < sizeof(IoBufBlock)) {
+    return nullptr;
+  }
   void* mem = std::malloc(blockSize);
   if (!mem) return nullptr;
   auto* b = static_cast<IoBufBlock*>(mem);
@@ -41,16 +44,25 @@ static IoBufBlock* allocateFromSystem() {
   return b;
 }
 
-IoBufBlock* ioBufBlockAllocate() {
+static IoBufBlock* allocateBlock(size_t minCapacity) {
   TLSBlockCache& c = g_tls_cache;
-  if (c.count > 0) {
+  while (c.count > 0) {
     IoBufBlock* b = c.blocks[--c.count];
     DCHECK_EQ(b->magic, IoBufBlock::kBlockMagic);
+    // Cached blocks are idle and may predate a block-size increase.
+    if (b->capacity < minCapacity) {
+      std::free(b);
+      continue;
+    }
     b->ref_count.store(1, std::memory_order_relaxed);
     b->data_len = 0;
     return b;
   }
   return allocateFromSystem();
+}
+
+IoBufBlock* ioBufBlockAllocate() {
+  return allocateBlock(0);
 }
 
 void ioBufBlockRelease(IoBufBlock* b) {
@@ -76,7 +88,12 @@ IoBufBlock* share_block(size_t min_capacity) {
     }
     c.current_share = nullptr;
   }
-  c.current_share = ioBufBlockAllocate();
+  c.current_share = allocateBlock(min_capacity);
+  // The configured block size may be too small even for a fresh allocation.
+  if (c.current_share != nullptr &&
+      c.current_share->remaining() < min_capacity) {
+    return nullptr;
+  }
   return c.current_share;
 }
 
