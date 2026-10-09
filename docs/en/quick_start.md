@@ -107,7 +107,7 @@ Compile all Folly tests and run the following command.
 ctest --test-dir _build --output-on-failure
 ```
 
-The memory pool–specific verification must cover at least the following:
+The memory pool–specific verification must cover at least the following.
 
 - When the memory pool is not enabled, the original `IOBuf::create()` path is preserved.
 - Multiple small IOBuf objects are split from the same block, and their slices do not overlap.
@@ -175,6 +175,6 @@ For formal stress testing, warm up the system first, and then run the baseline a
 
 ## Change History
 
-|Release|Date|Description|
-|:---|:---|:---|
-|01|2026-09-30|This is the first official release.|
+| Version | Date | Description |
+| ---- | ---- | -- |
+| 01 | 2026-09-30 | This is the first official release. |

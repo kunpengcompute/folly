@@ -213,6 +213,6 @@ This function does not return a value. When `send` cannot continue sending data 
 
 ## Change History
 
-|Release|Date|Description|
-|:---|:---|:---|
-|01|2026-09-30|This is the first official release.|
+| Version | Date | Description |
+| ---- | ---- | -- |
+| 01 | 2026-09-30 | This is the first official release. |
