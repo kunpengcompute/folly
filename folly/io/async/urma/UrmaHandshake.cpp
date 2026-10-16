@@ -206,67 +206,44 @@ void UrmaHandshake::allocateResources() {
 
   auto& res = socket_->res_;
 
-  // TX JFCE (先创建)
-  res.tx_jfce = urma_create_jfce(ctx);
-  if (!res.tx_jfce) {
-    onHandshakeError("create tx_jfce failed");
-    return;
-  }
+  // Phase 2: TX JFC/JFCE 由 JFS 池统一管理,不再 per-连接创建
+  // 仅创建 io_jetty/fc_jetty(绑定 JFR,用于 jetty_id 通告对端 import)
+  // jetty 的 jfs_cfg 不再使用(发送走 JFS 池),但 urma_create_jetty 需要 jfs_cfg
+  // 设置 jfs_cfg.jfc = nullptr,depth=0 表示不创建 JFS
 
-  // TX JFC (depth = tx_depth + 1, 预留 flush_done, 指定 jfce)
-  urma_jfc_cfg_t tx_jfc_cfg = {};
-  tx_jfc_cfg.depth = config_.tx_depth + 1;
-  tx_jfc_cfg.jfce = res.tx_jfce;
-  res.tx_jfc = urma_create_jfc(ctx, &tx_jfc_cfg);
-  if (!res.tx_jfc) {
-    onHandshakeError("create tx_jfc failed");
-    return;  // UrmaAsyncSocket 析构清理 res.tx_jfce
-  }
-
-  // IO jetty (share_jfr=1)
+  // IO jetty (share_jfr=1,绑定 JFR 提供 jetty_id)
   urma_jetty_cfg_t io_cfg = {};
   io_cfg.flag.bs.share_jfr = 1;
   io_cfg.shared.jfr = shared_->ioJfr();
   io_cfg.shared.jfc = shared_->ioJfc();
-  io_cfg.jfs_cfg.depth = config_.tx_depth;
+  io_cfg.jfs_cfg.depth = 1;  // 最小值,jetty 不用于发送
   io_cfg.jfs_cfg.trans_mode = URMA_TM_RM;
   io_cfg.jfs_cfg.max_sge = UrmaInit::getMaxJfsSge();
   io_cfg.jfs_cfg.max_inline_data = UrmaInit::getMaxJfsInlineLen();
   io_cfg.jfs_cfg.rnr_retry = URMA_DEFAULT_RNR_RETRY;
   io_cfg.jfs_cfg.err_timeout = URMA_DEFAULT_ERR_TIMEOUT;
-  io_cfg.jfs_cfg.jfc = res.tx_jfc;
+  // jfs_cfg.jfc 不设置(nullptr),jetty 内部 JFC 由 share_jfr 共享
   res.io_jetty = urma_create_jetty(ctx, &io_cfg);
   if (!res.io_jetty) {
     onHandshakeError("create io_jetty failed");
-    return;  // 析构清理 res.tx_jfc + res.tx_jfce
+    return;
   }
 
-  // FC TX JFC (depth=2, 指定同一个 tx_jfce)
-  urma_jfc_cfg_t fc_tx_jfc_cfg = {};
-  fc_tx_jfc_cfg.depth = 2;
-  fc_tx_jfc_cfg.jfce = res.tx_jfce;
-  res.fc_tx_jfc = urma_create_jfc(ctx, &fc_tx_jfc_cfg);
-  if (!res.fc_tx_jfc) {
-    onHandshakeError("create fc_tx_jfc failed");
-    return;  // 析构清理 res.io_jetty + res.tx_jfc + res.tx_jfce
-  }
-
-  // FC jetty (depth=2)
+  // FC jetty (share_jfr=1,绑定 FC JFR 提供 fc_jetty_id)
   urma_jetty_cfg_t fc_cfg = {};
   fc_cfg.flag.bs.share_jfr = 1;
   fc_cfg.shared.jfr = shared_->fcJfr();
   fc_cfg.shared.jfc = shared_->fcJfc();
-  fc_cfg.jfs_cfg.depth = 2;
+  fc_cfg.jfs_cfg.depth = 1;
   fc_cfg.jfs_cfg.trans_mode = URMA_TM_RM;
-  fc_cfg.jfs_cfg.max_sge = 1;  // FC 消息用 1 个 SGE(4B inline)
+  fc_cfg.jfs_cfg.max_sge = 1;
   fc_cfg.jfs_cfg.max_inline_data = UrmaInit::getMaxJfsInlineLen();
   fc_cfg.jfs_cfg.rnr_retry = URMA_DEFAULT_RNR_RETRY;
   fc_cfg.jfs_cfg.err_timeout = URMA_DEFAULT_ERR_TIMEOUT;
-  fc_cfg.jfs_cfg.jfc = res.fc_tx_jfc;
   res.fc_jetty = urma_create_jetty(ctx, &fc_cfg);
   if (!res.fc_jetty) {
     onHandshakeError("create fc_jetty failed");
-    return;  // 析构清理 res.fc_tx_jfc + res.io_jetty + res.tx_jfc + res.tx_jfce
+    return;
   }
 }
 

@@ -32,6 +32,11 @@ using IoBufBlockSizeFn  = size_t (*)(size_t requested_size);
 
 extern std::atomic<IoBufBlockSizeFn> g_size_fn;  // size 查询函数(默认 nullptr)
 
+// URMA headroom 预留大小(默认 0=禁用,UrmaInit::init 时设为 64)
+// 启用后每个 block 的 data 区前 headroom 字节作为预留空间,
+// 供 IOBuf::prepend(headroom) 写入 UrmaMsgHeader(DPDK rte_mbuf 风格)。
+extern std::atomic<size_t> g_urma_headroom;
+
 /**
  * 注入自定义 block alloc/free 函数
  *

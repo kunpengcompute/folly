@@ -19,6 +19,7 @@
 #include <folly/io/async/urma/UrmaHandshake.h>
 #include <folly/io/async/urma/UrmaSharedJfr.h>
 #include <folly/io/async/urma/UrmaInit.h>
+#include <folly/io/async/urma/UrmaJfsPool.h>
 #include <folly/logging/xlog.h>
 
 #include <unistd.h>
@@ -127,11 +128,7 @@ void UrmaAsyncSocket::onHandshakeReady() {
   res_.shared_fc_jfc = shared_->fcJfc();
   peer_rx_buf_size_ = handshake_->peer_rx_buf_size_;
 
-  // TX JFCE handler + 初始 arm(READ completion 也能异步唤醒 pollTx)
-  if (res_.tx_jfce) {
-    tx_cq_handler_ = new UrmaCqHandler(evb_, res_.tx_jfce->fd, this);
-    urma_rearm_jfc(res_.tx_jfc, false);
-  }
+  // Phase 2: TX CQE 由全局 JFS 池的 CqHandler 处理,不再 per-连接创建 tx_cq_handler_
 
   if (res_.remote_jetty) {
     shared_->registerSocket(res_.remote_jetty->id.id, this);
@@ -244,8 +241,6 @@ void UrmaAsyncSocket::writeChain(WriteCallback* cb, std::unique_ptr<IOBuf>&& cha
   bool big_deferred = false;
   urma_status_t ret = sendChain(cb, chain, total_posted, big_deferred, group);
   if (ret == URMA_EAGAIN) {
-//                << " big_deferred=" << big_deferred
-//                << " pending_big=" << pending_big_msg_.size();
     auto pw = std::make_unique<PendingWrite>();
     pw->cb = cb;
     pw->buf = std::move(chain);
@@ -253,11 +248,9 @@ void UrmaAsyncSocket::writeChain(WriteCallback* cb, std::unique_ptr<IOBuf>&& cha
     pw->next = nullptr;
     pending_write_head_ = std::move(pw);
     pending_write_tail_ = pending_write_head_.get();
-    if (res_.tx_jfc) {
-      urma_status_t rearm_ret = urma_rearm_jfc(res_.tx_jfc, false);
-      if (rearm_ret != URMA_SUCCESS) {
-        XLOG(ERR) << "UrmaAsyncSocket: urma_rearm_jfc(tx) failed, status=" << rearm_ret;
-      }
+    // Phase 2: 武装全局 JFS 池的 TX JFCE 中断,等待 CQE 唤醒
+    if (auto* pool = UrmaJfsPool::get()) {
+      pool->rearmAllTxJfce();
     }
   } else if (ret == URMA_SUCCESS) {
 //                << " big_deferred=" << big_deferred
@@ -271,47 +264,50 @@ void UrmaAsyncSocket::writeChain(WriteCallback* cb, std::unique_ptr<IOBuf>&& cha
 // ── TX completion ──
 
 void UrmaAsyncSocket::pollTx() noexcept {
-  if (!res_.tx_jfc) return;
   if (state_ != State::kOpen) return;
+  // Phase 2: 遍历 JFS 池中所有 IO JFS 的 JFC,poll TX CQE
+  // user_ctx 统一为 TxCompletionCtx*(不再使用 kCtrlUserCtx/kReadUserCtxBase 编码)
+  UrmaJfsPool* pool = UrmaJfsPool::get();
+  if (!pool) return;
+
   urma_cr_t cr[POLL_BATCH_MAX];
-  int n;
-  while ((n = urma_poll_jfc(res_.tx_jfc, POLL_BATCH_MAX, cr)) > 0) {
-    for (int i = 0; i < n; ++i) {
-      uint64_t ctx = cr[i].user_ctx;
-      if (ctx == kCtrlUserCtx) {
-        // 控制包/FREE 的 TX completion:释放 sge 引用
-        if (!ctrl_sge_refs_.empty()) {
-          ctrl_sge_refs_.pop_front();
-        }
-//                    << " ctrl_inflight=" << ctrl_sge_refs_.size();
-        continue;
-      }
-      if (ctx & kReadUserCtxBase) {
-        // B-4: 校验 CQE msg_id,跳过旧 READ 的重复 CQE
-        uint16_t cqe_msg_id = static_cast<uint16_t>(ctx & 0xFFFF);
-//                    << " st=" << static_cast<int>(cr[i].status)
-//                    << " expect=" << pending_read_msg_id_;
-        if (cqe_msg_id != pending_read_msg_id_) {
-          XLOG(WARN) << "[URMA] pollTx: stale READ cqe msg_id=" << cqe_msg_id
-                     << " expect=" << pending_read_msg_id_;
-          continue;
-        }
-        if (cr[i].status == URMA_CR_SUCCESS) {
-          onReadComplete();
+  for (uint32_t ji = 0; ji < pool->ioJfsCount(); ++ji) {
+    SharedJfs* sj = pool->getIoJfsByIndex(ji);
+    if (!sj || !sj->jfc) continue;
+    int n;
+    while ((n = urma_poll_jfc(sj->jfc, POLL_BATCH_MAX, cr)) > 0) {
+      for (int i = 0; i < n; ++i) {
+        auto* tx_ctx = reinterpret_cast<TxCompletionCtx*>(cr[i].user_ctx);
+        if (!tx_ctx) continue;
+
+        // 按消息类型处理
+        if (tx_ctx->type == TxCompletionCtx::MSG_READ) {
+          // B-4: 校验 CQE msg_id,跳过旧 READ 的重复 CQE
+          if (tx_ctx->msg_id != pending_read_msg_id_) {
+            XLOG(WARN) << "[URMA] pollTx: stale READ cqe msg_id=" << tx_ctx->msg_id
+                       << " expect=" << pending_read_msg_id_;
+            // 旧 CQE:归还 sq_inflight + delete ctx
+            pool->releaseIoJfs(tx_ctx->jfs_index);
+            delete tx_ctx;
+            continue;
+          }
+          if (cr[i].status == URMA_CR_SUCCESS) {
+            onReadComplete();
+          } else {
+            onReadFailed(cr[i].status);
+          }
+          // READ CQE 处理完后归还 sq_inflight + delete ctx
+          pool->releaseIoJfs(tx_ctx->jfs_index);
+          delete tx_ctx;
         } else {
-          onReadFailed(cr[i].status);
+          // MSG_DATA / MSG_CTRL_PULL / MSG_CTRL_FREE
+          // 归还 sq_inflight + delete ctx → send_data 析构 → block 回收
+          pool->releaseIoJfs(tx_ctx->jfs_index);
+          delete tx_ctx;
         }
-        continue;
-      }
-      // SEND completion:释放 sbuf_
-      uint64_t idx = ctx;
-//                  << " st=" << static_cast<int>(cr[i].status);
-      if (idx < sbuf_.size()) {
-        sbuf_[idx] = {};
       }
     }
   }
-  urma_rearm_jfc(res_.tx_jfc, false);
 }
 
 void UrmaAsyncSocket::retryWrite() noexcept {
@@ -328,6 +324,14 @@ urma_status_t UrmaAsyncSocket::sendChain(WriteCallback* cb,
   if (state_ != State::kOpen) {
     return URMA_EAGAIN;
   }
+
+  UrmaJfsPool* pool = UrmaJfsPool::get();
+  if (!pool) {
+    if (cb) cb->writeErr(0, AsyncSocketException(
+        AsyncSocketException::UNKNOWN, "JFS pool not initialized"));
+    return URMA_FAIL;
+  }
+
   while (chain) {
     uint32_t sge_total = 0;
     int num_sge = 0;
@@ -338,7 +342,8 @@ urma_status_t UrmaAsyncSocket::sendChain(WriteCallback* cb,
         std::min(chain_remaining, static_cast<size_t>(hw_max_sge)));
 
     auto sge_arr = std::make_shared<std::vector<urma_sge_t>>(sge_capacity);
-    auto wr_chain_head = std::shared_ptr<IOBuf>(IOBuf::create(0).release());
+    // 持有本次 WR 引用的 IOBuf chain(防止 post 期间被释放)
+    auto wr_chain_head = std::make_shared<IOBuf>();
 
     while (chain && num_sge < sge_capacity) {
       size_t iobuf_len = chain->length();
@@ -357,13 +362,13 @@ urma_status_t UrmaAsyncSocket::sendChain(WriteCallback* cb,
         }
         if (cb) cb->writeErr(total_posted, AsyncSocketException(
             AsyncSocketException::UNKNOWN, "sendBigMsgByRead failed"));
-        if (group) group->done = true;  // 防止已发大包后续 FREE 再回调 writeSuccess
+        if (group) group->done = true;
         return URMA_FAIL;
       }
       (*sge_arr)[num_sge].addr = reinterpret_cast<uint64_t>(chain->writableData());
       (*sge_arr)[num_sge].len = static_cast<uint32_t>(iobuf_len);
       (*sge_arr)[num_sge].tseg = UrmaInit::getPoolTseg();
-      wr_chain_head->prependChain(chain->cloneOne());
+      wr_chain_head->appendChain(std::move(chain->cloneOne()));
       sge_total += iobuf_len;
       num_sge++;
       chain = chain->pop();
@@ -371,31 +376,52 @@ urma_status_t UrmaAsyncSocket::sendChain(WriteCallback* cb,
 
     if (num_sge == 0) break;
 
+    // Phase 2: 从 JFS 池获取一个空闲 JFS
+    uint32_t jfs_index = 0;
+    SharedJfs* sj = pool->acquireIoJfs(&jfs_index);
+    if (!sj) {
+      // 所有 JFS 的 SQ 都满 → EAGAIN
+      return URMA_EAGAIN;
+    }
+
+    // Phase 2: 创建 TxCompletionCtx,move IOBuf chain 到 ctx
+    // post 前 move-in,TX CQE 后 delete ctx → send_data 析构 → block 回收
+    auto* tx_ctx = new TxCompletionCtx();
+    tx_ctx->socket_id = 0;  // Phase 3 headroom 路由时填充
+    tx_ctx->seq = 0;        // Phase 5 保序时填充
+    tx_ctx->type = TxCompletionCtx::MSG_DATA;
+    tx_ctx->jfs_index = jfs_index;
+    // 将 wr_chain_head move 到 ctx 的 send_data(持有 block 引用)
+    tx_ctx->send_data = std::move(*wr_chain_head);
+    // SGE 数组也由 ctx 管理(保持存活到硬件处理完毕)
+    tx_ctx->sge_arr = sge_arr;
+
     urma_jfs_wr_t wr = {};
     wr.opcode = URMA_OPC_SEND;
     wr.tjetty = res_.remote_jetty;
     wr.flag.bs.complete_enable = 1;
     wr.send.src.sge = sge_arr->data();
     wr.send.src.num_sge = static_cast<uint32_t>(num_sge);
-    wr.user_ctx = sbuf_.size();
+    wr.user_ctx = reinterpret_cast<uint64_t>(tx_ctx);
     wr.next = nullptr;
-
-    sbuf_.push_back(WrRefs{std::move(sge_arr), std::move(wr_chain_head)});
 
     total_posted += sge_total;
     urma_jfs_wr_t* bad_wr = nullptr;
-    urma_status_t ret = urma_post_jetty_send_wr(res_.io_jetty, &wr, &bad_wr);
+    urma_status_t ret = urma_post_jfs_wr(sj->jfs, &wr, &bad_wr);
     if (ret == URMA_SUCCESS) {
+      // tx_ctx 持有 send_data(IOBuf chain) + sge_arr,TX CQE 后 delete 回收
       continue;
     }
-    sbuf_.pop_back();
+    // post 失败:回收 ctx + 归还 sq_inflight
+    pool->releaseIoJfs(jfs_index);
+    delete tx_ctx;
     if (ret == URMA_EAGAIN) {
       return URMA_EAGAIN;
     }
     XLOG(ERR) << "UrmaAsyncSocket: post failed, status=" << ret;
     if (cb) cb->writeErr(total_posted, AsyncSocketException(
-        AsyncSocketException::UNKNOWN, "urma_post_jetty_send_wr failed"));
-    if (group) group->done = true;  // 防止已发大包后续 FREE 再回调 writeSuccess
+        AsyncSocketException::UNKNOWN, "urma_post_jfs_wr failed"));
+    if (group) group->done = true;
     return URMA_FAIL;
   }
   return URMA_SUCCESS;
@@ -420,11 +446,9 @@ void UrmaAsyncSocket::handlePendingWrites() noexcept {
                                   pw->big_group);
     if (ret == URMA_EAGAIN) {
       pw->buf = std::move(chain);
-      if (res_.tx_jfc) {
-        urma_status_t rearm_ret = urma_rearm_jfc(res_.tx_jfc, false);
-        if (rearm_ret != URMA_SUCCESS) {
-          XLOG(ERR) << "UrmaAsyncSocket: urma_rearm_jfc(tx) failed, status=" << rearm_ret;
-        }
+      // Phase 2: 武装全局 JFS 池的 TX JFCE 中断
+      if (auto* pool = UrmaJfsPool::get()) {
+        pool->rearmAllTxJfce();
       }
       return;
     }
@@ -488,33 +512,52 @@ bool UrmaAsyncSocket::sendBigMsgByRead(WriteCallback* cb,
 bool UrmaAsyncSocket::postControlPacket(uint16_t msg_id, uint64_t remote_va,
                                         uint32_t data_size) noexcept {
   if (!res_.remote_jetty) return false;
+
+  // Phase 2: 从 JFS 池获取 IO JFS
+  UrmaJfsPool* pool = UrmaJfsPool::get();
+  if (!pool) return false;
+  uint32_t jfs_index = 0;
+  SharedJfs* sj = pool->acquireIoJfs(&jfs_index);
+  if (!sj) {
+    XLOG(WARN) << "[URMA] postControlPacket: no available JFS";
+    return false;
+  }
+
   // inline=1: 元数据(8 字节 remote_va)在栈上,NIC post 时内联拷贝,不走 DMA/MR
+  // 注意:meta_va 在栈上,post 返回后 NIC 已内联拷贝,栈变量可安全释放
   uint64_t meta_va = remote_va;
-  urma_sge_t ctrl_sge = {};
-  ctrl_sge.addr = reinterpret_cast<uint64_t>(&meta_va);
-  ctrl_sge.len = sizeof(uint64_t);
-  ctrl_sge.tseg = nullptr;  // inline 模式不走 tseg
+  auto sge_arr = std::make_shared<std::vector<urma_sge_t>>(1);
+  (*sge_arr)[0].addr = reinterpret_cast<uint64_t>(&meta_va);
+  (*sge_arr)[0].len = sizeof(uint64_t);
+  (*sge_arr)[0].tseg = nullptr;
+
+  auto* tx_ctx = new TxCompletionCtx();
+  tx_ctx->type = TxCompletionCtx::MSG_CTRL_PULL;
+  tx_ctx->jfs_index = jfs_index;
+  tx_ctx->msg_id = msg_id;
+  tx_ctx->sge_arr = sge_arr;
 
   urma_jfs_wr_t wr = {};
   wr.opcode = URMA_OPC_SEND_IMM;
   wr.tjetty = res_.remote_jetty;
   wr.flag.bs.complete_enable = 1;
   wr.flag.bs.inline_flag = 1;
-  wr.send.src.sge = &ctrl_sge;
+  wr.send.src.sge = sge_arr->data();
   wr.send.src.num_sge = 1;
   wr.send.imm_data = encodeBigMsgImm(msg_id, kCtrlTypePull, data_size);
-  wr.user_ctx = kCtrlUserCtx;
+  wr.user_ctx = reinterpret_cast<uint64_t>(tx_ctx);
   wr.next = nullptr;
 
   urma_jfs_wr_t* bad_wr = nullptr;
-  urma_status_t st = urma_post_jetty_send_wr(res_.io_jetty, &wr, &bad_wr);
+  urma_status_t st = urma_post_jfs_wr(sj->jfs, &wr, &bad_wr);
   if (st != URMA_SUCCESS) {
+    pool->releaseIoJfs(jfs_index);
+    delete tx_ctx;
     XLOG(ERR) << "[URMA] ctrlPullPost FAIL msg_id=" << msg_id
               << " size=" << data_size << " st=" << static_cast<int>(st);
     return false;
   }
-//              << " st=" << static_cast<int>(st);
-  return st == URMA_SUCCESS;
+  return true;
 }
 
 // ── 单边 READ:接收方 ──
@@ -584,6 +627,19 @@ bool UrmaAsyncSocket::startRead(uint16_t msg_id, uint64_t remote_va,
       buf, data_size,
       [](void* ptr, void*) { UrmaInit::poolFree(ptr); });
 
+  // Phase 2: 从 JFS 池获取 IO JFS
+  UrmaJfsPool* pool = UrmaJfsPool::get();
+  if (!pool) {
+    XLOG(ERR) << "startRead: JFS pool not available";
+    return false;
+  }
+  uint32_t jfs_index = 0;
+  SharedJfs* sj = pool->acquireIoJfs(&jfs_index);
+  if (!sj) {
+    XLOG(WARN) << "startRead: no available JFS";
+    return false;
+  }
+
   auto sge_arr = std::make_shared<std::vector<urma_sge_t>>(2);
   (*sge_arr)[0].addr = remote_va;
   (*sge_arr)[0].len = data_size;
@@ -591,6 +647,14 @@ bool UrmaAsyncSocket::startRead(uint16_t msg_id, uint64_t remote_va,
   (*sge_arr)[1].addr = reinterpret_cast<uint64_t>(iobuf->writableData());
   (*sge_arr)[1].len = data_size;
   (*sge_arr)[1].tseg = UrmaInit::getPoolTseg();
+
+  auto* tx_ctx = new TxCompletionCtx();
+  tx_ctx->type = TxCompletionCtx::MSG_READ;
+  tx_ctx->jfs_index = jfs_index;
+  tx_ctx->msg_id = msg_id;
+  tx_ctx->sge_arr = sge_arr;
+  // READ 的 dst buffer 通过 pending_read_buf_ 持有,不放到 send_data
+  // tx_ctx->send_data 保持空
 
   urma_jfs_wr_t wr = {};
   wr.opcode = URMA_OPC_READ;
@@ -600,7 +664,7 @@ bool UrmaAsyncSocket::startRead(uint16_t msg_id, uint64_t remote_va,
   wr.rw.src.num_sge = 1;
   wr.rw.dst.sge = &(*sge_arr)[1];
   wr.rw.dst.num_sge = 1;
-  wr.user_ctx = kReadUserCtxBase | msg_id;
+  wr.user_ctx = reinterpret_cast<uint64_t>(tx_ctx);
   wr.next = nullptr;
 
   pending_read_msg_id_ = msg_id;
@@ -608,14 +672,15 @@ bool UrmaAsyncSocket::startRead(uint16_t msg_id, uint64_t remote_va,
   pending_read_sge_ = sge_arr;
 
   urma_jfs_wr_t* bad_wr = nullptr;
-  urma_status_t st = urma_post_jetty_send_wr(res_.io_jetty, &wr, &bad_wr);
+  urma_status_t st = urma_post_jfs_wr(sj->jfs, &wr, &bad_wr);
   if (st != URMA_SUCCESS) {
+    pool->releaseIoJfs(jfs_index);
+    delete tx_ctx;
     pending_read_sge_.reset();
     pending_read_buf_.reset();
     XLOG(ERR) << "startRead: post READ failed, status=" << st << " msg_id=" << msg_id;
     return false;
   }
-//              << " remote_va=" << remote_va << " st=" << static_cast<int>(st);
   return true;
 }
 
@@ -660,6 +725,19 @@ void UrmaAsyncSocket::onReadFailed(urma_status_t status) noexcept {
 
 bool UrmaAsyncSocket::postFreeNotify(uint16_t msg_id) noexcept {
   if (!res_.remote_jetty) return false;
+
+  // Phase 2: 从 JFS 池获取 IO JFS
+  UrmaJfsPool* pool = UrmaJfsPool::get();
+  if (!pool) return false;
+  uint32_t jfs_index = 0;
+  SharedJfs* sj = pool->acquireIoJfs(&jfs_index);
+  if (!sj) return false;
+
+  auto* tx_ctx = new TxCompletionCtx();
+  tx_ctx->type = TxCompletionCtx::MSG_CTRL_FREE;
+  tx_ctx->jfs_index = jfs_index;
+  tx_ctx->msg_id = msg_id;
+
   urma_jfs_wr_t wr = {};
   wr.opcode = URMA_OPC_SEND_IMM;
   wr.tjetty = res_.remote_jetty;
@@ -667,12 +745,17 @@ bool UrmaAsyncSocket::postFreeNotify(uint16_t msg_id) noexcept {
   wr.flag.bs.inline_flag = 1;  // ctrl packet inline
   wr.send.src.num_sge = 0;
   wr.send.imm_data = encodeBigMsgImm(msg_id, kCtrlTypeFree, 0);
-  wr.user_ctx = kCtrlUserCtx;
+  wr.user_ctx = reinterpret_cast<uint64_t>(tx_ctx);
   wr.next = nullptr;
 
   urma_jfs_wr_t* bad_wr = nullptr;
-  urma_status_t st = urma_post_jetty_send_wr(res_.io_jetty, &wr, &bad_wr);
-  return st == URMA_SUCCESS;
+  urma_status_t st = urma_post_jfs_wr(sj->jfs, &wr, &bad_wr);
+  if (st != URMA_SUCCESS) {
+    pool->releaseIoJfs(jfs_index);
+    delete tx_ctx;
+    return false;
+  }
+  return true;
 }
 
 void UrmaAsyncSocket::drainRxPendingQueue() noexcept {
@@ -822,19 +905,15 @@ void UrmaAsyncSocket::closeNow() {
 }
 
 void UrmaAsyncSocket::shutdownWrite() {
-  if (res_.tx_jfc) {
-    pollTx();
-  }
+  // Phase 2: poll JFS 池的 TX CQE 回收资源
+  pollTx();
 }
 
 void UrmaAsyncSocket::shutdownWriteNow() {
 }
 
 void UrmaAsyncSocket::destroyUrmaResources() {
-  if (tx_cq_handler_) {
-    delete tx_cq_handler_;
-    tx_cq_handler_ = nullptr;
-  }
+  // Phase 2: 不再删除 tx_cq_handler_(TX CQE 由全局 JFS 池 CqHandler 处理)
   if (shared_) {
     if (res_.remote_jetty) {
       shared_->unregisterSocket(res_.remote_jetty->id.id);
@@ -866,7 +945,8 @@ void UrmaAsyncSocket::destroyUrmaResources() {
     urma_unimport_seg(res_.remote_seg);
     res_.remote_seg = nullptr;
   }
-  sbuf_.clear();
+  // Phase 2: 不再有 sbuf_ 环形数组(TxCompletionCtx 在 pollTx 中 delete)
+  ctrl_sge_refs_.clear();
   pending_write_head_.reset();
   pending_write_tail_ = nullptr;
   read_queue_.move();

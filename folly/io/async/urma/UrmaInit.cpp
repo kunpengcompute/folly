@@ -14,6 +14,7 @@
 #include <folly/io/IOBuf.h>
 #include <folly/memory/IoBufPool.h>
 #include <folly/logging/xlog.h>
+#include <folly/io/async/urma/UrmaJfsPool.h>
 
 #include <cstring>
 #include <mutex>
@@ -320,7 +321,25 @@ void UrmaInit::init(const UrmaConfig& config) {
     return;
   }
 
-  // 7. folly IOBuf 注入(三步)
+  // 7. JFS 池(进程级共享,设计 §4)
+  // 创建 io_jfs_count 个 IO JFS + fc_jfs_count 个 FC JFS
+  // 替代 per-连接 JFS,所有 UrmaAsyncSocket 共享
+  auto* jfs_pool = new UrmaJfsPool();
+  if (!jfs_pool->init(s_ctx, s_config, s_max_jfs_sge, s_max_jfs_inline_len)) {
+    XLOG(ERR) << "UrmaInit: JFS pool init failed, URMA disabled";
+    delete jfs_pool;
+    finiMrPool();
+    urma_delete_context(s_ctx);
+    s_ctx = nullptr;
+    urma_uninit();
+    return;
+  }
+
+  // 8. 启用 IOBuf block headroom 预留(DPDK rte_mbuf 风格)
+  // 必须在 setIoBufBlockAllocFree 之前设置,使后续所有 block 分配都预留 headroom
+  g_urma_headroom.store(kUrmaHeadroom, std::memory_order_release);
+
+  // 9. folly IOBuf 注入(三步)
   setIoBufBlockAllocFree(
       &UrmaInit::poolAlloc, &UrmaInit::poolFree, &UrmaInit::poolBufSize);
   IOBuf::enableMemoryPool();
@@ -330,7 +349,10 @@ void UrmaInit::init(const UrmaConfig& config) {
   s_inited_ = true;
   XLOG(INFO) << "UrmaInit: initialized, device=" << device_name
              << " max_sge=" << static_cast<unsigned>(s_max_jfs_sge)
-             << " pool_size=" << s_mmap_size;
+             << " headroom=" << kUrmaHeadroom
+             << " pool_size=" << s_mmap_size
+             << " io_jfs=" << s_config.io_jfs_count
+             << " fc_jfs=" << s_config.fc_jfs_count;
 }
 
 void UrmaInit::fini() {
@@ -339,8 +361,15 @@ void UrmaInit::fini() {
   // 参照 brpc: 不在 fini 中删除 URMA 硬件资源(context/seg/JFR/JFC/JFCE/jetty)
   // 原因:硬件资源在进程退出时由内核自动回收
   // 用户态清理可能导致阻塞(jetty 引用 JFR/JFC 时删除会等待解绑)
-  // 仅恢复 IOBuf allocator 到默认值
+  // 仅恢复 IOBuf allocator 到默认值 + 禁用 headroom
+  g_urma_headroom.store(0, std::memory_order_release);
   setIoBufBlockAllocFree(&std::malloc, &std::free, nullptr);
+
+  // JFS 池清理(仅清空列表,不删除硬件资源)
+  if (UrmaJfsPool* pool = UrmaJfsPool::get()) {
+    pool->fini();
+    delete pool;
+  }
 
   // MR 内存池(mmap + register_seg)不 munmap——依赖进程退出时内核回收
   // URMA context 不删除——同上

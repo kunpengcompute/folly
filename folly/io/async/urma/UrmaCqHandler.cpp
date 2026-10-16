@@ -18,11 +18,9 @@ namespace folly {
 
 void UrmaCqHandler::handlerReady(uint16_t /*events*/) noexcept {
   if (is_tx_) {
-    // TX JFCE: CQE 到达(READ completion 或 SQ 解除 EAGAIN) → ack + pollTx + retryWrite
+    // Phase 2: TX 模式不再 per-连接使用,TX CQE 由全局 JFS 池 CqHandler 处理
+    // 保留接口兼容,实际不应被调用
     if (socket_) {
-      urma_jfc_t* jfcs[1] = {socket_->txJfc()};
-      uint32_t nevents[1] = {1};
-      urma_ack_jfc(jfcs, nevents, 1);
       socket_->pollTx();
       socket_->retryWrite();
     }

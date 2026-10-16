@@ -78,6 +78,12 @@ constexpr size_t URMA_HUGE_BUF_SIZE = 9 * 1024 * 1024; // 9MB,容纳 8MB payload
 constexpr size_t URMA_NUM_TIERS = 5;
 constexpr size_t URMA_NUM_SHARDS = 64;
 
+// IOBuf block headroom 预留大小(DPDK rte_mbuf 风格)
+// 启用后每个 block 的 data 区前 64B 作为 headroom,供 IOBuf::prepend(64)
+// 写入 UrmaMsgHeader,实现单 SGE 覆盖 header+data 的 headroom 路由。
+// init() 时通过 g_urma_headroom.store(kUrmaHeadroom) 生效。
+static constexpr size_t kUrmaHeadroom = 64;
+
 // JFS/JFR RNR 重试参数(参照 UMQ umq_ub.c:21-23,内部固定不暴露给用户)
 constexpr uint8_t URMA_DEFAULT_RNR_RETRY = 6;       // 硬件自动重试次数
 constexpr uint8_t URMA_DEFAULT_MIN_RNR_TIMER = 19;   // 每次重试间隔 2μs×2^19 ≈ 1.05s

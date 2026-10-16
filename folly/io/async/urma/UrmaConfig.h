@@ -27,15 +27,23 @@
 namespace folly {
 
 // ── 默认值常量 ──
-constexpr uint32_t kUrmaDefaultRxDepth = 1024;
+constexpr uint32_t kUrmaDefaultRxDepth = 4096;
 constexpr uint32_t kUrmaDefaultFcRxDepth = 1024;
 constexpr uint32_t kUrmaDefaultTxDepth = 1024;
+constexpr uint32_t kUrmaDefaultFcTxDepth = 64;
 constexpr uint32_t kUrmaDefaultIdleTimeoutMs = 10;
 constexpr uint64_t kUrmaDefaultPoolSize = 64ULL * 1024 * 1024 * 1024; // 64GB
 
+// ── 池化默认值(设计 §12) ──
+constexpr uint32_t kUrmaDefaultIoJfsCount = 64;
+constexpr uint32_t kUrmaDefaultFcJfsCount = 16;
+constexpr uint32_t kUrmaDefaultIoJfrCount = 16;
+constexpr uint32_t kUrmaDefaultFcJfrCount = 4;
+constexpr uint32_t kUrmaDefaultMinWater = 64;
+constexpr uint32_t kUrmaDefaultMaxWater = 256;
+constexpr uint32_t kUrmaDefaultBatchPost = 32;
+
 // ── 硬件限制校验常量 ──
-constexpr uint32_t kUrmaJfrPerIoThread = 2;    // IO + FC,每 IO 线程 2 个 JFR
-constexpr uint32_t kUrmaJettyPerConnection = 2; // IO + FC,每连接 2 个 jetty
 constexpr uint32_t kUrmaTxJfcReservedSlots = 1; // flush_done CQE 预留 1 个 slot
 
 struct UrmaConfig {
@@ -43,14 +51,22 @@ struct UrmaConfig {
   // 空字符串表示使用第一个可用设备(参照 brpc FLAGS_urma_device)
   std::string dev_name;
 
-  // ── 共享 JFR 接收侧 ──
-  uint32_t rx_depth = kUrmaDefaultRxDepth;
-  uint32_t fc_rx_depth = kUrmaDefaultFcRxDepth;
+  // ── JFS 池(发送侧,设计 §12) ──
+  uint32_t io_jfs_count = kUrmaDefaultIoJfsCount;  // IO JFS 数量(进程级共享)
+  uint32_t fc_jfs_count = kUrmaDefaultFcJfsCount;  // FC JFS 数量
+  uint32_t tx_depth = kUrmaDefaultTxDepth;          // 每个 IO JFS 的 SQ 深度
+  uint32_t fc_tx_depth = kUrmaDefaultFcTxDepth;     // 每个 FC JFS 的 SQ 深度
 
-  // ── 发送侧 ──
-  enum JfsMode : uint8_t { JFS_SINGLE = 0, JFS_SHARED = 1 };
-  JfsMode jfs_mode = JFS_SINGLE;
-  uint32_t tx_depth = kUrmaDefaultTxDepth;
+  // ── JFR 池(接收侧,设计 §12) ──
+  uint32_t io_jfr_count = kUrmaDefaultIoJfrCount;  // IO JFR 数量(进程级共享)
+  uint32_t fc_jfr_count = kUrmaDefaultFcJfrCount;  // FC JFR 数量
+  uint32_t rx_depth = kUrmaDefaultRxDepth;          // 每个 JFR 的 RQ 深度
+  uint32_t fc_rx_depth = kUrmaDefaultFcRxDepth;     // 每个 FC JFR 的 RQ 深度
+
+  // ── recv buffer 按需投递(设计 §7,DPDK 水位线) ──
+  uint32_t min_water = kUrmaDefaultMinWater;  // 最低水位(低于此值补投)
+  uint32_t max_water = kUrmaDefaultMaxWater;  // 最高水位(补投到此值)
+  uint32_t batch_post = kUrmaDefaultBatchPost; // 每批补投数量
 
   // ── 流控 ──
   uint32_t idle_timeout_ms = kUrmaDefaultIdleTimeoutMs;
@@ -63,7 +79,6 @@ struct UrmaConfig {
 
   // ── 硬件限制校验 ──
   // 超限 clamp 到硬件上限,日志告警(不 crash,不阻止启动)。
-  // io_thread_count / max_connections 由调用方提供(总量校验用)。
   void validateAndClamp(const urma_device_cap_t& cap,
                         uint32_t io_thread_count = 0,
                         uint32_t max_connections = 0) {
@@ -82,18 +97,23 @@ struct UrmaConfig {
       XLOG(WARN) << "tx_depth clamp " << tx_depth << " -> " << max_jfs_depth;
       tx_depth = max_jfs_depth;
     }
-    if (io_thread_count > 0) {
-      uint32_t total_jfr = kUrmaJfrPerIoThread * io_thread_count;
-      if (total_jfr > cap.max_jfr) {
-        XLOG(WARN) << "JFR total " << total_jfr << " exceed max_jfr " << cap.max_jfr;
-      }
+    if (fc_tx_depth > max_jfs_depth) {
+      XLOG(WARN) << "fc_tx_depth clamp " << fc_tx_depth << " -> " << max_jfs_depth;
+      fc_tx_depth = max_jfs_depth;
     }
-    if (max_connections > 0) {
-      uint32_t total_jetty = kUrmaJettyPerConnection * max_connections;
-      if (total_jetty > cap.max_jetty) {
-        XLOG(WARN) << "jetty total " << total_jetty << " exceed max_jetty "
-                   << cap.max_jetty << ", consider JFS_SHARED mode";
-      }
+    // JFS 池总量校验
+    uint32_t total_jfs = io_jfs_count + fc_jfs_count;
+    if (total_jfs > cap.max_jfs) {
+      XLOG(WARN) << "JFS total " << total_jfs << " exceed max_jfs " << cap.max_jfs
+                 << ", clamping io_jfs_count";
+      io_jfs_count = std::max(1u, cap.max_jfs - fc_jfs_count);
+    }
+    // JFR 池总量校验
+    uint32_t total_jfr = io_jfr_count + fc_jfr_count;
+    if (total_jfr > cap.max_jfr) {
+      XLOG(WARN) << "JFR total " << total_jfr << " exceed max_jfr " << cap.max_jfr
+                 << ", clamping io_jfr_count";
+      io_jfr_count = std::max(1u, cap.max_jfr - fc_jfr_count);
     }
   }
 };

@@ -16,6 +16,9 @@ std::atomic<IoBufBlockAllocFn> g_alloc_fn{&std::malloc};
 std::atomic<IoBufBlockFreeFn>  g_free_fn{&std::free};
 std::atomic<IoBufBlockSizeFn> g_size_fn{nullptr};
 
+// URMA headroom 预留大小（默认 0=禁用，UrmaInit::init 时设为 64）
+std::atomic<size_t> g_urma_headroom{0};
+
 void setIoBufBlockAllocFree(IoBufBlockAllocFn alloc_fn,
                             IoBufBlockFreeFn free_fn,
                             IoBufBlockSizeFn size_fn) {
@@ -39,6 +42,12 @@ static inline void blockFree(void* ptr) {
   g_free_fn.load(std::memory_order_acquire)(ptr);
 }
 
+// URMA headroom 预留：每个 block 的 data 区前 64B 作为 headroom，
+// 供 IOBuf::prepend(64) 写入 UrmaMsgHeader（DPDK rte_mbuf 风格）。
+// 外部可通过 g_urma_headroom 设置（0=禁用，64=启用）。
+// 启用时：capacity 减 64，data_len 初始 = 64，IOBuf 的 data_ 从 payloadBegin()+64 开始。
+extern std::atomic<size_t> g_urma_headroom;
+
 static IoBufBlock* allocateFromSystem(size_t size = gIoBufBlockSize) {
   void* mem = blockAlloc(size);
   if (!mem) return nullptr;
@@ -46,9 +55,10 @@ static IoBufBlock* allocateFromSystem(size_t size = gIoBufBlockSize) {
   b->magic = IoBufBlock::kBlockMagic;
   IoBufBlockSizeFn size_fn = g_size_fn.load(std::memory_order_acquire);
   size_t actual_size = size_fn ? size_fn(size) : size;
-  b->capacity = static_cast<uint32_t>(actual_size - sizeof(IoBufBlock));
+  size_t headroom = g_urma_headroom.load(std::memory_order_acquire);
+  b->capacity = static_cast<uint32_t>(actual_size - sizeof(IoBufBlock) - headroom);
   b->ref_count.store(1, std::memory_order_relaxed);
-  b->data_len = 0;
+  b->data_len = static_cast<uint32_t>(headroom);  // 预留 headroom 区域
   return b;
 }
 
@@ -58,7 +68,8 @@ IoBufBlock* ioBufBlockAllocate() {
     IoBufBlock* b = c.blocks[--c.count];
     assert(b->magic == IoBufBlock::kBlockMagic);
     b->ref_count.store(1, std::memory_order_relaxed);
-    b->data_len = 0;
+    size_t headroom = g_urma_headroom.load(std::memory_order_acquire);
+    b->data_len = static_cast<uint32_t>(headroom);
     return b;
   }
   return allocateFromSystem();
@@ -68,7 +79,8 @@ void ioBufBlockRelease(IoBufBlock* b) {
   if (!b) return;
   assert(b->magic == IoBufBlock::kBlockMagic);
   TLSBlockCache& c = g_tls_cache;
-  size_t blockDataCap = gIoBufBlockSize - sizeof(IoBufBlock);
+  size_t headroom = g_urma_headroom.load(std::memory_order_acquire);
+  size_t blockDataCap = gIoBufBlockSize - sizeof(IoBufBlock) - headroom;
   if (b->capacity == blockDataCap) {
     if (c.count < gMaxBlocksPerThread) {
       c.blocks[c.count++] = b;
@@ -93,11 +105,12 @@ IoBufBlock* share_block(size_t min_capacity) {
     }
     c.current_share = nullptr;
   }
-  size_t blockDataCap = gIoBufBlockSize - sizeof(IoBufBlock);
+  size_t headroom = g_urma_headroom.load(std::memory_order_acquire);
+  size_t blockDataCap = gIoBufBlockSize - sizeof(IoBufBlock) - headroom;
   if (min_capacity <= blockDataCap) {
     c.current_share = ioBufBlockAllocate();
   } else {
-    size_t alloc_size = min_capacity + sizeof(IoBufBlock);
+    size_t alloc_size = min_capacity + sizeof(IoBufBlock) + headroom;
     c.current_share = allocateFromSystem(alloc_size);
   }
   return c.current_share;

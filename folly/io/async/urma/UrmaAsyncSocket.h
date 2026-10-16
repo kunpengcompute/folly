@@ -40,6 +40,7 @@
 #include <folly/net/NetworkSocket.h>
 #include <folly/io/async/urma/UrmaConfig.h>
 #include <folly/io/async/urma/UrmaResource.h>
+#include <folly/io/async/urma/UrmaJfsPool.h>
 #include <ub/umdk/urma/urma_api.h>
 
 namespace folly {
@@ -120,9 +121,6 @@ class UrmaAsyncSocket : public AsyncTransport {
   // TX completion(由 UrmaCqHandler TX 模式调用)
   void pollTx() noexcept;
   void retryWrite() noexcept;
-
-  // TX JFC 访问器(供 UrmaCqHandler::handlerReady 做 ack)
-  urma_jfc_t* txJfc() noexcept { return res_.tx_jfc; }
 
   // 发送单个 IOBuf chain(多 SGE 合并 → post SEND,或 >4KB 走单边 READ)
   // big_deferred: 本调用有单边 READ 大包发出,writeSuccess 延迟到对端 FREE
@@ -216,12 +214,6 @@ class UrmaAsyncSocket : public AsyncTransport {
 
   std::unique_ptr<TcpHandshakeHandler> tcp_handshake_handler_;
 
-  struct WrRefs {
-    std::shared_ptr<std::vector<urma_sge_t>> sge;
-    std::shared_ptr<IOBuf> bufs;
-  };
-  std::vector<WrRefs> sbuf_;
-
   // 一个 writeChain 内多个大包共享的完成组:
   // writeSuccess 只在组内所有大包都收到对端 FREE 后回调一次
   struct BigMsgGroup {
@@ -237,8 +229,6 @@ class UrmaAsyncSocket : public AsyncTransport {
   };
   std::unique_ptr<PendingWrite> pending_write_head_;
   PendingWrite* pending_write_tail_{nullptr};
-
-  UrmaCqHandler* tx_cq_handler_{nullptr};
 
   // ── 单边 READ 状态 ──
   static constexpr uint64_t kCtrlUserCtx = 0xFFFFFFFFFFFFFFFFULL;
@@ -274,7 +264,7 @@ class UrmaAsyncSocket : public AsyncTransport {
   uint16_t next_msg_id_{1};
   // 控制包 8 字节 remote_va 的固定 MR buffer(每连接复用,B-6)
   void* ctrl_meta_mr_{nullptr};
-  // 控制包/FREE 的 sge 引用(FIFO,pollTx 里 kCtrlUserCtx 时 pop_front)
+  // Phase 2: 控制包 SGE 引用(保留兼容,新路径用 TxCompletionCtx 管理)
   std::deque<std::shared_ptr<std::vector<urma_sge_t>>> ctrl_sge_refs_;
 
   uint32_t send_timeout_ms_{0};
