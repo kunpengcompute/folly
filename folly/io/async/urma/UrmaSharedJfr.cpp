@@ -14,6 +14,8 @@
 #include <folly/io/async/EventBase.h>
 #include <folly/io/async/urma/UrmaAsyncSocket.h>
 #include <folly/io/async/urma/UrmaCqHandler.h>
+#include <folly/io/async/urma/UrmaHeader.h>
+#include <folly/io/async/urma/UrmaImportCache.h>
 #include <folly/logging/xlog.h>
 
 namespace folly {
@@ -212,38 +214,51 @@ void UrmaSharedJfr::pollAndDispatch() noexcept {
   while ((n = urma_poll_jfc(io_jfc_, POLL_BATCH_MAX, cr)) > 0) {
     for (int i = 0; i < n; ++i) {
       uint32_t slot = static_cast<uint32_t>(cr[i].user_ctx);
+      void* recv_buf = rx_bufs_[slot].data;
+      uint32_t recv_len = cr[i].completion_len;
+
+      // Phase 3: 兼容两种接收路径
+      // 1) SEND_IMM 控制包(Phase 5 前仍保留):无 header,用 imm_data + remote_id 路由
+      // 2) headroom 路由(Phase 3 新增):recv buffer 前 64B 含 UrmaMsgHeader
+      if (cr[i].opcode == URMA_CR_OPC_SEND_WITH_IMM) {
+        // 旧版 SEND_IMM 控制包:imm_data 编码 msg_id|is_ctl|data_size
+        // RX buffer 含 8 字节 meta(remote_va for PULL)
+        auto it = socket_map_.find(cr[i].remote_id.id);
+        if (it == socket_map_.end()) {
+          replenishRxBuf(slot);
+          continue;
+        }
+        it->second->onControlMsg(cr[i].imm_data, recv_buf);
+        replenishRxBuf(slot);
+        recharge();
+        continue;
+      }
+
+      // Phase 3: headroom 路由 — 从 recv buffer 前 64B 解析 UrmaMsgHeader
+      auto* hdr = parseHeader(recv_buf);
+      if (!hdr) {
+        XLOG(WARN) << "[URMA] pollAndDispatch: header magic mismatch, slot="
+                   << slot << " recv_len=" << recv_len;
+        replenishRxBuf(slot);
+        continue;
+      }
+
+      // 当前阶段仍用 socket_map_ 过渡(Phase 4 JFR 池化后改为全局 Socket::Address)
       auto it = socket_map_.find(cr[i].remote_id.id);
       if (it == socket_map_.end()) {
-//                    << " slot=" << slot << " opcode=" << static_cast<int>(cr[i].opcode);
         replenishRxBuf(slot);
         continue;
       }
       UrmaAsyncSocket* socket = it->second;
-      if (cr[i].opcode == URMA_CR_OPC_SEND_WITH_IMM) {
-        // SEND_IMM 控制包:imm_data 编码 msg_id|is_ctl|data_size
-        // RX buffer 含 8 字节 meta(remote_va for PULL)
-//                    << " imm=" << cr[i].imm_data;
-        socket->onControlMsg(cr[i].imm_data, rx_bufs_[slot].data);
-        replenishRxBuf(slot);
-        recharge();
-      } else {
-        // 普通 SEND 数据
-//                    << " remote=" << cr[i].remote_id.id;
-        auto data = IOBuf::takeOwnership(
-            rx_bufs_[slot].data, cr[i].completion_len,
-            [](void* /*buf*/, void* userData) {
-              auto* self = static_cast<UrmaSharedJfr*>(
-                  reinterpret_cast<void*>(
-                      reinterpret_cast<uintptr_t>(userData) >> 16));
-              uint32_t s = static_cast<uint32_t>(
-                  reinterpret_cast<uintptr_t>(userData) & 0xFFFF);
-              self->replenishRxBuf(s);
-              self->recharge();
-            },
-            reinterpret_cast<void*>(
-                (reinterpret_cast<uintptr_t>(this) << 16) | slot));
-        socket->onRxBuf(std::move(data));
-      }
+
+      // 统一通过 onIoMessageReceived 分发(header.type 决定处理路径)
+      socket->onIoMessageReceived(recv_buf, recv_len, slot);
+
+      // 补投 recv WR
+      // 注意:onRxBuf 路径中 IOBuf::wrapBuffer 不 takeOwnership,recv_buf 归属不变
+      // Phase 4 改为 takeOwnership 零拷贝后此处调整
+      replenishRxBuf(slot);
+      recharge();
     }
   }
   // poll 后 ack + rearm(参照 brpc: poll → ack → rearm)

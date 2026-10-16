@@ -20,6 +20,8 @@
 #include <folly/io/async/urma/UrmaSharedJfr.h>
 #include <folly/io/async/urma/UrmaInit.h>
 #include <folly/io/async/urma/UrmaJfsPool.h>
+#include <folly/io/async/urma/UrmaImportCache.h>
+#include <folly/io/async/urma/UrmaHeader.h>
 #include <folly/logging/xlog.h>
 
 #include <unistd.h>
@@ -76,6 +78,7 @@ void UrmaAsyncSocket::ConnectCallback::connectErr(
 
 UrmaAsyncSocket::UrmaAsyncSocket(EventBase* evb, const SocketAddress& addr)
     : evb_(evb), state_(State::kConnecting) {
+  socket_id_ = SocketIdAllocator::get().allocate();
   tcp_socket_ = AsyncSocket::newSocket(evb);
   connect_cb_ = std::make_unique<ConnectCallback>();
   connect_cb_->self = this;
@@ -84,6 +87,7 @@ UrmaAsyncSocket::UrmaAsyncSocket(EventBase* evb, const SocketAddress& addr)
 
 UrmaAsyncSocket::UrmaAsyncSocket(EventBase* evb, int fd)
     : evb_(evb), tcp_fd_(fd), state_(State::kIdle) {
+  socket_id_ = SocketIdAllocator::get().allocate();
   startHandshake(false);
 }
 
@@ -93,6 +97,7 @@ UrmaAsyncSocket::UrmaAsyncSocket(EventBase* evb, int fd,
       tcp_fd_(fd),
       state_(State::kHandshaking),
       handshake_(handshake) {
+  socket_id_ = SocketIdAllocator::get().allocate();
 }
 
 UrmaAsyncSocket::~UrmaAsyncSocket() {
@@ -345,6 +350,10 @@ urma_status_t UrmaAsyncSocket::sendChain(WriteCallback* cb,
     // 持有本次 WR 引用的 IOBuf chain(防止 post 期间被释放)
     auto wr_chain_head = std::make_shared<IOBuf>();
 
+    // Phase 3: 记录第一个 IOBuf 指针(用于后续 prepend 写 header)
+    IOBuf* first_buf = nullptr;
+    uint32_t first_data_len = 0;
+
     while (chain && num_sge < sge_capacity) {
       size_t iobuf_len = chain->length();
       if (sge_total + iobuf_len > peer_rx_buf_size_ && num_sge > 0) {
@@ -368,6 +377,11 @@ urma_status_t UrmaAsyncSocket::sendChain(WriteCallback* cb,
       (*sge_arr)[num_sge].addr = reinterpret_cast<uint64_t>(chain->writableData());
       (*sge_arr)[num_sge].len = static_cast<uint32_t>(iobuf_len);
       (*sge_arr)[num_sge].tseg = UrmaInit::getPoolTseg();
+      // Phase 3: 记录第一个 block(用于 headroom header 写入)
+      if (num_sge == 0) {
+        first_buf = chain.get();
+        first_data_len = static_cast<uint32_t>(iobuf_len);
+      }
       wr_chain_head->appendChain(std::move(chain->cloneOne()));
       sge_total += iobuf_len;
       num_sge++;
@@ -375,6 +389,29 @@ urma_status_t UrmaAsyncSocket::sendChain(WriteCallback* cb,
     }
 
     if (num_sge == 0) break;
+
+    // Phase 3: headroom 路由 — 在第一个 IOBuf block 的 headroom 写 UrmaMsgHeader
+    // prepend(64) → data 指针前移到 header 起始,SGE[0] 覆盖 header+data
+    uint16_t seq = send_seq_.fetch_add(1, std::memory_order_relaxed);
+    if (first_buf && first_buf->headroom() >= sizeof(UrmaMsgHeader)) {
+      first_buf->prepend(sizeof(UrmaMsgHeader));
+      auto* hdr = reinterpret_cast<UrmaMsgHeader*>(first_buf->writableData());
+      hdr->magic = URMA_MAGIC;
+      hdr->src_socket_id = socket_id_.toUint64();
+      hdr->seq = seq;
+      hdr->type = MSG_DATA;
+      hdr->msg_count = static_cast<uint8_t>(num_sge);
+      hdr->data_size = sge_total;
+      hdr->data_sge_count = static_cast<uint32_t>(num_sge);
+      std::memset(hdr->sub_len, 0, sizeof(hdr->sub_len));
+      hdr->sub_len[0] = static_cast<uint16_t>(first_data_len);
+      hdr->reserved[0] = 0;
+      hdr->reserved[1] = 0;
+      // SGE[0] 扩展覆盖 header+data
+      (*sge_arr)[0].addr = reinterpret_cast<uint64_t>(first_buf->writableData());
+      (*sge_arr)[0].len = sizeof(UrmaMsgHeader) + first_data_len;
+      sge_total += sizeof(UrmaMsgHeader);
+    }
 
     // Phase 2: 从 JFS 池获取一个空闲 JFS
     uint32_t jfs_index = 0;
@@ -387,10 +424,11 @@ urma_status_t UrmaAsyncSocket::sendChain(WriteCallback* cb,
     // Phase 2: 创建 TxCompletionCtx,move IOBuf chain 到 ctx
     // post 前 move-in,TX CQE 后 delete ctx → send_data 析构 → block 回收
     auto* tx_ctx = new TxCompletionCtx();
-    tx_ctx->socket_id = 0;  // Phase 3 headroom 路由时填充
-    tx_ctx->seq = 0;        // Phase 5 保序时填充
+    tx_ctx->socket_id = socket_id_.toUint64();
+    tx_ctx->seq = seq;
     tx_ctx->type = TxCompletionCtx::MSG_DATA;
     tx_ctx->jfs_index = jfs_index;
+    tx_ctx->msg_id = 0;
     // 将 wr_chain_head move 到 ctx 的 send_data(持有 block 引用)
     tx_ctx->send_data = std::move(*wr_chain_head);
     // SGE 数组也由 ctx 管理(保持存活到硬件处理完毕)
@@ -849,6 +887,48 @@ void UrmaAsyncSocket::scanBigMsgTimeout() noexcept {
   }
 }
 
+// ── Phase 3: headroom 路由 ──
+// 从 recv buffer 前 64B 解析 UrmaMsgHeader,按 type 分发
+// recv_buf: 接收到的 buffer 起始(header 64B + data)
+// recv_len: 实际接收字节数
+// slot:     rx_bufs_ 的 slot 索引(补投 recv WR 用)
+void UrmaAsyncSocket::onIoMessageReceived(void* recv_buf, uint32_t recv_len,
+                                           uint32_t slot) noexcept {
+  if (!recv_buf || recv_len < sizeof(UrmaMsgHeader)) {
+    return;
+  }
+
+  auto* hdr = parseHeader(recv_buf);
+  if (!hdr) {
+    XLOG(WARN) << "[URMA] onIoMessageReceived: magic mismatch, recv_len="
+               << recv_len;
+    return;
+  }
+
+  uint32_t data_len = recv_len - sizeof(UrmaMsgHeader);
+  void* data_ptr = static_cast<uint8_t*>(recv_buf) + sizeof(UrmaMsgHeader);
+
+  if (hdr->type == MSG_DATA) {
+    // 普通 SEND 数据:跳过 64B header,取 data 部分交付
+    auto iobuf = IOBuf::wrapBuffer(data_ptr, data_len);
+    onRxBuf(std::move(iobuf));
+  } else if (hdr->type == MSG_PULL_MEM) {
+    // 大包控制包(PULL):meta 在 data 部分(8 字节 remote_va)
+    // 复用 onControlMsg,is_ctl=kCtrlTypePull,imm 编码 msg_id|is_ctl|data_size
+    // msg_id 从 header seq 字段获取(Phase 5 保序后改用独立 msg_id)
+    uint64_t imm = encodeBigMsgImm(hdr->seq, kCtrlTypePull,
+                                    hdr->data_size);
+    onControlMsg(imm, data_ptr);
+  } else if (hdr->type == MSG_FREE) {
+    // 大包 FREE 通知:无 meta
+    uint64_t imm = encodeBigMsgImm(hdr->seq, kCtrlTypeFree, 0);
+    onControlMsg(imm, nullptr);
+  } else {
+    XLOG(WARN) << "[URMA] onIoMessageReceived: unknown type="
+               << static_cast<int>(hdr->type);
+  }
+}
+
 // ── 接收(普通 SEND 数据) ──
 
 void UrmaAsyncSocket::onRxBuf(std::unique_ptr<IOBuf> data) noexcept {
@@ -933,12 +1013,13 @@ void UrmaAsyncSocket::destroyUrmaResources() {
   while (!rx_pending_queue_.empty()) {
     rx_pending_queue_.pop();
   }
+  // Phase 3: import 句柄通过 ImportedJettyCache 引用计数管理
   if (res_.remote_fc_jetty) {
-    urma_unimport_jetty(res_.remote_fc_jetty);
+    ImportedJettyCache::get()->release(res_.remote_fc_jetty);
     res_.remote_fc_jetty = nullptr;
   }
   if (res_.remote_jetty) {
-    urma_unimport_jetty(res_.remote_jetty);
+    ImportedJettyCache::get()->release(res_.remote_jetty);
     res_.remote_jetty = nullptr;
   }
   if (res_.remote_seg) {

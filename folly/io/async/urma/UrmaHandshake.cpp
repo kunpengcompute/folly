@@ -18,6 +18,7 @@
 #include <folly/io/async/urma/UrmaInit.h>
 #include <folly/io/async/urma/UrmaAsyncSocket.h>
 #include <folly/io/async/urma/UrmaSharedJfr.h>
+#include <folly/io/async/urma/UrmaImportCache.h>
 #include <folly/logging/xlog.h>
 
 namespace folly {
@@ -277,8 +278,10 @@ void UrmaHandshake::importPeer(const v2_wire::HelloMessage& hello) {
     return;
   }
 
+  // Phase 3: import_jetty 通过全局 ImportedJettyCache 缓存复用
+  // 多连接到同一对端时复用同一 import 句柄,ref_count 引用计数管理
   urma_token_t token = {};
-  res.remote_jetty = urma_import_jetty(ctx, &rjetty, &token);
+  res.remote_jetty = ImportedJettyCache::get()->acquire(rjetty, &token);
   if (!res.remote_jetty) {
     onHandshakeError("import_jetty(IO) failed");
     return;  // 析构清理 res.remote_seg
@@ -293,10 +296,13 @@ void UrmaHandshake::importPeer(const v2_wire::HelloMessage& hello) {
   fc_rjetty.type = URMA_JETTY;
   fc_rjetty.tp_type = URMA_CTP;
 
-  res.remote_fc_jetty = urma_import_jetty(ctx, &fc_rjetty, &token);
+  res.remote_fc_jetty = ImportedJettyCache::get()->acquire(fc_rjetty, &token);
   if (!res.remote_fc_jetty) {
     onHandshakeError("import_jetty(FC) failed");
-    return;  // 析构清理 res.remote_jetty + res.remote_seg
+    // 回滚 IO import
+    ImportedJettyCache::get()->release(res.remote_jetty);
+    res.remote_jetty = nullptr;
+    return;
   }
 }
 

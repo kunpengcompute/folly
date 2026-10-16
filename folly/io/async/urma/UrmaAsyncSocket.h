@@ -41,6 +41,7 @@
 #include <folly/io/async/urma/UrmaConfig.h>
 #include <folly/io/async/urma/UrmaResource.h>
 #include <folly/io/async/urma/UrmaJfsPool.h>
+#include <folly/io/async/urma/UrmaHeader.h>
 #include <ub/umdk/urma/urma_api.h>
 
 namespace folly {
@@ -109,6 +110,14 @@ class UrmaAsyncSocket : public AsyncTransport {
   // ---------- URMA 专属 ----------
   // 接收数据(由 UrmaSharedJfr::pollAndDispatch 调用,普通 SEND)
   void onRxBuf(std::unique_ptr<IOBuf> data) noexcept;
+
+  // Phase 3: headroom 路由 — 从 recv buffer 前 64B 解析 header 路由
+  // recv_buf: 接收到的 buffer 起始(header 64B + data)
+  // recv_len: 实际接收字节数
+  // slot:     rx_bufs_ 的 slot 索引(补投 recv WR 用)
+  // 由 UrmaSharedJfr::pollAndDispatch 调用
+  void onIoMessageReceived(void* recv_buf, uint32_t recv_len,
+                           uint32_t slot) noexcept;
 
   // 控制包/FREE 通知(由 UrmaSharedJfr::pollAndDispatch 按 imm_valid 路由,SEND_IMM)
   // imm: 编码 msg_id | is_ctl<<56 | data_size<<16
@@ -201,6 +210,11 @@ class UrmaAsyncSocket : public AsyncTransport {
   int tcp_fd_{-1};
   State state_{State::kIdle};
   ReadCallback* read_cb_{nullptr};
+
+  // Phase 3: SocketId(headroom 路由用,接收方据此路由到本 socket)
+  SocketId socket_id_{};
+  // Phase 3: per-连接发送序列号(headroom header 中的 seq 字段)
+  std::atomic<uint16_t> send_seq_{0};
 
   folly::IOBufQueue read_queue_;
 
