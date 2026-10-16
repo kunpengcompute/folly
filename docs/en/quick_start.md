@@ -1,8 +1,10 @@
 # Quick Start
 
+<!-- md-trans-meta sourceCommit=9c3416697441a78c6ecbafeaec1103ba744523db translatedAt=2026-10-13T03:53:03.661Z pushedAt=2026-10-13T07:36:34.982Z -->
+
 This document provides guidance on how to compile an optimized version of Folly, enable the IOBuf thread-local storage (TLS) memory pool, and verify the existing `io_uring` hybrid read/write path.
 
-> ![note](./public_sys-resources/icon-note.gif)**Note:**
+> ![note](./public_sys-resources/icon-note.gif) **NOTE:**
 >Applicable version: Folly v1.1.0
 
 ## Environment Setup
@@ -18,7 +20,7 @@ On Debian or Ubuntu, run the following commands.
 ```bash
 sudo apt-get update
 sudo apt-get install -y \
-  git cmake build-essential liburing-dev libboost-all-dev \
+  git cmake build-essential clang-16 liburing-dev libboost-all-dev \
   libdouble-conversion-dev libgflags-dev libgoogle-glog-dev \
   libevent-dev libsodium-dev liblz4-dev libsnappy-dev libzstd-dev \
   libfmt-dev liblzma-dev libgtest-dev libgmock-dev libssl-dev \
@@ -26,9 +28,13 @@ sudo apt-get install -y \
   zlib1g-dev libbz2-dev
 ```
 
-### Obtaining and Applying the Optimization Patch
+### Obtaining the Optimized Source Code
 
-1. Obtain the optimization patch code.
+This project provides two methods to obtain the optimized source code. Method 1 directly obtains the optimized source code; method 2 obtains the baseline source code in sequence, verifies and applies the patches. After obtaining the optimized source code, proceed to [Compilation and Installation](#compilation-and-installation).
+
+#### Method 1: Obtaining the Optimized Source Code from the dev_iouring Branch
+
+The `dev_iouring` branch already includes optimizations such as io_uring network I/O optimization and the IOBuf TLS memory pool.
 
    ```bash
    git clone --recurse-submodules --branch dev_iouring --single-branch \
@@ -36,14 +42,81 @@ sudo apt-get install -y \
    cd folly
    ```
 
-2. The IOBuf TLS memory pool is provided by the v1.1.0 patch. When the source code does not yet include the corresponding implementation, apply the patch before configuration.
+If you have already obtained the optimized source code, you can proceed to [Compilation and Installation](#compilation-and-installation) to prepare for compilation.
 
-   ```bash
-   git apply --check /path/to/folly_iobuf_tls_pool.patch
-   git apply --3way /path/to/folly_iobuf_tls_pool.patch
-   ```
+#### Method 2: Obtaining the Baseline Source Code, Verifying and Applying Patches
 
-   If `git apply --reverse --check` succeeds, the patch has already been applied and should not be applied again.
+**Obtaining the Baseline Source Code, Patches, and Checksum Files**
+    
+Store the baseline source code in the `folly` directory, and store the patches and checksum files in the `folly-patches` directory at the same directory level. Run the following commands in the selected working directory:
+    
+   ```bash 
+   git clone --recurse-submodules --branch v2022.11.14.00 --single-branch \ 
+     https://github.com/facebook/folly.git folly 
+   git clone --branch master --single-branch \ 
+     https://gitcode.com/boostkit/folly.git folly-patches 
+   cd folly-patches 
+   ``` 
+   
+**Software Package Integrity Verification**
+    
+This project provides Folly performance optimization features in the form of patch files, and uses **SHA-256 verification** to confirm whether the patches have changed during download, transmission, or storage.
+
+SHA-256 verification does not independently prove source authenticity. Obtain the patches and the checksum files of the same version from the [official Folly repository](https://gitcode.com/boostkit/folly).
+   
+**Checksum Files**
+
+| File Name | Description |
+| --- | --- |
+| folly_iobuf_iouring.patch | Folly performance optimization patch |
+| folly_iobuf_iouring.patch.sha256 | Checksum file recording the above patch file name and its SHA-256 digest value |
+
+The patch and the checksum file must come from the same release version. When the patch is updated, the checksum file must be updated accordingly.
+
+**Verification Steps**
+   
+After you obtain the files according to the preceding steps, the current directory is `folly-patches`.
+   
+   1. Place the patch and the checksum file in the same directory, and run the following command in that directory.
+   
+         ```bash 
+         sha256sum --check --strict folly_iobuf_iouring.patch.sha256 
+         ``` 
+   
+   2. This [command](https://www.gnu.org/software/coreutils/manual/html_node/sha2-utilities.html) reads the digest value in the checksum file, compares it with the SHA-256 digest of the actual patch, and checks the checksum file format. If verification passes, the output is as follows:
+   
+         ```output
+         folly_iobuf_iouring.patch: OK 
+         ``` 
+   
+      Confirm that the corresponding file name in the output is `folly_iobuf_iouring.patch`, and that the command does not report a failure or format error.
+   
+**Result Evaluation**
+   
+| Verification Result | Evaluation and Handling |
+| --- | --- | 
+| Displays `OK` with no error prompt | The digest in the patch matches that in the checksum file; integrity verification passes, and you can proceed to apply the patch. |
+| Displays `FAILED` | The patch content does not match the expected value; stop using it and re-obtain the patch. |
+| Prompts that the file does not exist or cannot be read | Check the current directory, file name, and whether the file was downloaded completely |
+| Prompts a checksum file format error | Re-obtain the checksum file provided by the publisher |
+   
+**Exception Handling**
+   
+If verification fails, re-obtain the patch and checksum file of the same version from the official repository and run verification again.
+   
+Do not make verification pass by modifying the digest value in the checksum file. If verification still fails after re-obtaining the files, report the patch version, file name, and complete verification output to the publisher.
+   
+**Applying the Optimization Patch**
+    
+After verification passes, switch from the patch directory to the baseline source code directory, then check and apply the patch.
+   
+   ```bash 
+   cd ../folly 
+   git apply --check ../folly-patches/folly_iobuf_iouring.patch 
+   git apply ../folly-patches/folly_iobuf_iouring.patch 
+   ``` 
+   
+The patch only needs to be applied once. After that, continue with the compilation and installation steps in the next chapter in the current folly source directory.
 
 ## Compilation and Installation
 
@@ -97,7 +170,7 @@ When fmt or other dependencies are installed in a custom location, pass the actu
 - Call `setBlockSize()` only during the startup phase. Do not modify the block size dynamically while processing requests.
 - When small requests account for a high proportion of requests, the block reuse rate can be improved. Requests that frequently exceed the block capacity still use the original path.
 - When there are many threads, evaluate the upper bound of memory usage based on "number of threads × per-thread cache limit × block size".
-- IOBuf objects may be released across threads, and data blocks may enter the TLS cache of the thread that performs the final release. The cache distribution across threads should be monitored.
+- IOBuf objects may be released across threads, and data blocks may enter the TLS cache of the thread that performs the final release. The cache distribution across threads should be observed.
 
 ### Correctness Verification
 
@@ -107,7 +180,7 @@ Compile all Folly tests and run the following command.
 ctest --test-dir _build --output-on-failure
 ```
 
-The memory pool–specific verification must cover at least the following.
+The memory pool–specific verification must cover at least the following:
 
 - When the memory pool is not enabled, the original `IOBuf::create()` path is preserved.
 - Multiple small IOBuf objects are split from the same block, and their slices do not overlap.
@@ -126,7 +199,7 @@ After enabling `BUILD_TESTS` during the build, the `AsyncIoUringSocket` test can
 ./_build/experimental/io/test/async_iouring_socket_test
 ```
 
-v1.0.0 uses a hybrid mode: Read operations use `io_uring` multishot, while write operations use the open-source `send`. When `send` is temporarily unable to write, `PollWriteSqe` monitors the socket file descriptor and resumes sending.
+v1.0.0 uses a hybrid mode: Read operations use `io_uring` multishot, while write operations use the system call `send`. When `send` is temporarily unable to write, `PollWriteSqe` listens on the socket file descriptor and resumes sending.
 
 ### Testing the Benchmark
 

@@ -175,7 +175,7 @@ IoBufBlock
 
 ## Folly v1.0.0：io_uring混合读写接口说明
 
-> ![表示说明的图片](./public_sys-resources/icon-note.gif)**说明**：本节保留Folly v1.0.0提供的io_uring混合读写接口，与Folly v1.1.0的IOBuf TLS内存池分开说明。
+>![表示说明的图片](./public_sys-resources/icon-note.gif) **说明**：本节保留Folly v1.0.0提供的io_uring混合读写接口，与Folly v1.1.0的IOBuf TLS内存池分开说明。
 
 ### Folly v1.0.0：io_uring混合读写接口概览
 

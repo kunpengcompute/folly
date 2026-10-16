@@ -29,25 +29,28 @@ fbthrift/
 │   ├── en/                         # English documents
 │   │   ├── api_reference.md        # API reference sheet
 │   │   ├── quick_start.md          # Menu for beginners
+|   |   ├── menu_folly——en.md       # menu
 │   │   └── release_notes.md        # Release notes
 │   │
 │   ├── zh/                         # 中文文档
 │   │   ├── api_reference.md        # API参考
 │   │   ├── quick_start.md          # 快速入门
+|   |   ├── menu_folly.md           # 文档列表
 │   │   └── release_notes.md        # 版本说明书
 │   └── LICENSE
 ├── LICENSE
 ├── iouring.patch                   # Folly v1.1.0优化补丁文件
-└── README.md                       # 项目介绍
+├──README.md                        # 项目介绍
+└──README_en.md                     # Project Introduction
 ```
 
 ## 版本说明
 
-关于Folly优化补丁的版本更新情况请参见[版本说明书](docs/zh/release_notes.md)。
+关于Folly优化补丁的版本更新情况请参见《[版本说明书](docs/zh/release_notes.md)》。
 
 ## 快速入门
 
-关于Folly的快速入门操作指导请参见[快速入门](docs/zh/quick_start.md)。
+关于Folly的快速入门操作指导请参见《[快速入门](docs/zh/quick_start.md)》。
 
 ## 学习文档
 
