@@ -14,8 +14,6 @@
 #include <folly/io/async/EventBase.h>
 #include <folly/io/async/urma/UrmaAsyncSocket.h>
 #include <folly/io/async/urma/UrmaCqHandler.h>
-#include <folly/io/async/urma/UrmaHeader.h>
-#include <folly/io/async/urma/UrmaImportCache.h>
 #include <folly/logging/xlog.h>
 
 namespace folly {
@@ -30,7 +28,6 @@ UrmaSharedJfr* UrmaSharedJfr::getOrCreate(EventBase* evb) {
   if (existing && existing->isValid()) {
     return existing;
   }
-  // 旧的无效或不存在,删除后重新创建
   if (existing) {
     registry().erase(*evb);
   }
@@ -45,136 +42,48 @@ UrmaSharedJfr* UrmaSharedJfr::get(EventBase* evb) {
   return up ? up->get() : nullptr;
 }
 
-UrmaSharedJfr::UrmaSharedJfr(EventBase* evb, const UrmaConfig& config)
-    : evb_(evb), config_(config) {
-  urma_context_t* ctx = UrmaInit::getContext();
-  if (!ctx) {
-    XLOG(ERR) << "UrmaSharedJfr: UrmaInit not initialized";
+UrmaSharedJfr::UrmaSharedJfr(EventBase* evb, const UrmaConfig& /*config*/)
+    : evb_(evb) {
+  // Phase 4: 从进程级 UrmaJfrPool 选定 JFR(不再自己创建)
+  UrmaJfrPool* pool = UrmaJfrPool::get();
+  if (!pool) {
+    XLOG(ERR) << "UrmaSharedJfr: UrmaJfrPool not initialized";
     return;
   }
 
-  // ── IO 组 ──
-  // IO JFCE (先创建,JFC 创建时指定)
-  io_jfce_ = urma_create_jfce(ctx);
-  if (!io_jfce_) {
-    XLOG(ERR) << "UrmaSharedJfr: create io_jfce failed";
+  io_shared_jfr_ = pool->selectIoJfr(&io_jfr_index_);
+  if (!io_shared_jfr_) {
+    XLOG(ERR) << "UrmaSharedJfr: selectIoJfr failed";
     return;
   }
 
-  // IO JFC (指定 jfce)
-  urma_jfc_cfg_t io_jfc_cfg = {};
-  io_jfc_cfg.depth = config_.rx_depth;
-  io_jfc_cfg.jfce = io_jfce_;
-  io_jfc_ = urma_create_jfc(ctx, &io_jfc_cfg);
-  if (!io_jfc_) {
-    XLOG(ERR) << "UrmaSharedJfr: create io_jfc failed";
-    return;  // 析构清理 io_jfce_
+  fc_shared_jfr_ = pool->selectFcJfr(&fc_jfr_index_);
+  if (!fc_shared_jfr_) {
+    XLOG(ERR) << "UrmaSharedJfr: selectFcJfr failed";
+    return;
   }
 
-  // IO JFR
-  urma_jfr_cfg_t io_jfr_cfg = {};
-  io_jfr_cfg.depth = config_.rx_depth;
-  io_jfr_cfg.trans_mode = URMA_TM_RM;
-  io_jfr_cfg.max_sge = 1;  // 每个 recv WR 用 1 个 SGE(参照 brpc)
-  io_jfr_cfg.min_rnr_timer = URMA_DEFAULT_MIN_RNR_TIMER;
-  io_jfr_cfg.jfc = io_jfc_;
-  io_jfr_ = urma_create_jfr(ctx, &io_jfr_cfg);
-  if (!io_jfr_) {
-    XLOG(ERR) << "UrmaSharedJfr: create io_jfr failed";
-    return;  // 析构清理 io_jfc_ + io_jfce_
-  }
-
-  // IO RX buffer 池: rx_depth 个 4KB buffer
-  rx_bufs_.resize(config_.rx_depth);
-  for (uint32_t i = 0; i < config_.rx_depth; ++i) {
-    rx_bufs_[i].data = UrmaInit::poolAlloc(URMA_SMALL_BUF_SIZE);
-    if (!rx_bufs_[i].data) {
-      XLOG(ERR) << "UrmaSharedJfr: rx_buf alloc failed at " << i;
-      rx_bufs_.resize(i);  // 截断到已分配的部分,析构清理
-      return;  // 析构清理 rx_bufs_[0..i-1] + io_jfr_ + io_jfc_ + io_jfce_
-    }
-
-    urma_jfr_wr_t* wr = &rx_bufs_[i].wr;
-    rx_bufs_[i].sge.addr = reinterpret_cast<uint64_t>(rx_bufs_[i].data);
-    rx_bufs_[i].sge.len = URMA_SMALL_BUF_SIZE;
-    rx_bufs_[i].sge.tseg = UrmaInit::getPoolTseg();
-    wr->src.sge = &rx_bufs_[i].sge;
-    wr->src.num_sge = 1;
-    wr->user_ctx = i;  // slot 索引
-    wr->next = nullptr;
-    urma_jfr_wr_t* bad_wr = nullptr;
-    urma_status_t ret = urma_post_jfr_wr(io_jfr_, wr, &bad_wr);
-    if (ret != URMA_SUCCESS) {
-      XLOG(ERR) << "UrmaSharedJfr: post_jfr_wr failed at slot " << i
-                << ", status=" << ret;
-      UrmaInit::poolFree(rx_bufs_[i].data);
-      rx_bufs_[i].data = nullptr;
-      rx_bufs_.resize(i);  // 截断,析构清理已分配的
-      urma_delete_jfr(io_jfr_);
-      io_jfr_ = nullptr;
-      urma_delete_jfc(io_jfc_);
-      io_jfc_ = nullptr;
-      urma_delete_jfce(io_jfce_);
-      io_jfce_ = nullptr;
-      return;
-    }
-  }
-
-  // IO CqHandler
-  io_cq_handler_ = new UrmaCqHandler(evb_, io_jfce_->fd,
+  // CqHandler: 注册选定的 JFR 的 JFCE fd 到 EventBase epoll
+  io_cq_handler_ = new UrmaCqHandler(evb_, io_shared_jfr_->jfce_fd,
                                       this, false);
-  urma_rearm_jfc(io_jfc_, false);
+  urma_rearm_jfc(io_shared_jfr_->jfc, false);
 
-  // ── FC 组 ──
-  // FC JFCE (先创建)
-  fc_jfce_ = urma_create_jfce(ctx);
-  if (!fc_jfce_) {
-    XLOG(ERR) << "UrmaSharedJfr: create fc_jfce failed";
-    return;  // 析构清理 IO 组
-  }
-
-  // FC JFC (指定 jfce)
-  urma_jfc_cfg_t fc_jfc_cfg = {};
-  fc_jfc_cfg.depth = config_.fc_rx_depth;
-  fc_jfc_cfg.jfce = fc_jfce_;
-  fc_jfc_ = urma_create_jfc(ctx, &fc_jfc_cfg);
-  if (!fc_jfc_) {
-    XLOG(ERR) << "UrmaSharedJfr: create fc_jfc failed";
-    return;  // 析构清理 fc_jfce_ + IO 组
-  }
-
-  urma_jfr_cfg_t fc_jfr_cfg = {};
-  fc_jfr_cfg.depth = config_.fc_rx_depth;
-  fc_jfr_cfg.trans_mode = URMA_TM_RM;
-  fc_jfr_cfg.max_sge = 1;  // FC recv WR 用 1 个 SGE
-  fc_jfr_cfg.min_rnr_timer = URMA_DEFAULT_MIN_RNR_TIMER;
-  fc_jfr_cfg.jfc = fc_jfc_;
-  fc_jfr_ = urma_create_jfr(ctx, &fc_jfr_cfg);
-  if (!fc_jfr_) {
-    XLOG(ERR) << "UrmaSharedJfr: create fc_jfr failed";
-    return;  // 析构清理 fc_jfc_ + fc_jfce_ + IO 组
-  }
-
-  // FC RX buffer: Phase 2 空实现(Phase 4 填充)
-  fc_cq_handler_ = new UrmaCqHandler(evb_, fc_jfce_->fd,
+  fc_cq_handler_ = new UrmaCqHandler(evb_, fc_shared_jfr_->jfce_fd,
                                       this, true);
-  urma_rearm_jfc(fc_jfc_, false);
+  urma_rearm_jfc(fc_shared_jfr_->jfc, false);
 
-  // credit_pool 桩初始化
-  credit_idle_.store(config_.rx_depth);
-  credit_allocated_.store(0);
+  // credit_pool 从选定的 JFR 获取(非拥有,仅展示用)
+  credit_idle_.store(io_shared_jfr_->credit_idle.load(std::memory_order_relaxed),
+                     std::memory_order_relaxed);
+  credit_allocated_.store(io_shared_jfr_->credit_allocated.load(std::memory_order_relaxed),
+                          std::memory_order_relaxed);
 
-  valid_ = true;  // 全部资源创建成功
+  valid_ = true;
+  XLOG(INFO) << "UrmaSharedJfr: bound to io_jfr[" << io_jfr_index_
+             << "] fc_jfr[" << fc_jfr_index_ << "]";
 }
 
 UrmaSharedJfr::~UrmaSharedJfr() {
-  // 参照 brpc urma_helper.cpp:624-628:
-  // 不在析构中删除 URMA 硬件资源(JFR/JFC/JFCE/jetty)
-  // 原因:
-  // 1. jetty 可能仍引用 JFR(share_jfr=1),urma_delete_jfr 会阻塞等待解绑
-  // 2. urma_delete_jfc 会阻塞等待所有 CQE 被消费
-  // 3. 进程退出时内核自动回收所有 URMA 资源
-  // 仅清理 CqHandler(从 EventBase epoll 注销)
   if (io_cq_handler_) {
     delete io_cq_handler_;
     io_cq_handler_ = nullptr;
@@ -183,139 +92,66 @@ UrmaSharedJfr::~UrmaSharedJfr() {
     delete fc_cq_handler_;
     fc_cq_handler_ = nullptr;
   }
-  // JFR/JFC/JFCE 不删除——依赖进程退出时内核回收
-  // RX buffer 也不释放——MR 内存池在进程退出时由 munmap 回收
-}
-
-void UrmaSharedJfr::replenishRxBuf(uint32_t slot) noexcept {
-  if (slot >= rx_bufs_.size()) return;
-  urma_jfr_wr_t* bad_wr = nullptr;
-  urma_status_t ret = urma_post_jfr_wr(io_jfr_, &rx_bufs_[slot].wr, &bad_wr);
-  if (ret != URMA_SUCCESS) {
-    XLOG(WARN) << "UrmaSharedJfr: replenishRxBuf post failed at slot "
-               << slot << ", status=" << ret;
-  }
-}
-
-void UrmaSharedJfr::fillFcRxBuf() noexcept {
-  // Phase 4: 补充 FC RX buffer
+  // JFR/JFC/JFCE 由 UrmaJfrPool 管理,不在此删除
 }
 
 void UrmaSharedJfr::pollAndDispatch() noexcept {
-  urma_jfc_t* wait_jfcs[1] = {io_jfc_};
-  int wait_ret = urma_wait_jfc(io_jfce_, 1, 0, wait_jfcs);
-  if (wait_ret < 0) {
-    XLOG(ERR) << "UrmaSharedJfr: urma_wait_jfc failed, ret=" << wait_ret;
-    urma_rearm_jfc(io_jfc_, false);
-    return;
-  }
-  urma_cr_t cr[POLL_BATCH_MAX];
-  int n;
-  while ((n = urma_poll_jfc(io_jfc_, POLL_BATCH_MAX, cr)) > 0) {
-    for (int i = 0; i < n; ++i) {
-      uint32_t slot = static_cast<uint32_t>(cr[i].user_ctx);
-      void* recv_buf = rx_bufs_[slot].data;
-      uint32_t recv_len = cr[i].completion_len;
-
-      // Phase 3: 兼容两种接收路径
-      // 1) SEND_IMM 控制包(Phase 5 前仍保留):无 header,用 imm_data + remote_id 路由
-      // 2) headroom 路由(Phase 3 新增):recv buffer 前 64B 含 UrmaMsgHeader
-      if (cr[i].opcode == URMA_CR_OPC_SEND_WITH_IMM) {
-        // 旧版 SEND_IMM 控制包:imm_data 编码 msg_id|is_ctl|data_size
-        // RX buffer 含 8 字节 meta(remote_va for PULL)
-        auto it = socket_map_.find(cr[i].remote_id.id);
-        if (it == socket_map_.end()) {
-          replenishRxBuf(slot);
-          continue;
-        }
-        it->second->onControlMsg(cr[i].imm_data, recv_buf);
-        replenishRxBuf(slot);
-        recharge();
-        continue;
-      }
-
-      // Phase 3: headroom 路由 — 从 recv buffer 前 64B 解析 UrmaMsgHeader
-      auto* hdr = parseHeader(recv_buf);
-      if (!hdr) {
-        XLOG(WARN) << "[URMA] pollAndDispatch: header magic mismatch, slot="
-                   << slot << " recv_len=" << recv_len;
-        replenishRxBuf(slot);
-        continue;
-      }
-
-      // 当前阶段仍用 socket_map_ 过渡(Phase 4 JFR 池化后改为全局 Socket::Address)
-      auto it = socket_map_.find(cr[i].remote_id.id);
-      if (it == socket_map_.end()) {
-        replenishRxBuf(slot);
-        continue;
-      }
-      UrmaAsyncSocket* socket = it->second;
-
-      // 统一通过 onIoMessageReceived 分发(header.type 决定处理路径)
-      socket->onIoMessageReceived(recv_buf, recv_len, slot);
-
-      // 补投 recv WR
-      // 注意:onRxBuf 路径中 IOBuf::wrapBuffer 不 takeOwnership,recv_buf 归属不变
-      // Phase 4 改为 takeOwnership 零拷贝后此处调整
-      replenishRxBuf(slot);
-      recharge();
-    }
-  }
-  // poll 后 ack + rearm(参照 brpc: poll → ack → rearm)
-  urma_jfc_t* ack_jfcs[1] = {io_jfc_};
-  uint32_t nevents[1] = {static_cast<uint32_t>(wait_ret > 0 ? wait_ret : 0)};
-  if (nevents[0] > 0) {
-    urma_ack_jfc(ack_jfcs, nevents, 1);
-  }
-  urma_status_t rearm_ret = urma_rearm_jfc(io_jfc_, false);
-  if (rearm_ret != URMA_SUCCESS) {
-    XLOG(ERR) << "UrmaSharedJfr: urma_rearm_jfc(io) failed, status=" << rearm_ret;
+  // 委托给 UrmaJfrPool::pollAndDispatch(selected io jfr)
+  if (io_shared_jfr_) {
+    UrmaJfrPool::get()->pollAndDispatch(io_shared_jfr_);
   }
 }
 
 void UrmaSharedJfr::pollFcAndDispatch() noexcept {
-  // Phase 4: 完整 FC 消息处理
-  // 同 pollAndDispatch: wait_jfc → poll → ack → rearm
-  urma_jfc_t* wait_jfcs[1] = {fc_jfc_};
-  int wait_ret = urma_wait_jfc(fc_jfce_, 1, 0, wait_jfcs);
-  if (wait_ret < 0) {
-    XLOG(ERR) << "UrmaSharedJfr: urma_wait_jfc(fc) failed, ret=" << wait_ret;
-    urma_status_t err_rearm = urma_rearm_jfc(fc_jfc_, false);
-    if (err_rearm != URMA_SUCCESS) {
-      XLOG(ERR) << "UrmaSharedJfr: urma_rearm_jfc(fc) failed, status=" << err_rearm;
-    }
-    return;
+  if (fc_shared_jfr_) {
+    UrmaJfrPool::get()->pollFcAndDispatch(fc_shared_jfr_);
   }
-  urma_cr_t cr[POLL_BATCH_MAX];
-  int n;
-  while ((n = urma_poll_jfc(fc_jfc_, POLL_BATCH_MAX, cr)) > 0) {
-    (void)n;  // Phase 4 处理 FC CQE
-  }
-  urma_jfc_t* ack_jfcs[1] = {fc_jfc_};
-  uint32_t nevents[1] = {static_cast<uint32_t>(wait_ret > 0 ? wait_ret : 0)};
-  if (nevents[0] > 0) {
-    urma_ack_jfc(ack_jfcs, nevents, 1);
-  }
-  urma_status_t rearm_ret = urma_rearm_jfc(fc_jfc_, false);
-  if (rearm_ret != URMA_SUCCESS) {
-    XLOG(ERR) << "UrmaSharedJfr: urma_rearm_jfc(fc) failed, status=" << rearm_ret;
+}
+
+void UrmaSharedJfr::recharge() noexcept {
+  if (io_shared_jfr_) {
+    UrmaJfrPool::get()->recharge(io_shared_jfr_);
   }
 }
 
 void UrmaSharedJfr::registerSocket(uint32_t jetty_id, UrmaAsyncSocket* socket) {
-  socket_map_[jetty_id] = socket;
+  if (auto* pool = UrmaJfrPool::get()) {
+    pool->registerSocket(jetty_id, socket);
+  }
 }
 
 void UrmaSharedJfr::unregisterSocket(uint32_t jetty_id) {
-  socket_map_.erase(jetty_id);
+  if (auto* pool = UrmaJfrPool::get()) {
+    pool->unregisterSocket(jetty_id);
+  }
 }
 
 void UrmaSharedJfr::registerFcSocket(uint32_t fc_jetty_id, UrmaAsyncSocket* socket) {
-  fc_socket_map_[fc_jetty_id] = socket;
+  if (auto* pool = UrmaJfrPool::get()) {
+    pool->registerFcSocket(fc_jetty_id, socket);
+  }
 }
 
 void UrmaSharedJfr::unregisterFcSocket(uint32_t fc_jetty_id) {
-  fc_socket_map_.erase(fc_jetty_id);
+  if (auto* pool = UrmaJfrPool::get()) {
+    pool->unregisterFcSocket(fc_jetty_id);
+  }
+}
+
+urma_jfr_t* UrmaSharedJfr::ioJfr() const noexcept {
+  return io_shared_jfr_ ? io_shared_jfr_->jfr : nullptr;
+}
+
+urma_jfc_t* UrmaSharedJfr::ioJfc() const noexcept {
+  return io_shared_jfr_ ? io_shared_jfr_->jfc : nullptr;
+}
+
+urma_jfr_t* UrmaSharedJfr::fcJfr() const noexcept {
+  return fc_shared_jfr_ ? fc_shared_jfr_->jfr : nullptr;
+}
+
+urma_jfc_t* UrmaSharedJfr::fcJfc() const noexcept {
+  return fc_shared_jfr_ ? fc_shared_jfr_->jfc : nullptr;
 }
 
 } // namespace folly

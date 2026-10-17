@@ -20,6 +20,7 @@
 #include <folly/io/async/urma/UrmaSharedJfr.h>
 #include <folly/io/async/urma/UrmaInit.h>
 #include <folly/io/async/urma/UrmaJfsPool.h>
+#include <folly/io/async/urma/UrmaJfrPool.h>
 #include <folly/io/async/urma/UrmaImportCache.h>
 #include <folly/io/async/urma/UrmaHeader.h>
 #include <folly/logging/xlog.h>
@@ -993,13 +994,15 @@ void UrmaAsyncSocket::shutdownWriteNow() {
 }
 
 void UrmaAsyncSocket::destroyUrmaResources() {
-  // Phase 2: 不再删除 tx_cq_handler_(TX CQE 由全局 JFS 池 CqHandler 处理)
-  if (shared_) {
-    if (res_.remote_jetty) {
-      shared_->unregisterSocket(res_.remote_jetty->id.id);
+  // Phase 4: 路由表注销直接调 UrmaJfrPool(不依赖 shared_,避免 EventBase 析构后悬空)
+  if (res_.remote_jetty) {
+    if (auto* pool = UrmaJfrPool::get()) {
+      pool->unregisterSocket(res_.remote_jetty->id.id);
     }
-    if (res_.remote_fc_jetty) {
-      shared_->unregisterFcSocket(res_.remote_fc_jetty->id.id);
+  }
+  if (res_.remote_fc_jetty) {
+    if (auto* pool = UrmaJfrPool::get()) {
+      pool->unregisterFcSocket(res_.remote_fc_jetty->id.id);
     }
   }
   pending_big_msg_.clear();

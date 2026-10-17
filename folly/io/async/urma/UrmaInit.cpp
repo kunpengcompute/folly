@@ -15,6 +15,7 @@
 #include <folly/memory/IoBufPool.h>
 #include <folly/logging/xlog.h>
 #include <folly/io/async/urma/UrmaJfsPool.h>
+#include <folly/io/async/urma/UrmaJfrPool.h>
 
 #include <cstring>
 #include <mutex>
@@ -339,7 +340,25 @@ void UrmaInit::init(const UrmaConfig& config) {
   // 必须在 setIoBufBlockAllocFree 之前设置,使后续所有 block 分配都预留 headroom
   g_urma_headroom.store(kUrmaHeadroom, std::memory_order_release);
 
-  // 9. folly IOBuf 注入(三步)
+  // 9. JFR 池(进程级共享,设计 §3)
+  // 创建 io_jfr_count 个 IO JFR + fc_jfr_count 个 FC JFR
+  // 替代 per-EventBase JFR,所有 UrmaSharedJfr 共享
+  auto* jfr_pool = new UrmaJfrPool();
+  if (!jfr_pool->init(s_ctx, s_config)) {
+    XLOG(ERR) << "UrmaInit: JFR pool init failed, URMA disabled";
+    delete jfr_pool;
+    if (UrmaJfsPool* jpool = UrmaJfsPool::get()) {
+      jpool->fini();
+      delete jpool;
+    }
+    finiMrPool();
+    urma_delete_context(s_ctx);
+    s_ctx = nullptr;
+    urma_uninit();
+    return;
+  }
+
+  // 10. folly IOBuf 注入(三步)
   setIoBufBlockAllocFree(
       &UrmaInit::poolAlloc, &UrmaInit::poolFree, &UrmaInit::poolBufSize);
   IOBuf::enableMemoryPool();
@@ -352,7 +371,9 @@ void UrmaInit::init(const UrmaConfig& config) {
              << " headroom=" << kUrmaHeadroom
              << " pool_size=" << s_mmap_size
              << " io_jfs=" << s_config.io_jfs_count
-             << " fc_jfs=" << s_config.fc_jfs_count;
+             << " fc_jfs=" << s_config.fc_jfs_count
+             << " io_jfr=" << s_config.io_jfr_count
+             << " fc_jfr=" << s_config.fc_jfr_count;
 }
 
 void UrmaInit::fini() {
@@ -367,6 +388,12 @@ void UrmaInit::fini() {
 
   // JFS 池清理(仅清空列表,不删除硬件资源)
   if (UrmaJfsPool* pool = UrmaJfsPool::get()) {
+    pool->fini();
+    delete pool;
+  }
+
+  // JFR 池清理(仅清空列表,不删除硬件资源)
+  if (UrmaJfrPool* pool = UrmaJfrPool::get()) {
     pool->fini();
     delete pool;
   }
