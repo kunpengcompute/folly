@@ -74,6 +74,42 @@ struct SharedJfr {
   uint32_t rx_depth = 0;                      // credit_pool 逻辑总容量
 
   bool is_fc = false;  // FC JFR 标记
+
+  // std::atomic 不可拷贝,需显式定义移动构造/赋值以支持 vector::resize
+  SharedJfr() = default;
+  SharedJfr(SharedJfr&& o) noexcept
+      : jfr(o.jfr), jfc(o.jfc), jfce(o.jfce), jfce_fd(o.jfce_fd),
+        jetty_id(o.jetty_id),
+        rx_bufs(std::move(o.rx_bufs)),
+        recv_posted(o.recv_posted.load(std::memory_order_relaxed)),
+        next_free_slot(o.next_free_slot.load(std::memory_order_relaxed)),
+        watermark(o.watermark),
+        credit_idle(o.credit_idle.load(std::memory_order_relaxed)),
+        credit_allocated(o.credit_allocated.load(std::memory_order_relaxed)),
+        rx_depth(o.rx_depth), is_fc(o.is_fc) {
+    o.jfr = nullptr; o.jfc = nullptr; o.jfce = nullptr; o.jfce_fd = -1;
+  }
+  SharedJfr& operator=(SharedJfr&& o) noexcept {
+    if (this != &o) {
+      jfr = o.jfr; jfc = o.jfc; jfce = o.jfce; jfce_fd = o.jfce_fd;
+      jetty_id = o.jetty_id;
+      rx_bufs = std::move(o.rx_bufs);
+      recv_posted.store(o.recv_posted.load(std::memory_order_relaxed),
+                        std::memory_order_relaxed);
+      next_free_slot.store(o.next_free_slot.load(std::memory_order_relaxed),
+                           std::memory_order_relaxed);
+      watermark = o.watermark;
+      credit_idle.store(o.credit_idle.load(std::memory_order_relaxed),
+                        std::memory_order_relaxed);
+      credit_allocated.store(o.credit_allocated.load(std::memory_order_relaxed),
+                             std::memory_order_relaxed);
+      rx_depth = o.rx_depth; is_fc = o.is_fc;
+      o.jfr = nullptr; o.jfc = nullptr; o.jfce = nullptr; o.jfce_fd = -1;
+    }
+    return *this;
+  }
+  SharedJfr(const SharedJfr&) = delete;
+  SharedJfr& operator=(const SharedJfr&) = delete;
 };
 
 class UrmaJfrPool {
@@ -138,7 +174,6 @@ class UrmaJfrPool {
   };
   std::vector<JfrFdEntry> getAllJfrFds() const;
 
- private:
   UrmaJfrPool() = default;
   ~UrmaJfrPool() = default;
 

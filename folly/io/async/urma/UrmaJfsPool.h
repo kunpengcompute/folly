@@ -45,9 +45,26 @@ struct SharedJfs {
   std::atomic<uint32_t> sq_inflight{0};  // 当前 SQ 在途 WR 数(CAS 分配/释放)
   uint32_t sq_depth = 0;                 // SQ 深度(= config.tx_depth)
 
-  // round-robin 分配时的 CAS 目标:
-  //   acquire: sq_inflight.fetch_add(1) < sq_depth → 成功,否则回退
-  //   release: sq_inflight.fetch_sub(1)
+  // std::atomic 不可拷贝,需显式定义移动构造/赋值以支持 vector::resize
+  SharedJfs() = default;
+  SharedJfs(SharedJfs&& o) noexcept
+      : jfs(o.jfs), jfc(o.jfc), jfce(o.jfce), jfce_fd(o.jfce_fd),
+        sq_inflight(o.sq_inflight.load(std::memory_order_relaxed)),
+        sq_depth(o.sq_depth) {
+    o.jfs = nullptr; o.jfc = nullptr; o.jfce = nullptr; o.jfce_fd = -1;
+  }
+  SharedJfs& operator=(SharedJfs&& o) noexcept {
+    if (this != &o) {
+      jfs = o.jfs; jfc = o.jfc; jfce = o.jfce; jfce_fd = o.jfce_fd;
+      sq_inflight.store(o.sq_inflight.load(std::memory_order_relaxed),
+                        std::memory_order_relaxed);
+      sq_depth = o.sq_depth;
+      o.jfs = nullptr; o.jfc = nullptr; o.jfce = nullptr; o.jfce_fd = -1;
+    }
+    return *this;
+  }
+  SharedJfs(const SharedJfs&) = delete;
+  SharedJfs& operator=(const SharedJfs&) = delete;
 };
 
 class UrmaJfsPool {
@@ -110,7 +127,6 @@ class UrmaJfsPool {
   };
   std::vector<JfceFdEntry> getAllJfceFds() const;
 
- private:
   UrmaJfsPool() = default;
   ~UrmaJfsPool() = default;
 

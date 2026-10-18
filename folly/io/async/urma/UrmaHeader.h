@@ -50,7 +50,7 @@ struct __attribute__((packed)) UrmaMsgHeader {
   uint32_t data_size;       // data 字节数(不含 header)
   uint32_t data_sge_count;  // data SGE 个数(校验用)
   uint16_t sub_len[15];     // 子消息长度表(合并用,msg_count=1 时 sub_len[0]=data_size)
-  uint8_t  reserved[2];     // 凑齐 64B
+  uint8_t  reserved[10];    // 凑齐 64B
 };
 static_assert(sizeof(UrmaMsgHeader) == 64, "UrmaMsgHeader must be 64 bytes");
 
@@ -107,7 +107,6 @@ inline bool writeHeader(IOBuf* buf, uint64_t socket_id, uint16_t seq,
                         const uint16_t* sub_len, uint32_t data_size) {
   if (!buf) return false;
   // prepend(64): data 指针前移 64B 到 headroom 区
-  void* hdr_ptr = buf->precedingData();
   if (buf->headroom() < sizeof(UrmaMsgHeader)) {
     return false;
   }

@@ -76,7 +76,8 @@ urma_target_jetty_t* ImportedJettyCache::acquire(
     return nullptr;
   }
 
-  urma_target_jetty_t* target = urma_import_jetty(ctx, &rjetty, token);
+  urma_target_jetty_t* target = urma_import_jetty(ctx,
+      const_cast<urma_rjetty_t*>(&rjetty), token);
   if (!target) {
     XLOG(ERR) << "ImportedJettyCache: urma_import_jetty failed for jetty_id="
               << rjetty.jetty_id.id;
