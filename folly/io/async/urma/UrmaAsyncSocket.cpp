@@ -1096,21 +1096,207 @@ void UrmaAsyncSocket::onIoMessageReceived(void* recv_buf, uint32_t recv_len,
   }
 }
 
-// ── Phase 6: FC 消息接收(占位实现) ──
+// ── Phase 6: FC 消息接收 ──
 //
-// FC 消息路由通路已打通(UrmaJfrPool::harvestFcAndDispatch → fc_socket_map → 此方法)。
-// 完整的 REQ/REP/RETURN/ACK 消息处理在 Phase 6 后续补全:
-//   - REQ:对端申请 credit,检查 credit_idle → REP 授予
-//   - REP:对端授予 credit,credit_allocated += N
-//   - RETURN:对端归还 credit,credit_idle += N,credit_allocated -= N
-//   - ACK:对端确认归还(可选,用于可靠性)
-// 当前仅日志记录,避免阻塞 FC JFR 的 CQE 收割。
+// FC 消息路由通路:UrmaJfrPool::harvestFcAndDispatch → fc_socket_map → 此方法
+// payload 前 8B = 发送方 SocketId,后续 8B = FcHeader(msg_type/credit_cnt/fc_seq)
+// 按 msg_type 分发到 handleFcReq/handleFcRep/handleFcReturn/handleFcAck
 
 void UrmaAsyncSocket::onFcMessageReceived(void* recv_buf,
                                             uint32_t recv_len) noexcept {
-  if (!recv_buf || recv_len < sizeof(uint64_t)) return;
-  XLOG(DBG) << "[URMA-FC] onFcMessageReceived: recv_len=" << recv_len
-            << " this=" << this;
+  if (!recv_buf || recv_len < FC_MSG_LEN) {
+    XLOG(WARN) << "[URMA-FC] recv too short: recv_len=" << recv_len;
+    return;
+  }
+
+  uint64_t peer_socket_id = 0;
+  UrmaFcMsgType type;
+  uint16_t credit_cnt = 0;
+  uint16_t fc_seq = 0;
+  if (!deserializeFcMsg(recv_buf, peer_socket_id, type, credit_cnt, fc_seq)) {
+    return;
+  }
+
+  XLOG(DBG) << "[URMA-FC] onFcMessageReceived: type=" << static_cast<int>(type)
+            << " credit_cnt=" << credit_cnt << " fc_seq=" << fc_seq
+            << " peer_socket_id=0x" << std::hex << peer_socket_id << std::dec;
+
+  switch (type) {
+    case FC_REQ:
+      handleFcReq(peer_socket_id, credit_cnt, fc_seq);
+      break;
+    case FC_REP:
+      handleFcRep(credit_cnt, fc_seq);
+      break;
+    case FC_RETURN:
+      handleFcReturn(peer_socket_id, credit_cnt, fc_seq);
+      break;
+    case FC_ACK:
+      handleFcAck(credit_cnt, fc_seq);
+      break;
+    default:
+      XLOG(WARN) << "[URMA-FC] unknown msg_type=" << static_cast<int>(type);
+      break;
+  }
+}
+
+// ── Phase 6: FC REQ 处理(接收方) ──
+// 对端申请 credit,从 credit_idle 扣减后回复 REP 授予
+// 去重:fc_seq 与 fc_last_req_seq 相同则跳过(防止 REQ 重发重复授信)
+
+void UrmaAsyncSocket::handleFcReq(uint64_t peer_socket_id, uint16_t credit_cnt,
+                                    uint16_t fc_seq) noexcept {
+  // 去重:同一 REQ 序列号只处理一次
+  uint16_t last_seq = fc_state_.fc_last_req_seq.load(std::memory_order_acquire);
+  if (fc_seq == last_seq && last_seq != 0) {
+    XLOG(DBG) << "[URMA-FC] dup REQ fc_seq=" << fc_seq << ", skip";
+    return;
+  }
+  fc_state_.fc_last_req_seq.store(fc_seq, std::memory_order_release);
+
+  // 从 per-JFR credit_idle 扣减(通过 UrmaJfrPool)
+  // 授予数量 = min(请求量, credit_idle)
+  uint32_t granted = 0;
+  if (auto* pool = UrmaJfrPool::get()) {
+    if (auto* jfr = pool->getIoJfrByIndex(0)) {  // 简化:用第一个 IO JFR
+      uint32_t idle = jfr->credit_idle.load(std::memory_order_acquire);
+      uint32_t to_grant = std::min(static_cast<uint32_t>(credit_cnt), idle);
+      if (to_grant > 0) {
+        // 原子扣减 credit_idle
+        uint32_t cur = idle;
+        while (cur >= to_grant) {
+          if (jfr->credit_idle.compare_exchange_weak(
+                  cur, cur - to_grant,
+                  std::memory_order_acq_rel, std::memory_order_acquire)) {
+            granted = to_grant;
+            break;
+          }
+        }
+      }
+      // credit_allocated += granted
+      if (granted > 0) {
+        jfr->credit_allocated.fetch_add(granted, std::memory_order_release);
+      }
+    }
+  }
+
+  fc_state_.peer_granted.fetch_add(granted, std::memory_order_acq_rel);
+
+  XLOG(DBG) << "[URMA-FC] REQ: requested=" << credit_cnt
+            << " granted=" << granted;
+
+  // 回复 REP(授予 credit)
+  if (granted > 0) {
+    uint16_t rep_seq = fc_state_.fc_seq_next.fetch_add(1, std::memory_order_relaxed);
+    sendFcMsg(FC_REP, static_cast<uint16_t>(granted), rep_seq);
+  }
+}
+
+// ── Phase 6: FC REP 处理(发送方) ──
+// 对端授予 credit,增加 peer_credit,唤醒 pending_write_
+
+void UrmaAsyncSocket::handleFcRep(uint16_t credit_cnt, uint16_t fc_seq) noexcept {
+  fc_state_.peer_credit.fetch_add(credit_cnt, std::memory_order_acq_rel);
+  XLOG(DBG) << "[URMA-FC] REP: granted=" << credit_cnt
+            << " peer_credit=" << fc_state_.peer_credit.load();
+
+  // 唤醒 pending_write_(credit 到位后可继续发送)
+  if (evb_) {
+    evb_->runInLoop([this] { handlePendingWrites(); });
+  }
+}
+
+// ── Phase 6: FC RETURN 处理(接收方) ──
+// 对端归还 credit,credit_idle += N,credit_allocated -= N
+
+void UrmaAsyncSocket::handleFcReturn(uint64_t peer_socket_id,
+                                       uint16_t credit_cnt,
+                                       uint16_t fc_seq) noexcept {
+  if (auto* pool = UrmaJfrPool::get()) {
+    if (auto* jfr = pool->getIoJfrByIndex(0)) {
+      jfr->credit_idle.fetch_add(credit_cnt, std::memory_order_release);
+      jfr->credit_allocated.fetch_sub(credit_cnt, std::memory_order_acq_rel);
+    }
+  }
+  fc_state_.peer_granted.fetch_sub(credit_cnt, std::memory_order_acq_rel);
+
+  XLOG(DBG) << "[URMA-FC] RETURN: returned=" << credit_cnt;
+
+  // 回复 ACK(确认归还)
+  uint16_t ack_seq = fc_state_.fc_seq_next.fetch_add(1, std::memory_order_relaxed);
+  sendFcMsg(FC_ACK, credit_cnt, ack_seq);
+}
+
+// ── Phase 6: FC ACK 处理(发送方) ──
+// 对端确认归还(可选,用于可靠性,当前仅日志)
+
+void UrmaAsyncSocket::handleFcAck(uint16_t credit_cnt,
+                                    uint16_t fc_seq) noexcept {
+  XLOG(DBG) << "[URMA-FC] ACK: confirmed=" << credit_cnt;
+}
+
+// ── Phase 6: FC 消息发送(通过 FC JFS 池) ──
+// 序列化 16B FC 消息 → acquireFcJfs → post SEND
+// 目标 jetty:res_.remote_fc_jetty(握手时 importPeer 创建)
+
+bool UrmaAsyncSocket::sendFcMsg(UrmaFcMsgType type, uint16_t credit_cnt,
+                                  uint16_t fc_seq) noexcept {
+  if (state_ != State::kOpen) return false;
+  if (!res_.remote_fc_jetty) {
+    XLOG(WARN) << "[URMA-FC] sendFcMsg: no remote_fc_jetty";
+    return false;
+  }
+
+  UrmaJfsPool* pool = UrmaJfsPool::get();
+  if (!pool) return false;
+
+  uint32_t fc_jfs_index = 0;
+  SharedJfs* fc_jfs = pool->acquireFcJfs(&fc_jfs_index);
+  if (!fc_jfs) {
+    XLOG(DBG) << "[URMA-FC] acquireFcJfs failed (SQ full)";
+    return false;
+  }
+
+  // 序列化 FC 消息到 fc_send_buf_
+  serializeFcMsg(fc_send_buf_, socket_id_.toUint64(), type, credit_cnt, fc_seq);
+
+  // 构造 SGE + WR
+  auto sge_arr = std::make_shared<std::vector<urma_sge_t>>(1);
+  (*sge_arr)[0].addr = reinterpret_cast<uint64_t>(fc_send_buf_);
+  (*sge_arr)[0].len = FC_MSG_LEN;
+  (*sge_arr)[0].tseg = UrmaInit::getPoolTseg();
+
+  // per-WR context(FC 消息无数据 block 需持有,send_data 留空)
+  auto* tx_ctx = new TxCompletionCtx();
+  tx_ctx->socket_id = socket_id_.toUint64();
+  tx_ctx->seq = fc_seq;
+  tx_ctx->type = TxCompletionCtx::MSG_CTRL_PULL;  // 复用控制包类型(FC CQE 回收路径相同)
+  tx_ctx->jfs_index = fc_jfs_index;
+  tx_ctx->msg_id = 0;
+  tx_ctx->sge_arr = sge_arr;
+
+  urma_jfs_wr_t wr = {};
+  wr.opcode = URMA_OPC_SEND;
+  wr.tjetty = res_.remote_fc_jetty;
+  wr.flag.bs.complete_enable = 1;
+  wr.send.src.sge = sge_arr->data();
+  wr.send.src.num_sge = 1;
+  wr.user_ctx = reinterpret_cast<uint64_t>(tx_ctx);
+  wr.next = nullptr;
+
+  urma_jfs_wr_t* bad_wr = nullptr;
+  urma_status_t ret = urma_post_jfs_wr(fc_jfs->jfs, &wr, &bad_wr);
+  if (ret != URMA_SUCCESS) {
+    XLOG(WARN) << "[URMA-FC] post_jfs_wr failed: " << ret;
+    pool->releaseFcJfs(fc_jfs_index);
+    delete tx_ctx;
+    return false;
+  }
+
+  // 武装 FC TX JFCE 中断(SQ 可能满,等待 CQE 唤醒)
+  pool->rearmAllFcTxFce();
+
+  return true;
 }
 
 // ── 接收(普通 SEND 数据) ──

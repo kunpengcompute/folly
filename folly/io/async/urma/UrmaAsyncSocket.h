@@ -43,6 +43,7 @@
 #include <folly/io/async/urma/UrmaJfsPool.h>
 #include <folly/io/async/urma/UrmaJfrPool.h>
 #include <folly/io/async/urma/UrmaHeader.h>
+#include <folly/io/async/urma/UrmaFlowControl.h>
 #include <ub/umdk/urma/urma_api.h>
 
 namespace folly {
@@ -144,6 +145,18 @@ class UrmaAsyncSocket : public AsyncTransport {
   // recv_len: 实际接收字节数
   // 当前为占位实现,REQ/REP/RETURN/ACK 完整处理在 Phase 6 后续补全
   void onFcMessageReceived(void* recv_buf, uint32_t recv_len) noexcept;
+
+  // Phase 6: FC 消息处理(REQ/REP/RETURN/ACK)
+  void handleFcReq(uint64_t peer_socket_id, uint16_t credit_cnt,
+                    uint16_t fc_seq) noexcept;
+  void handleFcRep(uint16_t credit_cnt, uint16_t fc_seq) noexcept;
+  void handleFcReturn(uint64_t peer_socket_id, uint16_t credit_cnt,
+                       uint16_t fc_seq) noexcept;
+  void handleFcAck(uint16_t credit_cnt, uint16_t fc_seq) noexcept;
+
+  // Phase 6: FC 消息发送(通过 FC JFS 池)
+  bool sendFcMsg(UrmaFcMsgType type, uint16_t credit_cnt,
+                  uint16_t fc_seq) noexcept;
 
   // 性能优化:活跃 JFS 位图管理
   // sendChain acquireIoJfs 后调用,置位 + 计数+1
@@ -325,6 +338,13 @@ class UrmaAsyncSocket : public AsyncTransport {
   size_t bytes_written_{0};
   size_t bytes_received_{0};
   bool eor_tracking_{false};
+
+  // Phase 6: FC 流控状态(per-连接)
+  UrmaFcState fc_state_;
+
+  // Phase 6: FC 发送缓冲区(16B,复用避免每次分配)
+  // sendFcMsg 中序列化后 post 到 FC JFS
+  uint8_t fc_send_buf_[FC_MSG_LEN] __attribute__((aligned(16)));
 
   static constexpr int POLL_BATCH_MAX = 64;
 };

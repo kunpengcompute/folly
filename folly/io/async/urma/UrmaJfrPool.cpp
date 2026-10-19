@@ -382,6 +382,8 @@ void UrmaJfrPool::harvestTxAndDispatch() noexcept {
 
   constexpr int TX_POLL_BATCH = 32;
   urma_cr_t cr[TX_POLL_BATCH];
+
+  // ── IO JFS TX CQE 收割 ──
   uint32_t jfs_count = jfs_pool->ioJfsCount();
   for (uint32_t ji = 0; ji < jfs_count; ++ji) {
     SharedJfs* sj = jfs_pool->getIoJfsByIndex(ji);
@@ -410,6 +412,24 @@ void UrmaJfrPool::harvestTxAndDispatch() noexcept {
           jfs_pool->releaseIoJfs(tx_ctx->jfs_index);
           delete tx_ctx;
         }
+      }
+    }
+  }
+
+  // ── FC JFS TX CQE 收割(Phase 6) ──
+  // FC JFCE fd 未注册 epoll,与 IO JFS 同理用 RX 事件驱动收割
+  uint32_t fc_jfs_count = jfs_pool->fcJfsCount();
+  for (uint32_t ji = 0; ji < fc_jfs_count; ++ji) {
+    SharedJfs* sj = jfs_pool->getFcJfsByIndex(ji);
+    if (!sj || !sj->jfc) continue;
+    int n;
+    while ((n = urma_poll_jfc(sj->jfc, TX_POLL_BATCH, cr)) > 0) {
+      for (int i = 0; i < n; ++i) {
+        auto* tx_ctx = reinterpret_cast<TxCompletionCtx*>(cr[i].user_ctx);
+        if (!tx_ctx) continue;
+        // FC 消息 CQE:归还 sq_inflight + delete ctx
+        jfs_pool->releaseFcJfs(tx_ctx->jfs_index);
+        delete tx_ctx;
       }
     }
   }
