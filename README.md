@@ -41,7 +41,7 @@ fbthrift/
 ├── LICENSE
 ├── iouring.patch                   # Folly v1.1.0优化补丁文件
 ├──README.md                        # 项目介绍
-└──README_en.md                     # Project Introduction
+└──README_en.md                     # 项目介绍（英文）
 ```
 
 ## 版本说明
