@@ -139,6 +139,12 @@ class UrmaAsyncSocket : public AsyncTransport {
   // status: CQE 状态(URMA_CR_SUCCESS 或错误码)
   void handleRemoteReadCqe(uint16_t msg_id, urma_status_t status) noexcept;
 
+  // Phase 6: FC 消息接收入口(由 UrmaJfrPool::harvestFcAndDispatch 调用)
+  // recv_buf: payload 前 8B 携带对端 SocketId(无 64B headroom header)
+  // recv_len: 实际接收字节数
+  // 当前为占位实现,REQ/REP/RETURN/ACK 完整处理在 Phase 6 后续补全
+  void onFcMessageReceived(void* recv_buf, uint32_t recv_len) noexcept;
+
   // 性能优化:活跃 JFS 位图管理
   // sendChain acquireIoJfs 后调用,置位 + 计数+1
   void markActiveJfs(uint32_t jfs_index) {

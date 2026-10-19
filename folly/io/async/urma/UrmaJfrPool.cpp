@@ -415,32 +415,79 @@ void UrmaJfrPool::harvestTxAndDispatch() noexcept {
   }
 }
 
-// ── pollFcAndDispatch: FC JFR 的 CQE 处理(Phase 6 完整实现) ──
+// ── pollFcAndDispatch: FC JFR 的 CQE 处理 ──
+//
+// 与 pollAndDispatch 一致采用 epoll 事件驱动模式:
+// 不调用 urma_wait_jfc/urma_ack_jfc —— 它们在 epoll 驱动模式下多余且有害
+// (会消费并确认 JFCE 事件,与 edge-triggered rearm 语义冲突,导致 CQE 事件丢失,
+//  参见 IO JFR 的同类修复:4312us → 49us 的 P50 优化)。
+//
+// FC 消息路由(Phase 6):payload 前 8B 携带 SocketId(无 64B headroom header),
+// 用 fc_socket_map 路由到 UrmaAsyncSocket::onFcMessageReceived。
+//
+// 当前 FC 消息处理为占位实现(REQ/REP/RETURN/ACK 完整逻辑在 Phase 6 后续补全),
+// 仅回收 recv buffer slot,保证 FC JFR 的 RQ 不溢出。
 
 void UrmaJfrPool::pollFcAndDispatch(SharedJfr* jfr) noexcept {
   if (!jfr || !jfr->jfc) return;
 
-  urma_jfc_t* wait_jfcs[1] = {jfr->jfc};
-  int wait_ret = urma_wait_jfc(jfr->jfce, 1, 0, wait_jfcs);
-  if (wait_ret < 0) {
-    urma_rearm_jfc(jfr->jfc, false);
-    return;
-  }
+  // 第一次收割
+  (void)harvestFcAndDispatch(jfr);
 
+  // rearm(为下次 epoll 事件武装)
+  urma_rearm_jfc(jfr->jfc, false);
+
+  // edge-triggered 模式下 rearm 后再 poll 一次,防止 rearm 窗口期间到达的 CQE 漏掉
+  (void)harvestFcAndDispatch(jfr);
+}
+
+// 内部:收割 FC JFR 的 CQE 并路由(返回收割的 CQE 数)
+uint32_t UrmaJfrPool::harvestFcAndDispatch(SharedJfr* jfr) noexcept {
   constexpr int POLL_BATCH_MAX = 64;
   urma_cr_t cr[POLL_BATCH_MAX];
+  uint32_t repost_slots[POLL_BATCH_MAX];
+  uint32_t total_cqes = 0;
   int n;
   while ((n = urma_poll_jfc(jfr->jfc, POLL_BATCH_MAX, cr)) > 0) {
-    // Phase 6: FC 消息处理(REQ/REP/RETURN/ACK)
-    (void)n;
-  }
+    total_cqes += static_cast<uint32_t>(n);
+    int repost_cnt = 0;
+    for (int i = 0; i < n; ++i) {
+      uint32_t slot = static_cast<uint32_t>(cr[i].user_ctx);
+      void* recv_buf = jfr->rx_bufs[slot].data;
+      uint32_t recv_len = cr[i].completion_len;
 
-  urma_jfc_t* ack_jfcs[1] = {jfr->jfc};
-  uint32_t nevents[1] = {static_cast<uint32_t>(wait_ret > 0 ? wait_ret : 0)};
-  if (nevents[0] > 0) {
-    urma_ack_jfc(ack_jfcs, nevents, 1);
+      // FC 消息:payload 前 8B 携带 SocketId(无 64B headroom header)
+      if (recv_len < sizeof(uint64_t)) {
+        XLOG(WARN) << "[URMA-FC] recv too short, slot=" << slot
+                   << " recv_len=" << recv_len;
+        repost_slots[repost_cnt++] = slot;
+        continue;
+      }
+
+      uint64_t peer_socket_id = 0;
+      std::memcpy(&peer_socket_id, recv_buf, sizeof(uint64_t));
+
+      auto it = fc_socket_map_.find(peer_socket_id);
+      if (it == fc_socket_map_.end()) {
+        XLOG(DBG) << "[URMA-FC] fc_socket_map miss: peer_socket_id=0x"
+                   << std::hex << peer_socket_id << std::dec
+                   << " map_size=" << fc_socket_map_.size();
+        repost_slots[repost_cnt++] = slot;
+        continue;
+      }
+
+      // 分发到目标 UrmaAsyncSocket(Phase 6: REQ/REP/RETURN/ACK 完整处理)
+      // 当前为占位:仅日志记录,FC 消息路由通路已打通
+      it->second->onFcMessageReceived(recv_buf, recv_len);
+      repost_slots[repost_cnt++] = slot;
+    }
+
+    // 批量补投本批回收的 slot
+    if (repost_cnt > 0) {
+      postRecvWrBatch(jfr, repost_slots, repost_cnt);
+    }
   }
-  urma_rearm_jfc(jfr->jfc, false);
+  return total_cqes;
 }
 
 // ── 路由表 ──

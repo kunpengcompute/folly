@@ -200,6 +200,10 @@ class UrmaJfrPool {
   // (edge-triggered rearm 后必须再 poll 一次,防止漏 CQE)
   uint32_t harvestAndDispatch(SharedJfr* jfr) noexcept;
 
+  // 内部:收割 FC JFR 的 CQE 并按 payload 前 8B SocketId 路由(返回收割的 CQE 数)
+  // 被 pollFcAndDispatch 调用,与 harvestAndDispatch 同构但路由表为 fc_socket_map_
+  uint32_t harvestFcAndDispatch(SharedJfr* jfr) noexcept;
+
   std::vector<SharedJfr> io_jfr_list_;
   std::vector<SharedJfr> fc_jfr_list_;
 

@@ -1096,6 +1096,23 @@ void UrmaAsyncSocket::onIoMessageReceived(void* recv_buf, uint32_t recv_len,
   }
 }
 
+// ── Phase 6: FC 消息接收(占位实现) ──
+//
+// FC 消息路由通路已打通(UrmaJfrPool::harvestFcAndDispatch → fc_socket_map → 此方法)。
+// 完整的 REQ/REP/RETURN/ACK 消息处理在 Phase 6 后续补全:
+//   - REQ:对端申请 credit,检查 credit_idle → REP 授予
+//   - REP:对端授予 credit,credit_allocated += N
+//   - RETURN:对端归还 credit,credit_idle += N,credit_allocated -= N
+//   - ACK:对端确认归还(可选,用于可靠性)
+// 当前仅日志记录,避免阻塞 FC JFR 的 CQE 收割。
+
+void UrmaAsyncSocket::onFcMessageReceived(void* recv_buf,
+                                            uint32_t recv_len) noexcept {
+  if (!recv_buf || recv_len < sizeof(uint64_t)) return;
+  XLOG(DBG) << "[URMA-FC] onFcMessageReceived: recv_len=" << recv_len
+            << " this=" << this;
+}
+
 // ── 接收(普通 SEND 数据) ──
 
 void UrmaAsyncSocket::onRxBuf(std::unique_ptr<IOBuf> data) noexcept {
