@@ -18,6 +18,7 @@
 #include <folly/io/async/urma/UrmaInit.h>
 #include <folly/io/async/urma/UrmaAsyncSocket.h>
 #include <folly/io/async/urma/UrmaSharedJfr.h>
+#include <folly/io/async/urma/UrmaJfrPool.h>
 #include <folly/io/async/urma/UrmaImportCache.h>
 #include <folly/logging/xlog.h>
 
@@ -347,6 +348,17 @@ void UrmaHandshake::processRemoteHello(const v2_wire::HelloMessage& hello) {
     }
     local_hello_.socket_id = socket_->socket_id_.toUint64();
     importPeer(hello);
+    // 预注册 socket_map:客户端 ACK 后会立即发首包,服务端 registerSocket
+    // 必须在首包 CQE 到达 harvestAndDispatch 之前完成,否则 socket_map miss。
+    // 在 kWaitHello 阶段 peer_socket_id 已知,此处预注册消除竞态。
+    if (auto* jfr_pool = UrmaJfrPool::get()) {
+      if (socket_->res_.remote_jetty) {
+        jfr_pool->registerSocket(socket_->res_.peer_socket_id, socket_);
+      }
+      if (socket_->res_.remote_fc_jetty) {
+        jfr_pool->registerFcSocket(socket_->res_.peer_socket_id, socket_);
+      }
+    }
     // 发 Hello(通过 TCP fd)
     sendHello();
     // sendHello 内部设置 phase_ = kWaitAck 并启动超时
