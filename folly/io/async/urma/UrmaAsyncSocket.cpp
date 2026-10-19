@@ -363,6 +363,19 @@ urma_status_t UrmaAsyncSocket::sendChain(WriteCallback* cb,
     return URMA_FAIL;
   }
 
+  // Phase 6: inline 路径预留(设计 §4.5 inline 快速路径)
+  // 当 payload ≤ max_inline_len - 10(header 开销)时,走 inline SEND(零拷贝,无需 SGE)
+  // 当前硬件 max_inline_len=8,条件不满足,自动走 headroom 路径
+  // 未来硬件支持更大 inline 时,此条件自动启用
+  uint32_t max_inline_len = UrmaInit::getMaxJfsInlineLen();
+  if (chain && !chain->isChained() &&  // 单 IOBuf block
+      max_inline_len > 10 + sizeof(UrmaMsgHeader) &&
+      chain->length() <= max_inline_len - 10) {
+    // inline 快速路径(当前不可达,预留)
+    // 未来实现:post inline SEND,无需 acquireIoJfs/SGE
+    // 暂走 headroom 路径
+  }
+
   while (chain) {
     uint32_t sge_total = 0;
     int num_sge = 0;
