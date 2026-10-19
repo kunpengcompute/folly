@@ -51,7 +51,8 @@ void HelloMessage::serialize(void* buf) const {
   v64 = htobe64(seg_len);   memcpy(p, &v64, 8); p += 8;
   v32 = htonl(seg_token_id);memcpy(p, &v32, 4); p += 4;
   v32 = htonl(fc_jetty_id); memcpy(p, &v32, 4); p += 4;
-  // total = 4 + 86 = 90
+  v64 = htobe64(socket_id); memcpy(p, &v64, 8); p += 8;
+  // total = 4 + 94 = 98
 }
 
 void HelloMessage::deserialize(const void* buf) {
@@ -79,6 +80,7 @@ void HelloMessage::deserialize(const void* buf) {
   memcpy(&v64, p, 8); seg_len = be64toh(v64); p += 8;
   memcpy(&v32, p, 4); seg_token_id = ntohl(v32); p += 4;
   memcpy(&v32, p, 4); fc_jetty_id = ntohl(v32); p += 4;
+  memcpy(&v64, p, 8); socket_id = be64toh(v64); p += 8;
 }
 
 } // namespace v2_wire
@@ -135,6 +137,7 @@ void UrmaHandshake::start(ReadyCallback ready_cb, ErrorCallback error_cb) {
       memcpy(local_hello_.eid, UrmaInit::getLocalEid().raw, 16);
       local_hello_.uasid = ctx->uasid;
     }
+    local_hello_.socket_id = socket_->socket_id_.toUint64();
     sendHello();
   } else {
     // 服务端:等客户端 Hello
@@ -223,7 +226,8 @@ void UrmaHandshake::allocateResources() {
   io_cfg.jfs_cfg.max_inline_data = UrmaInit::getMaxJfsInlineLen();
   io_cfg.jfs_cfg.rnr_retry = URMA_DEFAULT_RNR_RETRY;
   io_cfg.jfs_cfg.err_timeout = URMA_DEFAULT_ERR_TIMEOUT;
-  // jfs_cfg.jfc 不设置(nullptr),jetty 内部 JFC 由 share_jfr 共享
+  // urma_jfs_cfg_t.jfc 是 [Required],必须指定。共享 JFR 的 JFC 复用即可
+  io_cfg.jfs_cfg.jfc = shared_->ioJfc();
   res.io_jetty = urma_create_jetty(ctx, &io_cfg);
   if (!res.io_jetty) {
     onHandshakeError("create io_jetty failed");
@@ -241,6 +245,7 @@ void UrmaHandshake::allocateResources() {
   fc_cfg.jfs_cfg.max_inline_data = UrmaInit::getMaxJfsInlineLen();
   fc_cfg.jfs_cfg.rnr_retry = URMA_DEFAULT_RNR_RETRY;
   fc_cfg.jfs_cfg.err_timeout = URMA_DEFAULT_ERR_TIMEOUT;
+  fc_cfg.jfs_cfg.jfc = shared_->fcJfc();
   res.fc_jetty = urma_create_jetty(ctx, &fc_cfg);
   if (!res.fc_jetty) {
     onHandshakeError("create fc_jetty failed");
@@ -251,6 +256,14 @@ void UrmaHandshake::allocateResources() {
 void UrmaHandshake::importPeer(const v2_wire::HelloMessage& hello) {
   urma_context_t* ctx = UrmaInit::getContext();
   auto& res = socket_->res_;
+
+  // 保存对端通告的 jetty_id(CQE remote_id 匹配用)
+  // urma_import_jetty 返回的 target->id.id 可能与对端真实 jetty_id 不同
+  // 接收侧 CQE 的 remote_id.id 是发送方的本地 jetty_id
+  res.peer_io_jetty_id = hello.jetty_id;
+  res.peer_fc_jetty_id = hello.fc_jetty_id;
+  // Phase 3: 保存对端 SocketId(headroom 路由用,接收方据此路由到本 socket)
+  res.peer_socket_id = hello.socket_id;
 
   // 构造 rjetty for IO(参照 brpc urma_endpoint.cpp:567-577)
   urma_rjetty_t rjetty = {};
@@ -332,6 +345,7 @@ void UrmaHandshake::processRemoteHello(const v2_wire::HelloMessage& hello) {
       memcpy(local_hello_.eid, UrmaInit::getLocalEid().raw, 16);
       local_hello_.uasid = ctx->uasid;
     }
+    local_hello_.socket_id = socket_->socket_id_.toUint64();
     importPeer(hello);
     // 发 Hello(通过 TCP fd)
     sendHello();

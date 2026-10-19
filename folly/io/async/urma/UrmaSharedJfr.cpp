@@ -114,27 +114,27 @@ void UrmaSharedJfr::recharge() noexcept {
   }
 }
 
-void UrmaSharedJfr::registerSocket(uint32_t jetty_id, UrmaAsyncSocket* socket) {
+void UrmaSharedJfr::registerSocket(uint64_t socket_id, UrmaAsyncSocket* socket) {
   if (auto* pool = UrmaJfrPool::get()) {
-    pool->registerSocket(jetty_id, socket);
+    pool->registerSocket(socket_id, socket);
   }
 }
 
-void UrmaSharedJfr::unregisterSocket(uint32_t jetty_id) {
+void UrmaSharedJfr::unregisterSocket(uint64_t socket_id) {
   if (auto* pool = UrmaJfrPool::get()) {
-    pool->unregisterSocket(jetty_id);
+    pool->unregisterSocket(socket_id);
   }
 }
 
-void UrmaSharedJfr::registerFcSocket(uint32_t fc_jetty_id, UrmaAsyncSocket* socket) {
+void UrmaSharedJfr::registerFcSocket(uint64_t socket_id, UrmaAsyncSocket* socket) {
   if (auto* pool = UrmaJfrPool::get()) {
-    pool->registerFcSocket(fc_jetty_id, socket);
+    pool->registerFcSocket(socket_id, socket);
   }
 }
 
-void UrmaSharedJfr::unregisterFcSocket(uint32_t fc_jetty_id) {
+void UrmaSharedJfr::unregisterFcSocket(uint64_t socket_id) {
   if (auto* pool = UrmaJfrPool::get()) {
-    pool->unregisterFcSocket(fc_jetty_id);
+    pool->unregisterFcSocket(socket_id);
   }
 }
 

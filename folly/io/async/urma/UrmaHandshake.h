@@ -35,8 +35,8 @@ class UrmaSharedJfr;
 namespace v2_wire {
 
 constexpr size_t MAGIC_STR_LEN = 4;
-constexpr size_t HELLO_BODY_LEN = 86;
-constexpr size_t HELLO_PACKET_LEN = MAGIC_STR_LEN + HELLO_BODY_LEN;  // 90
+constexpr size_t HELLO_BODY_LEN = 94;
+constexpr size_t HELLO_PACKET_LEN = MAGIC_STR_LEN + HELLO_BODY_LEN;  // 98
 constexpr uint16_t HELLO_V2_VERSION = 2;
 constexpr uint16_t IMPL_V2_VERSION = 1;
 
@@ -59,13 +59,14 @@ struct __attribute__((packed)) HelloMessage {
   uint64_t seg_len{0};
   uint32_t seg_token_id{0};
   uint32_t fc_jetty_id{0};
+  uint64_t socket_id{0};  // Phase 3: 本端 SocketId(headroom 路由用,接收方据此路由)
 
   void serialize(void* buf) const;
   void deserialize(const void* buf);
 };
 
 static_assert(sizeof(HelloMessage) == HELLO_BODY_LEN,
-              "HelloMessage must be 86 bytes");
+              "HelloMessage must be 94 bytes");
 
 } // namespace v2_wire
 

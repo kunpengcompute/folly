@@ -131,6 +131,24 @@ class UrmaAsyncSocket : public AsyncTransport {
   void pollTx() noexcept;
   void retryWrite() noexcept;
 
+  // 性能优化:活跃 JFS 位图管理
+  // sendChain acquireIoJfs 后调用,置位 + 计数+1
+  void markActiveJfs(uint32_t jfs_index) {
+    if (jfs_index >= kMaxJfsBitmap) return;
+    active_jfs_inflight_[jfs_index]++;
+    active_jfs_mask_ |= (1ULL << jfs_index);
+  }
+  // pollTx 回收 CQE 后调用,计数-1,归零则清位
+  void releaseActiveJfsSlot(uint32_t jfs_index) {
+    if (jfs_index >= kMaxJfsBitmap) return;
+    if (active_jfs_inflight_[jfs_index] > 0) {
+      active_jfs_inflight_[jfs_index]--;
+      if (active_jfs_inflight_[jfs_index] == 0) {
+        active_jfs_mask_ &= ~(1ULL << jfs_index);
+      }
+    }
+  }
+
   // 发送单个 IOBuf chain(多 SGE 合并 → post SEND,或 >4KB 走单边 READ)
   // big_deferred: 本调用有单边 READ 大包发出,writeSuccess 延迟到对端 FREE
   urma_status_t sendChain(WriteCallback* cb,
@@ -215,6 +233,14 @@ class UrmaAsyncSocket : public AsyncTransport {
   SocketId socket_id_{};
   // Phase 3: per-连接发送序列号(headroom header 中的 seq 字段)
   std::atomic<uint16_t> send_seq_{0};
+
+  // 性能优化:跟踪本连接活跃的 JFS 位图(避免 pollTx 遍历全部 64 个 JFS)
+  // sendChain acquireIoJfs 后置位;pollTx 回收 CQE 后若该 JFS 无本连接在途 WR 则清位
+  // 用 per-JFS 计数 active_jfs_inflight_[idx] 跟踪本连接在该 JFS 上的在途 WR 数
+  // 位图 + 计数数组长度按 io_jfs_count 上限 64 设计
+  static constexpr uint32_t kMaxJfsBitmap = 64;
+  uint64_t active_jfs_mask_{0};              // 位图:bit i 置位表示 JFS i 有本连接在途 WR
+  uint32_t active_jfs_inflight_[kMaxJfsBitmap]{0};  // per-JFS 本连接在途 WR 计数
 
   folly::IOBufQueue read_queue_;
 

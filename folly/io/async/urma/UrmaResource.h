@@ -69,6 +69,17 @@ struct UrmaResource {
   urma_target_jetty_t* remote_fc_jetty = nullptr;
   urma_target_seg_t* remote_seg = nullptr;
 
+  // ── 对端通告的 jetty_id(HelloMessage 里的值,CQE remote_id 匹配用) ──
+  // 注意:urma_import_jetty 返回的 target->id.id 可能与对端真实 jetty_id 不同
+  // 接收侧 CQE 的 remote_id.id 是发送方的本地 jetty_id,即对端 HelloMessage 里的值
+  uint32_t peer_io_jetty_id = 0;
+  uint32_t peer_fc_jetty_id = 0;
+
+  // ── 对端 SocketId(Phase 3 headroom 路由用) ──
+  // 接收方收到数据时,从 header.src_socket_id 路由到本 socket
+  // 注册时 key = peer_socket_id(对端发送时写入 header 的 src_socket_id)
+  uint64_t peer_socket_id = 0;
+
   // ── 共享层指针(非 owned,Phase 4 由 UrmaJfrPool 持有) ──
   urma_jfr_t* shared_io_jfr = nullptr;
   urma_jfc_t* shared_io_jfc = nullptr;

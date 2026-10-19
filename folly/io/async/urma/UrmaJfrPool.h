@@ -157,14 +157,14 @@ class UrmaJfrPool {
   }
 
   // ── 路由表(SocketId → UrmaAsyncSocket*) ──
-  // Phase 3 过渡:仍按 jetty_id 查表(Phase 5 改为 SocketId 全局路由)
-  void registerSocket(uint32_t jetty_id, UrmaAsyncSocket* socket);
-  void unregisterSocket(uint32_t jetty_id);
-  UrmaAsyncSocket* findSocket(uint32_t jetty_id);
+  // Phase 3: 按 header.src_socket_id 路由(对端发送时写入 header 的 SocketId)
+  void registerSocket(uint64_t socket_id, UrmaAsyncSocket* socket);
+  void unregisterSocket(uint64_t socket_id);
+  UrmaAsyncSocket* findSocket(uint64_t socket_id);
 
-  void registerFcSocket(uint32_t fc_jetty_id, UrmaAsyncSocket* socket);
-  void unregisterFcSocket(uint32_t fc_jetty_id);
-  UrmaAsyncSocket* findFcSocket(uint32_t fc_jetty_id);
+  void registerFcSocket(uint64_t socket_id, UrmaAsyncSocket* socket);
+  void unregisterFcSocket(uint64_t socket_id);
+  UrmaAsyncSocket* findFcSocket(uint64_t socket_id);
 
   // ── JFCE fd 注册(供 UrmaCqHandler 使用) ──
   struct JfrFdEntry {
@@ -187,6 +187,13 @@ class UrmaJfrPool {
 
   // post 单个 recv WR
   static bool postRecvWr(SharedJfr* jfr, uint32_t slot);
+  // 批量 post recv WR(用 WR 链表一次 urma_post_jfr_wr,摊薄系统调用)
+  static bool postRecvWrBatch(SharedJfr* jfr, const uint32_t* slots, uint32_t count);
+
+  // 内部:收割 CQE 并 headroom 路由分发(返回收割的 CQE 数)
+  // 被 pollAndDispatch 调用,rearm 后的二次 poll 也复用此函数
+  // (edge-triggered rearm 后必须再 poll 一次,防止漏 CQE)
+  uint32_t harvestAndDispatch(SharedJfr* jfr) noexcept;
 
   std::vector<SharedJfr> io_jfr_list_;
   std::vector<SharedJfr> fc_jfr_list_;
@@ -195,9 +202,9 @@ class UrmaJfrPool {
   std::atomic<uint32_t> io_rr_{0};
   std::atomic<uint32_t> fc_rr_{0};
 
-  // 路由表(Phase 3 过渡,Phase 5 改为 SocketId 全局路由)
-  std::unordered_map<uint32_t, UrmaAsyncSocket*> socket_map_;
-  std::unordered_map<uint32_t, UrmaAsyncSocket*> fc_socket_map_;
+  // 路由表(Phase 3: SocketId 全局路由)
+  std::unordered_map<uint64_t, UrmaAsyncSocket*> socket_map_;
+  std::unordered_map<uint64_t, UrmaAsyncSocket*> fc_socket_map_;
 
   bool inited_{false};
 };

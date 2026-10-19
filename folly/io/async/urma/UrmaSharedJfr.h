@@ -50,11 +50,11 @@ class UrmaSharedJfr {
   void pollFcAndDispatch() noexcept;
 
   // 路由表委托给 UrmaJfrPool(全局共享)
-  void registerSocket(uint32_t jetty_id, UrmaAsyncSocket* socket);
-  void unregisterSocket(uint32_t jetty_id);
+  void registerSocket(uint64_t socket_id, UrmaAsyncSocket* socket);
+  void unregisterSocket(uint64_t socket_id);
 
-  void registerFcSocket(uint32_t fc_jetty_id, UrmaAsyncSocket* socket);
-  void unregisterFcSocket(uint32_t fc_jetty_id);
+  void registerFcSocket(uint64_t socket_id, UrmaAsyncSocket* socket);
+  void unregisterFcSocket(uint64_t socket_id);
 
   EventBase* getEventBase() const noexcept { return evb_; }
 
