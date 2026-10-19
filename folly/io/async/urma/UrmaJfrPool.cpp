@@ -18,6 +18,8 @@
 #include <folly/io/async/urma/UrmaConfig.h>
 #include <folly/io/async/urma/UrmaHeader.h>
 #include <folly/io/async/urma/UrmaInit.h>
+#include <folly/io/async/urma/UrmaJfsPool.h>
+#include <folly/io/async/urma/UrmaResource.h>
 #include <folly/logging/xlog.h>
 
 namespace folly {
@@ -367,6 +369,50 @@ void UrmaJfrPool::pollAndDispatch(SharedJfr* jfr) noexcept {
 
   // edge-triggered 模式下 rearm 后再 poll 一次,防止 rearm 窗口期间到达的 CQE 漏掉
   (void)harvestAndDispatch(jfr);
+
+  // Phase 5: 顺带收割 TX CQE(JFS 池共享,TX JFCE fd 未注册 epoll)。
+  // 用 RX 事件驱动 TX CQE 收割,避免大包 READ CQE 无事件触发而饿死。
+  // 通过 tx_ctx->socket_id 路由到对应连接处理。
+  harvestTxAndDispatch();
+}
+
+void UrmaJfrPool::harvestTxAndDispatch() noexcept {
+  UrmaJfsPool* jfs_pool = UrmaJfsPool::get();
+  if (!jfs_pool) return;
+
+  constexpr int TX_POLL_BATCH = 32;
+  urma_cr_t cr[TX_POLL_BATCH];
+  uint32_t jfs_count = jfs_pool->ioJfsCount();
+  for (uint32_t ji = 0; ji < jfs_count; ++ji) {
+    SharedJfs* sj = jfs_pool->getIoJfsByIndex(ji);
+    if (!sj || !sj->jfc) continue;
+    int n;
+    while ((n = urma_poll_jfc(sj->jfc, TX_POLL_BATCH, cr)) > 0) {
+      for (int i = 0; i < n; ++i) {
+        auto* tx_ctx = reinterpret_cast<TxCompletionCtx*>(cr[i].user_ctx);
+        if (!tx_ctx) continue;
+
+        if (tx_ctx->type == TxCompletionCtx::MSG_READ) {
+          // READ CQE:通过 socket_id 路由到对应连接
+          UrmaAsyncSocket* peer = findSocket(tx_ctx->socket_id);
+          if (peer) {
+            peer->handleRemoteReadCqe(tx_ctx->msg_id, cr[i].status);
+          } else {
+            XLOG(WARN) << "[URMA] harvestTx: READ cqe for disconnected socket_id=0x"
+                       << std::hex << tx_ctx->socket_id << std::dec
+                       << " msg_id=" << tx_ctx->msg_id;
+          }
+          jfs_pool->releaseIoJfs(tx_ctx->jfs_index);
+          delete tx_ctx;
+        } else {
+          // MSG_DATA / MSG_CTRL_PULL / MSG_CTRL_FREE:
+          // 归还 sq_inflight + delete ctx → send_data 析构 → block 回收
+          jfs_pool->releaseIoJfs(tx_ctx->jfs_index);
+          delete tx_ctx;
+        }
+      }
+    }
+  }
 }
 
 // ── pollFcAndDispatch: FC JFR 的 CQE 处理(Phase 6 完整实现) ──

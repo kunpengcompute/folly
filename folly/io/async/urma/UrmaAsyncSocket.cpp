@@ -278,18 +278,20 @@ void UrmaAsyncSocket::writeChain(WriteCallback* cb, std::unique_ptr<IOBuf>&& cha
 
 void UrmaAsyncSocket::pollTx() noexcept {
   if (state_ != State::kOpen) return;
-  // 性能优化:只扫本连接活跃 JFS 位图(避免遍历全部 64 个 JFS)
-  // 位图为 0 时直接返回,零系统调用
   UrmaJfsPool* pool = UrmaJfsPool::get();
   if (!pool) return;
+  // 性能优化:只扫本连接活跃 JFS 位图(避免遍历全部 64 个 JFS)
+  // 位图为 0 时直接返回,零系统调用
+  // Phase 5: 跨连接的 TX CQE 收割由 UrmaJfrPool::harvestTxAndDispatch 负责
+  // (在 pollAndDispatch 中顺带收割所有 JFS 的 TX CQE 并路由)。
+  // pollTx 只负责收割本连接 mask 置位的 JFS 上的 CQE(本连接 post 的 SEND/CTRL)。
   if (active_jfs_mask_ == 0) return;
 
   urma_cr_t cr[POLL_BATCH_MAX];
-  // 遍历位图置位的 JFS
   uint64_t mask = active_jfs_mask_;
   while (mask) {
-    uint32_t ji = __builtin_ctzll(mask);  // 最低置位 bit 的索引
-    mask &= (mask - 1);                    // 清最低置位 bit
+    uint32_t ji = __builtin_ctzll(mask);
+    mask &= (mask - 1);
     SharedJfs* sj = pool->getIoJfsByIndex(ji);
     if (!sj || !sj->jfc) continue;
     int n;
@@ -298,30 +300,38 @@ void UrmaAsyncSocket::pollTx() noexcept {
         auto* tx_ctx = reinterpret_cast<TxCompletionCtx*>(cr[i].user_ctx);
         if (!tx_ctx) continue;
 
-        // 按消息类型处理
         if (tx_ctx->type == TxCompletionCtx::MSG_READ) {
-          // B-4: 校验 CQE msg_id,跳过旧 READ 的重复 CQE
-          if (tx_ctx->msg_id != pending_read_msg_id_) {
-            XLOG(WARN) << "[URMA] pollTx: stale READ cqe msg_id=" << tx_ctx->msg_id
-                       << " expect=" << pending_read_msg_id_;
-            // 旧 CQE:归还 sq_inflight + delete ctx
+          // READ CQE:本连接 post 的 READ(handleRemoteReadCqe 路由来的)
+          // 或其他连接 post 的 READ(本连接 mask 恰好置位此 JFS)
+          if (tx_ctx->socket_id == socket_id_.toUint64()) {
+            if (tx_ctx->msg_id != pending_read_msg_id_) {
+              releaseActiveJfsSlot(tx_ctx->jfs_index);
+              pool->releaseIoJfs(tx_ctx->jfs_index);
+              delete tx_ctx;
+              continue;
+            }
+            if (cr[i].status == URMA_CR_SUCCESS) {
+              onReadComplete();
+            } else {
+              onReadFailed(cr[i].status);
+            }
             releaseActiveJfsSlot(tx_ctx->jfs_index);
             pool->releaseIoJfs(tx_ctx->jfs_index);
             delete tx_ctx;
-            continue;
-          }
-          if (cr[i].status == URMA_CR_SUCCESS) {
-            onReadComplete();
           } else {
-            onReadFailed(cr[i].status);
+            // 其他连接的 READ CQE:路由到目标连接
+            UrmaAsyncSocket* peer = nullptr;
+            if (auto* jfr_pool = UrmaJfrPool::get()) {
+              peer = jfr_pool->findSocket(tx_ctx->socket_id);
+            }
+            if (peer) {
+              peer->handleRemoteReadCqe(tx_ctx->msg_id, cr[i].status);
+            }
+            pool->releaseIoJfs(tx_ctx->jfs_index);
+            delete tx_ctx;
           }
-          // READ CQE 处理完后归还 sq_inflight + delete ctx
-          releaseActiveJfsSlot(tx_ctx->jfs_index);
-          pool->releaseIoJfs(tx_ctx->jfs_index);
-          delete tx_ctx;
         } else {
           // MSG_DATA / MSG_CTRL_PULL / MSG_CTRL_FREE
-          // 归还 sq_inflight + delete ctx → send_data 析构 → block 回收
           releaseActiveJfsSlot(tx_ctx->jfs_index);
           pool->releaseIoJfs(tx_ctx->jfs_index);
           delete tx_ctx;
@@ -626,28 +636,44 @@ bool UrmaAsyncSocket::postControlPacket(uint16_t msg_id, uint64_t remote_va,
   }
   markActiveJfs(jfs_index);
 
-  // inline=1: 元数据(8 字节 remote_va)在栈上,NIC post 时内联拷贝,不走 DMA/MR
-  // 注意:meta_va 在栈上,post 返回后 NIC 已内联拷贝,栈变量可安全释放
-  uint64_t meta_va = remote_va;
+  // Phase 5: 控制包改用 headroom 小 SEND(替代 SEND_IMM)
+  // 构造 64B header(MSG_PULL_MEM) + 8B remote_va data
+  // header.seq = msg_id(接收侧 onIoMessageReceived 用 seq 作为 msg_id 匹配 READ/FREE)
+  auto hdr_buf = IOBuf::create(sizeof(UrmaMsgHeader) + sizeof(uint64_t));
+  hdr_buf->append(sizeof(UrmaMsgHeader) + sizeof(uint64_t));
+  auto* hdr = reinterpret_cast<UrmaMsgHeader*>(hdr_buf->writableData());
+  hdr->magic = URMA_MAGIC;
+  hdr->src_socket_id = socket_id_.toUint64();
+  hdr->seq = msg_id;  // 控制包用 msg_id 作为 seq(接收侧据此匹配)
+  hdr->type = MSG_PULL_MEM;
+  hdr->msg_count = 1;
+  hdr->data_size = data_size;
+  hdr->data_sge_count = 0;
+  std::memset(hdr->sub_len, 0, sizeof(hdr->sub_len));
+  std::memset(hdr->reserved, 0, sizeof(hdr->reserved));
+  // data 部分:8 字节 remote_va
+  std::memcpy(hdr_buf->writableData() + sizeof(UrmaMsgHeader),
+              &remote_va, sizeof(remote_va));
+
   auto sge_arr = std::make_shared<std::vector<urma_sge_t>>(1);
-  (*sge_arr)[0].addr = reinterpret_cast<uint64_t>(&meta_va);
-  (*sge_arr)[0].len = sizeof(uint64_t);
-  (*sge_arr)[0].tseg = nullptr;
+  (*sge_arr)[0].addr = reinterpret_cast<uint64_t>(hdr_buf->writableData());
+  (*sge_arr)[0].len = sizeof(UrmaMsgHeader) + sizeof(uint64_t);
+  (*sge_arr)[0].tseg = UrmaInit::getPoolTseg();
 
   auto* tx_ctx = new TxCompletionCtx();
   tx_ctx->type = TxCompletionCtx::MSG_CTRL_PULL;
+  tx_ctx->socket_id = socket_id_.toUint64();
   tx_ctx->jfs_index = jfs_index;
   tx_ctx->msg_id = msg_id;
   tx_ctx->sge_arr = sge_arr;
+  tx_ctx->send_data = std::move(*hdr_buf);  // 持有 buffer 到 TX CQE
 
   urma_jfs_wr_t wr = {};
-  wr.opcode = URMA_OPC_SEND_IMM;
+  wr.opcode = URMA_OPC_SEND;
   wr.tjetty = res_.remote_jetty;
   wr.flag.bs.complete_enable = 1;
-  wr.flag.bs.inline_flag = 1;
   wr.send.src.sge = sge_arr->data();
   wr.send.src.num_sge = 1;
-  wr.send.imm_data = encodeBigMsgImm(msg_id, kCtrlTypePull, data_size);
   wr.user_ctx = reinterpret_cast<uint64_t>(tx_ctx);
   wr.next = nullptr;
 
@@ -670,6 +696,10 @@ void UrmaAsyncSocket::onControlMsg(uint64_t imm, const void* meta) noexcept {
   uint8_t is_ctl;
   uint32_t data_size;
   decodeBigMsgImm(imm, msg_id, is_ctl, data_size);
+  XLOG(DBG) << "[URMA-DIAG] onControlMsg msg_id=" << msg_id
+             << " is_ctl=" << static_cast<int>(is_ctl)
+             << " data_size=" << data_size
+             << " has_pending_read=" << has_pending_read_;
 
   if (is_ctl == kCtrlTypeFree) {
     // 发送方收到 FREE:释放大 buffer。writeSuccess 只在组内全部大包 FREE 后回调一次
@@ -754,6 +784,7 @@ bool UrmaAsyncSocket::startRead(uint16_t msg_id, uint64_t remote_va,
 
   auto* tx_ctx = new TxCompletionCtx();
   tx_ctx->type = TxCompletionCtx::MSG_READ;
+  tx_ctx->socket_id = socket_id_.toUint64();  // Phase 5: 跨连接 pollTx 路由用
   tx_ctx->jfs_index = jfs_index;
   tx_ctx->msg_id = msg_id;
   tx_ctx->sge_arr = sge_arr;
@@ -785,6 +816,9 @@ bool UrmaAsyncSocket::startRead(uint16_t msg_id, uint64_t remote_va,
     XLOG(ERR) << "startRead: post READ failed, status=" << st << " msg_id=" << msg_id;
     return false;
   }
+  XLOG(DBG) << "[URMA-DIAG] startRead posted msg_id=" << msg_id
+             << " jfs_idx=" << jfs_index << " remote_va=0x" << std::hex
+             << remote_va << std::dec << " size=" << data_size;
   return true;
 }
 
@@ -793,11 +827,12 @@ void UrmaAsyncSocket::onReadComplete() noexcept {
     XLOG(WARN) << "[URMA] readDone: pending_read_buf_ already reset, skip";
     return;
   }
+  XLOG(DBG) << "[URMA-DIAG] onReadComplete msg_id=" << pending_read_msg_id_
+             << " len=" << pending_read_buf_->length();
   auto data = std::move(pending_read_buf_);
   pending_read_sge_.reset();
   has_pending_read_ = false;
   bytes_received_ += data->length();
-//              << " len=" << data->length();
 
   read_queue_.append(std::move(data));
   if (read_cb_) {
@@ -827,6 +862,35 @@ void UrmaAsyncSocket::onReadFailed(urma_status_t status) noexcept {
   drainRxPendingQueue();
 }
 
+void UrmaAsyncSocket::handleRemoteReadCqe(uint16_t msg_id,
+                                          urma_status_t status) noexcept {
+  // Phase 5: 处理其他连接 pollTx/harvestTxAndDispatch 收割到的本连接 READ CQE。
+  // JFS 池化后多连接共享 JFS,READ CQE 可能被其他连接的 poll 收割。
+  // 通过 tx_ctx->socket_id 路由到本连接调用此方法。
+  //
+  // 用 runInLoop 异步执行,避免在 harvestTxAndDispatch 调用栈中同步处理
+  // 导致递归(onReadComplete → deliverReadData → write → sendChain → pollTx)。
+  if (msg_id != pending_read_msg_id_) {
+    return;  // 不是当前等待的 READ,忽略(重复或过时 CQE)
+  }
+  if (!evb_) {
+    // 无 EventBase(不应发生),直接处理
+    if (status == URMA_CR_SUCCESS) {
+      onReadComplete();
+    } else {
+      onReadFailed(status);
+    }
+    return;
+  }
+  evb_->runInLoop([this, status] {
+    if (status == URMA_CR_SUCCESS) {
+      onReadComplete();
+    } else {
+      onReadFailed(status);
+    }
+  });
+}
+
 bool UrmaAsyncSocket::postFreeNotify(uint16_t msg_id) noexcept {
   if (!res_.remote_jetty) return false;
 
@@ -838,18 +902,41 @@ bool UrmaAsyncSocket::postFreeNotify(uint16_t msg_id) noexcept {
   if (!sj) return false;
   markActiveJfs(jfs_index);
 
+  // Phase 5: FREE 通知改用 headroom 小 SEND(替代 SEND_IMM)
+  // 构造 64B header(MSG_FREE),无 data
+  // header.seq = msg_id(复用对应 PULL_MEM 的 msg_id,发送方据此匹配释放)
+  auto hdr_buf = IOBuf::create(sizeof(UrmaMsgHeader));
+  hdr_buf->append(sizeof(UrmaMsgHeader));
+  auto* hdr = reinterpret_cast<UrmaMsgHeader*>(hdr_buf->writableData());
+  hdr->magic = URMA_MAGIC;
+  hdr->src_socket_id = socket_id_.toUint64();
+  hdr->seq = msg_id;  // 复用 PULL_MEM 的 msg_id
+  hdr->type = MSG_FREE;
+  hdr->msg_count = 1;
+  hdr->data_size = 0;
+  hdr->data_sge_count = 0;
+  std::memset(hdr->sub_len, 0, sizeof(hdr->sub_len));
+  std::memset(hdr->reserved, 0, sizeof(hdr->reserved));
+
+  auto sge_arr = std::make_shared<std::vector<urma_sge_t>>(1);
+  (*sge_arr)[0].addr = reinterpret_cast<uint64_t>(hdr_buf->writableData());
+  (*sge_arr)[0].len = sizeof(UrmaMsgHeader);
+  (*sge_arr)[0].tseg = UrmaInit::getPoolTseg();
+
   auto* tx_ctx = new TxCompletionCtx();
   tx_ctx->type = TxCompletionCtx::MSG_CTRL_FREE;
+  tx_ctx->socket_id = socket_id_.toUint64();
   tx_ctx->jfs_index = jfs_index;
   tx_ctx->msg_id = msg_id;
+  tx_ctx->sge_arr = sge_arr;
+  tx_ctx->send_data = std::move(*hdr_buf);  // 持有 buffer 到 TX CQE
 
   urma_jfs_wr_t wr = {};
-  wr.opcode = URMA_OPC_SEND_IMM;
+  wr.opcode = URMA_OPC_SEND;
   wr.tjetty = res_.remote_jetty;
   wr.flag.bs.complete_enable = 1;
-  wr.flag.bs.inline_flag = 1;  // ctrl packet inline
-  wr.send.src.num_sge = 0;
-  wr.send.imm_data = encodeBigMsgImm(msg_id, kCtrlTypeFree, 0);
+  wr.send.src.sge = sge_arr->data();
+  wr.send.src.num_sge = 1;
   wr.user_ctx = reinterpret_cast<uint64_t>(tx_ctx);
   wr.next = nullptr;
 
@@ -983,16 +1070,29 @@ void UrmaAsyncSocket::onIoMessageReceived(void* recv_buf, uint32_t recv_len,
     // 大包控制包(PULL):meta 在 data 部分(8 字节 remote_va)
     // 复用 onControlMsg,is_ctl=kCtrlTypePull,imm 编码 msg_id|is_ctl|data_size
     // msg_id 从 header seq 字段获取(Phase 5 保序后改用独立 msg_id)
+    XLOG(DBG) << "[URMA-DIAG] onIoMessageReceived MSG_PULL_MEM msg_id="
+               << hdr->seq << " data_size=" << hdr->data_size
+               << " data_len=" << data_len;
     uint64_t imm = encodeBigMsgImm(hdr->seq, kCtrlTypePull,
                                     hdr->data_size);
     onControlMsg(imm, data_ptr);
   } else if (hdr->type == MSG_FREE) {
     // 大包 FREE 通知:无 meta
+    XLOG(DBG) << "[URMA-DIAG] onIoMessageReceived MSG_FREE msg_id="
+               << hdr->seq;
     uint64_t imm = encodeBigMsgImm(hdr->seq, kCtrlTypeFree, 0);
     onControlMsg(imm, nullptr);
   } else {
     XLOG(WARN) << "[URMA] onIoMessageReceived: unknown type="
                << static_cast<int>(hdr->type);
+  }
+
+  // Phase 5: RX 处理后异步调度 pollTx,收割可能在途的 READ/SEND TX CQE。
+  // 大包流程中 startRead post 的 READ WR,其 CQE 需要在 pollTx 中收割。
+  // 用 runInLoop 异步调度,避免在 harvestAndDispatch 调用栈中同步 pollTx
+  // 导致递归(pollTx → onReadComplete → deliverReadData → write → pollTx)。
+  if (evb_) {
+    evb_->runInLoop([this] { pollTx(); });
   }
 }
 

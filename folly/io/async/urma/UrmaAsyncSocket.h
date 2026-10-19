@@ -41,6 +41,7 @@
 #include <folly/io/async/urma/UrmaConfig.h>
 #include <folly/io/async/urma/UrmaResource.h>
 #include <folly/io/async/urma/UrmaJfsPool.h>
+#include <folly/io/async/urma/UrmaJfrPool.h>
 #include <folly/io/async/urma/UrmaHeader.h>
 #include <ub/umdk/urma/urma_api.h>
 
@@ -130,6 +131,13 @@ class UrmaAsyncSocket : public AsyncTransport {
   // TX completion(由 UrmaCqHandler TX 模式调用)
   void pollTx() noexcept;
   void retryWrite() noexcept;
+
+  // Phase 5: 处理其他连接 pollTx 收割到的本连接 READ CQE
+  // JFS 池化后多连接共享 JFS,pollTx 可能收割到其他连接 post 的 READ CQE,
+  // 通过 tx_ctx->socket_id 路由到对应连接调用此方法
+  // msg_id: READ 的 msg_id(对应 PULL_MEM 的 seq)
+  // status: CQE 状态(URMA_CR_SUCCESS 或错误码)
+  void handleRemoteReadCqe(uint16_t msg_id, urma_status_t status) noexcept;
 
   // 性能优化:活跃 JFS 位图管理
   // sendChain acquireIoJfs 后调用,置位 + 计数+1

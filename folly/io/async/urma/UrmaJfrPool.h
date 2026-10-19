@@ -145,6 +145,11 @@ class UrmaJfrPool {
   void pollAndDispatch(SharedJfr* jfr) noexcept;
   void pollFcAndDispatch(SharedJfr* jfr) noexcept;
 
+  // Phase 5: TX CQE 全局收割(JFS 池共享,TX JFCE fd 未注册 epoll)。
+  // 在 pollAndDispatch 中顺带调用,用 RX 事件驱动 TX CQE 收割。
+  // 通过 tx_ctx->socket_id 路由到对应 UrmaAsyncSocket 处理。
+  void harvestTxAndDispatch() noexcept;
+
   // ── recv buffer 按需投递 ──
   // 补投 recv WR(水位线触发)
   void replenishRxBuf(SharedJfr* jfr, uint32_t slot) noexcept;
