@@ -1,5 +1,7 @@
 # API Reference
 
+<!-- md-trans-meta sourceCommit=8238e077500cf42ad004454abe733af1fc900534 translatedAt=2026-10-13T03:53:07.457Z pushedAt=2026-10-13T06:49:09.732Z -->
+
 ## Folly v1.1.0: IOBuf TLS Memory Pool APIs
 
 This document describes the IOBuf thread-local storage (TLS) memory pool APIs and lifecycle rules introduced in Folly v1.1.0. By default, this capability does not change the original allocation behavior. The pooled allocation path is entered only after `enableMemoryPool()` is called.
@@ -175,8 +177,8 @@ When a thread exits, `current_share` can release only the reference held by TLS 
 
 ## Folly v1.0.0: io_uring Hybrid Read/Write APIs
 
-> ![note](./public_sys-resources/icon-note.gif)**Note:**
->This section describes the hybrid `io_uring`  read/write APIs provided in Folly v1.0.0, separately from the IOBuf TLS memory pool introduced in Folly v1.1.0.
+> ![note](./public_sys-resources/icon-note.gif) **NOTE:**
+>This section covers the hybrid `io_uring` read/write APIs provided in Folly v1.0.0, documented independently of the IOBuf TLS memory pool in Folly v1.1.0.
 
 ### Folly v1.0.0：io_uring API Overview
 
@@ -209,10 +211,10 @@ void AsyncIoUringSocket::writeChain(
 |buf|IOBuf chain to be sent|Input|
 |flags|Write operation flags|Input|
 
-This function does not return a value. When `send` cannot continue sending data due to insufficient buffer space, it works with `PollWriteSqe` to monitor the writable event of the socket file descriptor and resumes sending after the socket becomes writable.
+This function has no return value. When `send` cannot continue sending due to insufficient buffer space, it works with `PollWriteSqe` to listen for the writable event on the socket file descriptor and resumes sending once the socket becomes writable.
 
 ## Change History
 
 | Version | Date | Description |
-| ---- | ---- | -- |
+|:---|:---|:---|
 | 01 | 2026-09-30 | This is the first official release. |

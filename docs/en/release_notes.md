@@ -1,5 +1,7 @@
 # Release Notes
 
+<!-- md-trans-meta sourceCommit=70e53fbff2954afd12d690b81046748fe2b1410a translatedAt=2026-10-13T03:53:30.361Z pushedAt=2026-10-13T07:43:34.310Z -->
+
 ## Version Requirements
 
 ### Product Versions
@@ -8,7 +10,7 @@
 |--|--|
 |Product name|Kunpeng BoostKit|
 |Product version|26.2.RC1|
-|Software name|Folly performance optimization patch|
+|Software name|Folly|
 |Package version|v1.1.0|
 
 ### OS, Compiler, and CPU
@@ -67,23 +69,11 @@ For details, see [Quick Start](./quick_start.md).
 
 ## Related Documentation
 
-### v1.1.0 Documentation
-
 |Document|Description|Delivery Form|
 |---|---|---|
-|[APT Reference](./api_reference.md)|Provides API usage instructions for the Folly v1.1.0 optimization features.|Open-source repository|
-|[Quick Start](./quick_start.md)|Provides entry-level guidance for compiling the optimized Folly version|Open-source repository.|
+|[API Reference](./api_reference.md)|Provides API usage instructions for the Folly v1.1.0 optimization features.|Open-source repository|
+|[Quick Start](./quick_start.md)|Provides entry-level guidance for compiling the optimized Folly version.|Open-source repository.|
 |[Release Notes](./release_notes.md)|Provides release information for the Folly optimization patch versions.|Open-source repository|
-
-### v1.0.0 Documentation
-
-The current documentation already incorporates the previous documentation.
-
-## Change History
-
-|Release|Date|Description|
-|:---|:---|:---|
-|01|2026-09-30|This is the first official release.|
 
 ### Obtaining Documentation
 
