@@ -305,6 +305,7 @@ uint32_t UrmaJfrPool::harvestAndDispatch(SharedJfr* jfr) noexcept {
   while ((n = urma_poll_jfc(jfr->jfc, POLL_BATCH_MAX, cr)) > 0) {
     total_cqes += static_cast<uint32_t>(n);
     int repost_cnt = 0;
+
     for (int i = 0; i < n; ++i) {
       uint32_t slot = static_cast<uint32_t>(cr[i].user_ctx);
       void* recv_buf = jfr->rx_bufs[slot].data;

@@ -33,9 +33,10 @@ namespace folly {
 static uint32_t countBigMsgs(const IOBuf* head, uint32_t peer_rx_buf_size) {
   uint32_t n = 0;
   if (!head) return 0;
+  // Phase 3: headroom 路径下大包判断:data_len + 64B header > peer_rx_buf_size
   const IOBuf* b = head;
   do {
-    if (b->length() > peer_rx_buf_size) {
+    if (b->length() + sizeof(UrmaMsgHeader) > peer_rx_buf_size) {
       ++n;
     }
     b = b->next();
@@ -398,10 +399,17 @@ urma_status_t UrmaAsyncSocket::sendChain(WriteCallback* cb,
 
     while (chain && num_sge < max_data_sge) {
       size_t iobuf_len = chain->length();
-      if (sge_total + iobuf_len > peer_rx_buf_size_ && num_sge > 0) {
+      // Phase 3: headroom 路径下总长 = header(64B) + sge_total,
+      // 不能超过 peer_rx_buf_size_(recv buffer 大小)
+      if (sge_total + iobuf_len + sizeof(UrmaMsgHeader) > peer_rx_buf_size_ &&
+          num_sge > 0) {
         break;
       }
-      if (iobuf_len > peer_rx_buf_size_) {
+      // Phase 3: headroom 路径下 SGE[0] = header(64B) + data,
+      // data 不能超过 peer_rx_buf_size_ - sizeof(UrmaMsgHeader),
+      // 否则接收端 recv buffer(4096B) 装不下 header+data,header 被截断。
+      // 大包判断条件:data_len + 64 > peer_rx_buf_size_ → 走单边 READ
+      if (iobuf_len + sizeof(UrmaMsgHeader) > peer_rx_buf_size_) {
         // §4.7 大包:走单边 READ(控制包 SEND_IMM + 对端 READ 拉取 + FREE)
         auto big = std::move(chain);
         size_t big_len = big->length();
