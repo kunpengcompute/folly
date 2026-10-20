@@ -45,7 +45,7 @@ void HelloMessage::serialize(void* buf) const {
   memcpy(p, eid, 16);       p += 16;
   v32 = htonl(uasid);       memcpy(p, &v32, 4); p += 4;
   *p = tp_type;             p += 1;
-  memcpy(p, pad, 3);        p += 3;
+  memcpy(p, capability_flags, 3); p += 3;
   memcpy(p, seg_eid, 16);   p += 16;
   v32 = htonl(seg_uasid);   memcpy(p, &v32, 4); p += 4;
   v64 = htobe64(seg_va);    memcpy(p, &v64, 8); p += 8;
@@ -74,7 +74,7 @@ void HelloMessage::deserialize(const void* buf) {
   memcpy(eid, p, 16); p += 16;
   memcpy(&v32, p, 4); uasid = ntohl(v32); p += 4;
   tp_type = *p; p += 1;
-  memcpy(pad, p, 3); p += 3;
+  memcpy(capability_flags, p, 3); p += 3;
   memcpy(seg_eid, p, 16); p += 16;
   memcpy(&v32, p, 4); seg_uasid = ntohl(v32); p += 4;
   memcpy(&v64, p, 8); seg_va = be64toh(v64); p += 8;
@@ -177,6 +177,16 @@ bool UrmaHandshake::validateHello(const v2_wire::HelloMessage& hello) {
   }
   if (hello.impl_ver != v2_wire::IMPL_V2_VERSION) {
     onHandshakeError("impl_ver mismatch");
+    return false;
+  }
+  // Phase 8: 协商池化能力 — 对端不支持时握手失败,触发降级 TCP
+  uint8_t peer_caps = hello.capability_flags[0];
+  if (!(peer_caps & v2_wire::CAP_SHARED_JFR)) {
+    onHandshakeError("peer does not support CAP_SHARED_JFR");
+    return false;
+  }
+  if (!(peer_caps & v2_wire::CAP_HEADROOM_ROUTING)) {
+    onHandshakeError("peer does not support CAP_HEADROOM_ROUTING");
     return false;
   }
   if (hello.buffer_size < 1024) {

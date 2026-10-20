@@ -42,6 +42,11 @@ constexpr uint16_t IMPL_V2_VERSION = 1;
 
 constexpr uint32_t HELLO_ACK_VALUE = 0x00000001;
 
+// Phase 8: capability flags(复用 pad[3] 空间,HelloMessage 大小不变)
+// 协商池化能力:对端不支持时降级 TCP
+constexpr uint8_t CAP_SHARED_JFR       = 0x01;  // JFR 池化(headroom 路由)
+constexpr uint8_t CAP_HEADROOM_ROUTING = 0x02;  // headroom 路由(64B header in recv buffer)
+
 struct __attribute__((packed)) HelloMessage {
   uint16_t msg_len{HELLO_PACKET_LEN};
   uint16_t hello_ver{HELLO_V2_VERSION};
@@ -52,7 +57,7 @@ struct __attribute__((packed)) HelloMessage {
   uint8_t eid[16] = {};
   uint32_t uasid{0};
   uint8_t tp_type{URMA_CTP};
-  uint8_t pad[3] = {};
+  uint8_t capability_flags[3] = {CAP_SHARED_JFR | CAP_HEADROOM_ROUTING, 0, 0};
   uint8_t seg_eid[16] = {};
   uint32_t seg_uasid{0};
   uint64_t seg_va{0};

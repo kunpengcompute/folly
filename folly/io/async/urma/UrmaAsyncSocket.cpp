@@ -168,11 +168,21 @@ void UrmaAsyncSocket::onHandshakeReady() {
 void UrmaAsyncSocket::onHandshakeError(const std::string& reason) {
   XLOG(ERR) << "UrmaAsyncSocket: handshake error: " << reason;
   tcp_handshake_handler_.reset();
-  state_ = State::kError;
   if (handshake_) {
     delete handshake_;
     handshake_ = nullptr;
   }
+
+  // Phase 8: 降级 TCP — 握手失败时用已有 tcp_fd_ 创建 AsyncSocket 作为 delegate
+  // 对上层透明:后续 write/read/close 全部委托给 tcp_delegate_
+  if (tcp_fd_ >= 0) {
+    XLOG(WARN) << "UrmaAsyncSocket: falling back to TCP, reason=" << reason;
+    fallbackToTcp();
+    return;
+  }
+
+  // 无 tcp_fd_(如 connect 失败),无法降级,直接报错
+  state_ = State::kError;
   while (pending_write_head_) {
     auto pw = std::move(pending_write_head_);
     pending_write_head_ = std::move(pw->next);
@@ -186,6 +196,31 @@ void UrmaAsyncSocket::onHandshakeError(const std::string& reason) {
   }
 }
 
+void UrmaAsyncSocket::fallbackToTcp() {
+  // 用已有 tcp_fd_ 创建 AsyncSocket,接管 fd 所有权
+  tcp_delegate_ = AsyncSocket::newSocket(evb_, NetworkSocket(tcp_fd_));
+  // tcp_fd_ 所有权移交给 delegate,本对象不再持有
+  tcp_fd_ = -1;
+  state_ = State::kOpen;  // 降级后视为 open,操作委托给 delegate
+
+  // 将 pending_write_ 队列中的写入通过 delegate 重放
+  while (pending_write_head_) {
+    auto pw = std::move(pending_write_head_);
+    pending_write_head_ = std::move(pw->next);
+    if (!pending_write_head_) {
+      pending_write_tail_ = nullptr;
+    }
+    if (pw->cb) {
+      tcp_delegate_->writeChain(pw->cb, std::move(pw->buf), WriteFlags::NONE);
+    }
+  }
+
+  // 如果已有 read_cb_,设置到 delegate
+  if (read_cb_) {
+    tcp_delegate_->setReadCB(read_cb_);
+  }
+}
+
 void UrmaAsyncSocket::onHandshakeData(const uint8_t* data, size_t len) {
   if (handshake_) {
     handshake_->onDataAvailable(data, len);
@@ -195,6 +230,11 @@ void UrmaAsyncSocket::onHandshakeData(const uint8_t* data, size_t len) {
 // ── AsyncReader ──
 
 void UrmaAsyncSocket::setReadCB(ReadCallback* callback) noexcept {
+  // Phase 8: 降级 TCP 模式下委托给 delegate
+  if (tcp_delegate_) {
+    tcp_delegate_->setReadCB(callback);
+    return;
+  }
   read_cb_ = callback;
   if (read_cb_ && !read_queue_.empty()) {
     deliverReadData();
@@ -205,18 +245,30 @@ void UrmaAsyncSocket::setReadCB(ReadCallback* callback) noexcept {
 
 void UrmaAsyncSocket::write(WriteCallback* cb, const void* buf, size_t bytes,
                              WriteFlags flags) noexcept {
+  if (tcp_delegate_) {
+    tcp_delegate_->write(cb, buf, bytes, flags);
+    return;
+  }
   auto iobuf = IOBuf::copyBuffer(buf, bytes);
   writeChain(cb, std::move(iobuf), flags);
 }
 
 void UrmaAsyncSocket::writev(WriteCallback* cb, const iovec* vec, size_t count,
                               WriteFlags flags) noexcept {
+  if (tcp_delegate_) {
+    tcp_delegate_->writev(cb, vec, count, flags);
+    return;
+  }
   auto iobuf = IOBuf::wrapIov(vec, count);
   writeChain(cb, std::move(iobuf), flags);
 }
 
 void UrmaAsyncSocket::writeChain(WriteCallback* cb, std::unique_ptr<IOBuf>&& chain,
                                   WriteFlags flags) noexcept {
+  if (tcp_delegate_) {
+    tcp_delegate_->writeChain(cb, std::move(chain), flags);
+    return;
+  }
   if (state_ == State::kError || state_ == State::kClosed) {
     if (cb) cb->writeErr(0, AsyncSocketException(
         AsyncSocketException::UNKNOWN, "socket not open"));
@@ -1365,22 +1417,38 @@ void UrmaAsyncSocket::deliverReadData() noexcept {
 // ── 关闭 ──
 
 void UrmaAsyncSocket::close() {
+  if (tcp_delegate_) {
+    tcp_delegate_->close();
+    return;
+  }
   shutdownWrite();
   closeNow();
 }
 
 void UrmaAsyncSocket::closeNow() {
+  if (tcp_delegate_) {
+    tcp_delegate_->closeNow();
+    return;
+  }
   if (state_ == State::kClosed) return;
   state_ = State::kClosed;
   destroyUrmaResources();
 }
 
 void UrmaAsyncSocket::shutdownWrite() {
+  if (tcp_delegate_) {
+    tcp_delegate_->shutdownWrite();
+    return;
+  }
   // Phase 2: poll JFS 池的 TX CQE 回收资源
   pollTx();
 }
 
 void UrmaAsyncSocket::shutdownWriteNow() {
+  if (tcp_delegate_) {
+    tcp_delegate_->shutdownWriteNow();
+    return;
+  }
 }
 
 void UrmaAsyncSocket::destroyUrmaResources() {
@@ -1436,12 +1504,23 @@ void UrmaAsyncSocket::detachEventBase() {
 
 void UrmaAsyncSocket::setSendTimeout(uint32_t milliseconds) {
   send_timeout_ms_ = milliseconds;
+  if (tcp_delegate_) {
+    tcp_delegate_->setSendTimeout(milliseconds);
+  }
 }
 
-void UrmaAsyncSocket::getLocalAddress(SocketAddress* /*address*/) const {
+void UrmaAsyncSocket::getLocalAddress(SocketAddress* address) const {
+  if (tcp_delegate_) {
+    tcp_delegate_->getLocalAddress(address);
+    return;
+  }
 }
 
-void UrmaAsyncSocket::getPeerAddress(SocketAddress* /*address*/) const {
+void UrmaAsyncSocket::getPeerAddress(SocketAddress* address) const {
+  if (tcp_delegate_) {
+    tcp_delegate_->getPeerAddress(address);
+    return;
+  }
 }
 
 } // namespace folly

@@ -84,17 +84,23 @@ class UrmaAsyncSocket : public AsyncTransport {
   void shutdownWrite() override;
   void shutdownWriteNow() override;
   bool good() const override {
+    if (tcp_delegate_) return tcp_delegate_->good();
     return state_ == State::kConnecting || state_ == State::kHandshaking ||
            state_ == State::kOpen;
   }
   bool readable() const override {
+    if (tcp_delegate_) return tcp_delegate_->readable();
     return state_ == State::kConnecting || state_ == State::kHandshaking ||
            state_ == State::kOpen;
   }
   bool connecting() const override {
+    if (tcp_delegate_) return tcp_delegate_->connecting();
     return state_ == State::kConnecting || state_ == State::kHandshaking;
   }
-  bool error() const override { return state_ == State::kError; }
+  bool error() const override {
+    if (tcp_delegate_) return tcp_delegate_->error();
+    return state_ == State::kError;
+  }
   void attachEventBase(EventBase* eventBase) override;
   void detachEventBase() override;
   bool isDetachable() const override { return false; }
@@ -216,6 +222,10 @@ class UrmaAsyncSocket : public AsyncTransport {
   void onHandshakeError(const std::string& reason);
   void destroyUrmaResources();
 
+  // Phase 8: 降级 TCP — 握手失败时用 tcp_fd_ 创建 AsyncSocket 作为 delegate
+  // 所有后续 AsyncTransport 操作委托给 delegate,对上层透明
+  void fallbackToTcp();
+
   class TcpHandshakeHandler : public EventHandler {
    public:
     TcpHandshakeHandler(EventBase* evb, int fd, UrmaAsyncSocket* socket)
@@ -273,6 +283,9 @@ class UrmaAsyncSocket : public AsyncTransport {
 
   std::unique_ptr<ConnectCallback> connect_cb_;
   AsyncSocket::UniquePtr tcp_socket_;
+
+  // Phase 8: 降级 TCP delegate(握手失败时创建,接管所有 AsyncTransport 操作)
+  AsyncSocket::UniquePtr tcp_delegate_;
 
   UrmaSharedJfr* shared_{nullptr};
   UrmaHandshake* handshake_{nullptr};
