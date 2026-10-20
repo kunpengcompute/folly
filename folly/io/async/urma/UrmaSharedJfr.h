@@ -23,6 +23,7 @@
 
 #include <atomic>
 #include <memory>
+#include <vector>
 
 #include <folly/io/async/EventBaseLocal.h>
 #include <folly/io/async/urma/UrmaConfig.h>
@@ -48,6 +49,10 @@ class UrmaSharedJfr {
 
   void pollAndDispatch() noexcept;
   void pollFcAndDispatch() noexcept;
+
+  // TX CQE 收割(epoll 驱动,由 UrmaCqHandler::handlerReady 调用)
+  // 遍历所有 IO/FC JFS 的 TX JFCE,poll TX CQE(含 READ CQE)并派发
+  void harvestTx() noexcept;
 
   // 路由表委托给 UrmaJfrPool(全局共享)
   void registerSocket(uint64_t socket_id, UrmaAsyncSocket* socket);
@@ -86,6 +91,10 @@ class UrmaSharedJfr {
   // CqHandler(per-EventBase,绑定选定的 JFR 的 JFCE fd)
   UrmaCqHandler* io_cq_handler_{nullptr};
   UrmaCqHandler* fc_cq_handler_{nullptr};
+
+  // TX CqHandler 列表:每个 IO JFS 的 TX JFCE fd 一个
+  // 让 READ CQE 有独立的事件驱动收割,不依赖 RX 事件
+  std::vector<std::unique_ptr<UrmaCqHandler>> tx_cq_handlers_;
 
   static EventBaseLocal<std::unique_ptr<UrmaSharedJfr>>& registry();
 };

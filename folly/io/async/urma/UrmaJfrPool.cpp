@@ -415,6 +415,9 @@ void UrmaJfrPool::harvestTxAndDispatch() noexcept {
         }
       }
     }
+    // edge-triggered rearm:poll 完后 rearm,为下次 epoll 事件武装
+    // (TX JFCE fd 注册 epoll 后,必须 rearm 才能持续收到 CQE 事件)
+    urma_rearm_jfc(sj->jfc, false);
   }
 
   // ── FC JFS TX CQE 收割(Phase 6) ──
@@ -433,6 +436,8 @@ void UrmaJfrPool::harvestTxAndDispatch() noexcept {
         delete tx_ctx;
       }
     }
+    // edge-triggered rearm(与 IO JFS 同理)
+    urma_rearm_jfc(sj->jfc, false);
   }
 }
 

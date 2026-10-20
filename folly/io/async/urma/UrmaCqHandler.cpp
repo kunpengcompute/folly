@@ -18,9 +18,11 @@ namespace folly {
 
 void UrmaCqHandler::handlerReady(uint16_t /*events*/) noexcept {
   if (is_tx_) {
-    // Phase 2: TX 模式不再 per-连接使用,TX CQE 由全局 JFS 池 CqHandler 处理
-    // 保留接口兼容,实际不应被调用
-    if (socket_) {
+    // TX 池模式: shared_ 指向 UrmaSharedJfr,收割 TX CQE(含 READ CQE)
+    // TX per-socket 模式(旧设计): socket_ 指向 UrmaAsyncSocket
+    if (shared_) {
+      shared_->harvestTx();
+    } else if (socket_) {
       socket_->pollTx();
       socket_->retryWrite();
     }

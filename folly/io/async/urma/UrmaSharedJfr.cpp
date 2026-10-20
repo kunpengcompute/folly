@@ -14,6 +14,7 @@
 #include <folly/io/async/EventBase.h>
 #include <folly/io/async/urma/UrmaAsyncSocket.h>
 #include <folly/io/async/urma/UrmaCqHandler.h>
+#include <folly/io/async/urma/UrmaJfsPool.h>
 #include <folly/logging/xlog.h>
 
 namespace folly {
@@ -78,12 +79,38 @@ UrmaSharedJfr::UrmaSharedJfr(EventBase* evb, const UrmaConfig& /*config*/)
   credit_allocated_.store(io_shared_jfr_->credit_allocated.load(std::memory_order_relaxed),
                           std::memory_order_relaxed);
 
+  // TX CqHandler: 为所有 IO JFS 的 TX JFCE fd 注册 epoll
+  // 让 READ CQE 有独立的事件驱动收割,不依赖 RX 事件
+  // (多连接大包并发时,所有连接等 READ 完成无 RX 事件,
+  //  harvestTxAndDispatch 不被触发,READ CQE 饿死)
+  if (auto* jfs_pool = UrmaJfsPool::get()) {
+    auto fds = jfs_pool->getAllJfceFds();
+    tx_cq_handlers_.reserve(fds.size());
+    int registered = 0;
+    for (const auto& entry : fds) {
+      if (entry.is_fc) continue;  // 只注册 IO JFS 的 TX JFCE
+      if (entry.fd < 0) continue;
+      // edge-triggered: 先 rearm 再注册,避免错过已有 CQE
+      auto* sj = jfs_pool->getIoJfsByIndex(entry.jfs_index);
+      if (sj && sj->jfc) {
+        urma_rearm_jfc(sj->jfc, false);
+      }
+      tx_cq_handlers_.push_back(
+          std::make_unique<UrmaCqHandler>(evb_, entry.fd, this, true, false));
+      ++registered;
+    }
+    XLOG(INFO) << "UrmaSharedJfr: registered " << registered
+               << " TX JFCE fds to epoll";
+  }
+
   valid_ = true;
   XLOG(INFO) << "UrmaSharedJfr: bound to io_jfr[" << io_jfr_index_
              << "] fc_jfr[" << fc_jfr_index_ << "]";
 }
 
 UrmaSharedJfr::~UrmaSharedJfr() {
+  // 先清理 TX CqHandler(释放 epoll 注册)
+  tx_cq_handlers_.clear();
   if (io_cq_handler_) {
     delete io_cq_handler_;
     io_cq_handler_ = nullptr;
@@ -105,6 +132,14 @@ void UrmaSharedJfr::pollAndDispatch() noexcept {
 void UrmaSharedJfr::pollFcAndDispatch() noexcept {
   if (fc_shared_jfr_) {
     UrmaJfrPool::get()->pollFcAndDispatch(fc_shared_jfr_);
+  }
+}
+
+void UrmaSharedJfr::harvestTx() noexcept {
+  // 委托给 UrmaJfrPool::harvestTxAndDispatch
+  // 遍历所有 IO/FC JFS 的 TX JFCE,poll TX CQE(含 READ CQE)并派发
+  if (auto* pool = UrmaJfrPool::get()) {
+    pool->harvestTxAndDispatch();
   }
 }
 
