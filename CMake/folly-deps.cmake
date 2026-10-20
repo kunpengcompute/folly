@@ -306,6 +306,9 @@ if (NOT DEFINED fmt_CONFIG)
 endif()
 target_link_libraries(folly_deps INTERFACE fmt::fmt)
 
+# URMA is opt-in and must link the real SDK. No success-only stub transport.
+include(${CMAKE_CURRENT_LIST_DIR}/FollyUrma.cmake)
+
 list(REMOVE_DUPLICATES FOLLY_INCLUDE_DIRECTORIES)
 target_include_directories(folly_deps INTERFACE ${FOLLY_INCLUDE_DIRECTORIES})
 target_link_libraries(folly_deps INTERFACE

@@ -1103,3 +1103,11 @@ if (BUILD_TESTS OR BUILD_BENCHMARKS)
 endif()
 
 add_subdirectory(folly)
+
+option(FOLLY_BUILD_URMA_DEMO "Build the basic URMA echo example" OFF)
+if(FOLLY_BUILD_URMA_DEMO)
+  if(NOT FOLLY_USE_URMA AND NOT URMA_USE_REAL_LIB)
+    message(FATAL_ERROR "The URMA demo requires FOLLY_USE_URMA=ON")
+  endif()
+  add_subdirectory(urma_demo)
+endif()
