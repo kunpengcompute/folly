@@ -1,0 +1,3 @@
+add_executable(UrmaCoalescingTest CoalescingTest.cpp)
+target_link_libraries(UrmaCoalescingTest PRIVATE folly ${CMAKE_DL_LIBS})
+apply_folly_compile_options_to_target(UrmaCoalescingTest)

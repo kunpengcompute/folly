@@ -11,6 +11,7 @@
 #include <deque>
 #include <stdexcept>
 #include <utility>
+#include <folly/io/Cursor.h>
 #include <folly/io/IOBufQueue.h>
 #include <folly/io/async/AsyncSocket.h>
 #include <folly/io/async/AsyncTimeout.h>
@@ -387,9 +388,15 @@ struct UrmaAsyncSocket::Impl final : AsyncSocket::ConnectCallback,
           writes.front().completed += txBytes;
           bytesWritten += txBytes;
           auto& data = writes.front().data;
-          data->trimStart(txBytes);
-          while (data && data->length() == 0)
+          // One SEND may cover several IOBuf nodes. Consume them only after
+          // successful completion so submission failures and RNR retain data.
+          size_t remaining = txBytes;
+          while (data && data->length() <= remaining) {
+            remaining -= data->length();
             data = data->pop();
+          }
+          if (data)
+            data->trimStart(remaining);
           txBytes = 0;
           finishWrite();
         }
@@ -426,10 +433,13 @@ struct UrmaAsyncSocket::Impl final : AsyncSocket::ConnectCallback,
         finishWrite();
         continue;
       }
-      const size_t bytes = std::min(request.data->length(), size_t(peerBuffer));
       auto* target = static_cast<char*>(res->memory) +
           size_t(config.rx_depth) * config.buffer_size;
-      std::memcpy(target, request.data->data(), bytes);
+      // Pack this write's fragments into the existing registered TX block.
+      // Send immediately, bounded by the peer's negotiated receive capacity;
+      // do not wait for later writes or alter the queued data before completion.
+      const size_t bytes =
+          io::Cursor(request.data.get()).pullAtMost(target, peerBuffer);
       urma_sge_t sge{};
       sge.addr = reinterpret_cast<uint64_t>(target);
       sge.len = bytes;
