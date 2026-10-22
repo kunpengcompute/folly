@@ -3,11 +3,13 @@
 #pragma once
 #ifdef FOLLY_HAVE_URMA
 #include <memory>
+#include <vector>
 #include <folly/SocketAddress.h>
 #include <folly/io/async/AsyncTransport.h>
 #include <folly/io/async/AsyncSocket.h>
+#include <folly/io/async/urma/UrmaRecordWriter.h>
 namespace folly {
-class UrmaAsyncSocket : public AsyncTransport {
+class UrmaAsyncSocket : public AsyncTransport, public UrmaRecordWriter {
  public:
   UrmaAsyncSocket(EventBase* evb, const SocketAddress& address);
   UrmaAsyncSocket(EventBase* evb, int acceptedFd);
@@ -35,6 +37,16 @@ class UrmaAsyncSocket : public AsyncTransport {
       WriteCallback*,
       std::unique_ptr<IOBuf>&&,
       WriteFlags = WriteFlags::NONE) noexcept override;
+  // recordLengths describe complete serialized records BEFORE upper-layer
+  // batching, not IOBuf nodes. Their sum must equal the chain length. Adjacent
+  // small records can share SENDs; large records use READ independently. One
+  // callback still covers the entire write. Empty metadata means one record.
+  bool supportsUrmaRecords() const override { return true; }
+  void writeChainWithRecords(
+      WriteCallback*,
+      std::unique_ptr<IOBuf>&&,
+      std::vector<size_t> recordLengths,
+      WriteFlags = WriteFlags::NONE) noexcept override;
   EventBase* getEventBase() const override;
   void close() override;
   void closeNow() override;
@@ -50,6 +62,13 @@ class UrmaAsyncSocket : public AsyncTransport {
   void detachEventBase() override;
   void setSendTimeout(uint32_t) override;
   uint32_t getSendTimeout() const override;
+  // Called on the owning EventBase when queued bytes or retained capacity
+  // change. Registration is passive; the caller must keep the callback alive
+  // until it is unregistered. Idle registered caches are not pending egress.
+  void setBufferCallback(BufferCallback*);
+  size_t getAppBytesBuffered() const override;
+  size_t getRawBytesBuffered() const override;
+  size_t getAllocatedBytesBuffered() const override;
   void getLocalAddress(SocketAddress*) const override;
   void getPeerAddress(SocketAddress*) const override;
   bool isEorTrackingEnabled() const override { return false; }

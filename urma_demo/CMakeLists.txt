@@ -1,6 +1,0 @@
-if(NOT TARGET folly)
-  message(FATAL_ERROR "Configure the Folly root with FOLLY_USE_URMA=ON and FOLLY_BUILD_URMA_DEMO=ON")
-endif()
-add_executable(UrmaEchoDemo UrmaEchoDemo.cpp)
-target_link_libraries(UrmaEchoDemo PRIVATE folly)
-apply_folly_compile_options_to_target(UrmaEchoDemo)
