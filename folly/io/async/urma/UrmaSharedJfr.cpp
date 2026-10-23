@@ -96,7 +96,8 @@ UrmaSharedJfr::UrmaSharedJfr(EventBase* evb, const UrmaConfig& /*config*/)
         urma_rearm_jfc(sj->jfc, false);
       }
       tx_cq_handlers_.push_back(
-          std::make_unique<UrmaCqHandler>(evb_, entry.fd, this, true, false));
+          std::make_unique<UrmaCqHandler>(evb_, entry.fd, this,
+                                          true, false, entry.jfs_index));
       ++registered;
     }
     XLOG(INFO) << "UrmaSharedJfr: registered " << registered
@@ -135,11 +136,10 @@ void UrmaSharedJfr::pollFcAndDispatch() noexcept {
   }
 }
 
-void UrmaSharedJfr::harvestTx() noexcept {
-  // 委托给 UrmaJfrPool::harvestTxAndDispatch
-  // 遍历所有 IO/FC JFS 的 TX JFCE,poll TX CQE(含 READ CQE)并派发
+void UrmaSharedJfr::harvestTx(uint32_t jfs_index) noexcept {
+  // 单点收割: 只 poll 指定 JFS 的 TX CQE(含 READ CQE)
   if (auto* pool = UrmaJfrPool::get()) {
-    pool->harvestTxAndDispatch();
+    pool->harvestTxAndDispatch(jfs_index);
   }
 }
 

@@ -311,13 +311,58 @@ uint32_t UrmaJfrPool::harvestAndDispatch(SharedJfr* jfr) noexcept {
       void* recv_buf = jfr->rx_bufs[slot].data;
       uint32_t recv_len = cr[i].completion_len;
 
-      // Phase 3: 兼容 SEND_IMM 控制包 + headroom 路由双路径
+      // Phase 3: SEND_IMM 控制包路径(MSG_PULL_MEM / MSG_FREE)
+      // 控制包仍写 header 到 recv buffer(用于 socket 路由),imm_data 携带控制元数据
+      // 从 recv buffer 前 24B 解析 header → socket 路由 → 从 imm_data 和 trailing field 取控制元数据
       if (cr[i].opcode == URMA_CR_OPC_SEND_WITH_IMM) {
+        auto* ctrl_hdr = parseHeader(recv_buf);
+        if (!ctrl_hdr) {
+          XLOG(WARN) << "[URMA] SEND_IMM magic mismatch, slot=" << slot
+                     << " recv_len=" << recv_len;
+          repost_slots[repost_cnt++] = slot;
+          continue;
+        }
+        // version 校验(不匹配仅 WARN,不丢弃,向前兼容)
+        if (ctrl_hdr->version != URMA_VERSION) {
+          XLOG(WARN) << "[URMA] SEND_IMM version mismatch: got="
+                     << static_cast<int>(ctrl_hdr->version)
+                     << " expected=" << static_cast<int>(URMA_VERSION)
+                     << " type=" << static_cast<int>(ctrl_hdr->type);
+        }
+        auto it = socket_map_.find(ctrl_hdr->src_socket_id);
+        if (it == socket_map_.end()) {
+          XLOG(WARN) << "[URMA] SEND_IMM socket_map miss: src_socket_id="
+                     << ctrl_hdr->src_socket_id;
+          repost_slots[repost_cnt++] = slot;
+          continue;
+        }
+
+        if (ctrl_hdr->type == MSG_PULL_MEM) {
+          // PULL_MEM:SGE[0] = PullMemControlPacket(32B)
+          // imm_data = remote_va(u64),trailing data_size 从 recv_buf offset 24 读取
+          if (recv_len < sizeof(PullMemControlPacket)) {
+            XLOG(WARN) << "[URMA] PULL_MEM too short: recv_len=" << recv_len;
+            repost_slots[repost_cnt++] = slot;
+            continue;
+          }
+          auto* pkt = static_cast<const PullMemControlPacket*>(recv_buf);
+          uint64_t remote_va = cr[i].imm_data;
+          uint32_t data_size = pkt->data_size;
+          it->second->onControlMsgImm(MSG_PULL_MEM, ctrl_hdr->msg_id,
+                                      remote_va, data_size);
+        } else if (ctrl_hdr->type == MSG_FREE) {
+          // FREE:SGE[0] = UrmaMsgHeader(24B),imm_data = msg_id(低 16 位有效)
+          uint16_t msg_id = static_cast<uint16_t>(cr[i].imm_data);
+          it->second->onControlMsgImm(MSG_FREE, msg_id, 0, 0);
+        } else {
+          XLOG(WARN) << "[URMA] SEND_IMM unexpected type="
+                     << static_cast<int>(ctrl_hdr->type);
+        }
         repost_slots[repost_cnt++] = slot;
         continue;
       }
 
-      // headroom 路由:从 recv buffer 前 64B 解析 header
+      // 独立 buffer 路由:从 recv buffer 前 24B 解析 header(MSG_DATA 走此路径)
       auto* hdr = parseHeader(recv_buf);
       if (!hdr) {
         XLOG(WARN) << "[URMA] magic mismatch, slot=" << slot
@@ -371,57 +416,59 @@ void UrmaJfrPool::pollAndDispatch(SharedJfr* jfr) noexcept {
   // edge-triggered 模式下 rearm 后再 poll 一次,防止 rearm 窗口期间到达的 CQE 漏掉
   (void)harvestAndDispatch(jfr);
 
-  // Phase 5: 顺带收割 TX CQE(JFS 池共享,TX JFCE fd 未注册 epoll)。
-  // 用 RX 事件驱动 TX CQE 收割,避免大包 READ CQE 无事件触发而饿死。
-  // 通过 tx_ctx->socket_id 路由到对应连接处理。
-  harvestTxAndDispatch();
+  // TX CQE 收割由 TX JFCE fd 的 epoll 事件独立驱动(UrmaCqHandler is_tx 模式),
+  // 不在 RX 事件中耦合收割。RX 和 TX 各有独立的 epoll 事件源。
+  // FC JFS TX CQE 不在此处收割:FC 消息量极小(仅建链/流控),
+  // fc_tx_depth=64 的 CQ 足以缓冲,避免每次 RX 事件遍历 FC JFS 产生空轮询自旋锁开销。
 }
 
-void UrmaJfrPool::harvestTxAndDispatch() noexcept {
+void UrmaJfrPool::harvestTxAndDispatch(uint32_t jfs_index) noexcept {
+  UrmaJfsPool* jfs_pool = UrmaJfsPool::get();
+  if (!jfs_pool) return;
+
+  SharedJfs* sj = jfs_pool->getIoJfsByIndex(jfs_index);
+  if (!sj || !sj->jfc) return;
+
+  constexpr int TX_POLL_BATCH = 32;
+  urma_cr_t cr[TX_POLL_BATCH];
+
+  int n;
+  while ((n = urma_poll_jfc(sj->jfc, TX_POLL_BATCH, cr)) > 0) {
+    for (int i = 0; i < n; ++i) {
+      auto* tx_ctx = reinterpret_cast<TxCompletionCtx*>(cr[i].user_ctx);
+      if (!tx_ctx) continue;
+
+      if (tx_ctx->type == TxCompletionCtx::MSG_READ) {
+        // READ CQE:通过 socket_id 路由到对应连接
+        UrmaAsyncSocket* peer = findSocket(tx_ctx->socket_id);
+        if (peer) {
+          peer->handleRemoteReadCqe(tx_ctx->msg_id, cr[i].status);
+        } else {
+          XLOG(WARN) << "[URMA] harvestTx: READ cqe for disconnected socket_id=0x"
+                     << std::hex << tx_ctx->socket_id << std::dec
+                     << " msg_id=" << tx_ctx->msg_id;
+        }
+        jfs_pool->releaseIoJfs(tx_ctx->jfs_index);
+        delete tx_ctx;
+      } else {
+        // MSG_DATA / MSG_CTRL_PULL / MSG_CTRL_FREE:
+        // 归还 sq_inflight + delete ctx → send_data 析构 → block 回收
+        jfs_pool->releaseIoJfs(tx_ctx->jfs_index);
+        delete tx_ctx;
+      }
+    }
+  }
+  // edge-triggered rearm
+  urma_rearm_jfc(sj->jfc, false);
+}
+
+void UrmaJfrPool::harvestFcTxAndDispatch() noexcept {
   UrmaJfsPool* jfs_pool = UrmaJfsPool::get();
   if (!jfs_pool) return;
 
   constexpr int TX_POLL_BATCH = 32;
   urma_cr_t cr[TX_POLL_BATCH];
 
-  // ── IO JFS TX CQE 收割 ──
-  uint32_t jfs_count = jfs_pool->ioJfsCount();
-  for (uint32_t ji = 0; ji < jfs_count; ++ji) {
-    SharedJfs* sj = jfs_pool->getIoJfsByIndex(ji);
-    if (!sj || !sj->jfc) continue;
-    int n;
-    while ((n = urma_poll_jfc(sj->jfc, TX_POLL_BATCH, cr)) > 0) {
-      for (int i = 0; i < n; ++i) {
-        auto* tx_ctx = reinterpret_cast<TxCompletionCtx*>(cr[i].user_ctx);
-        if (!tx_ctx) continue;
-
-        if (tx_ctx->type == TxCompletionCtx::MSG_READ) {
-          // READ CQE:通过 socket_id 路由到对应连接
-          UrmaAsyncSocket* peer = findSocket(tx_ctx->socket_id);
-          if (peer) {
-            peer->handleRemoteReadCqe(tx_ctx->msg_id, cr[i].status);
-          } else {
-            XLOG(WARN) << "[URMA] harvestTx: READ cqe for disconnected socket_id=0x"
-                       << std::hex << tx_ctx->socket_id << std::dec
-                       << " msg_id=" << tx_ctx->msg_id;
-          }
-          jfs_pool->releaseIoJfs(tx_ctx->jfs_index);
-          delete tx_ctx;
-        } else {
-          // MSG_DATA / MSG_CTRL_PULL / MSG_CTRL_FREE:
-          // 归还 sq_inflight + delete ctx → send_data 析构 → block 回收
-          jfs_pool->releaseIoJfs(tx_ctx->jfs_index);
-          delete tx_ctx;
-        }
-      }
-    }
-    // edge-triggered rearm:poll 完后 rearm,为下次 epoll 事件武装
-    // (TX JFCE fd 注册 epoll 后,必须 rearm 才能持续收到 CQE 事件)
-    urma_rearm_jfc(sj->jfc, false);
-  }
-
-  // ── FC JFS TX CQE 收割(Phase 6) ──
-  // FC JFCE fd 未注册 epoll,与 IO JFS 同理用 RX 事件驱动收割
   uint32_t fc_jfs_count = jfs_pool->fcJfsCount();
   for (uint32_t ji = 0; ji < fc_jfs_count; ++ji) {
     SharedJfs* sj = jfs_pool->getFcJfsByIndex(ji);
@@ -431,12 +478,10 @@ void UrmaJfrPool::harvestTxAndDispatch() noexcept {
       for (int i = 0; i < n; ++i) {
         auto* tx_ctx = reinterpret_cast<TxCompletionCtx*>(cr[i].user_ctx);
         if (!tx_ctx) continue;
-        // FC 消息 CQE:归还 sq_inflight + delete ctx
         jfs_pool->releaseFcJfs(tx_ctx->jfs_index);
         delete tx_ctx;
       }
     }
-    // edge-triggered rearm(与 IO JFS 同理)
     urma_rearm_jfc(sj->jfc, false);
   }
 }

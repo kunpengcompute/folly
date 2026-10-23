@@ -50,9 +50,9 @@ class UrmaSharedJfr {
   void pollAndDispatch() noexcept;
   void pollFcAndDispatch() noexcept;
 
-  // TX CQE 收割(epoll 驱动,由 UrmaCqHandler::handlerReady 调用)
-  // 遍历所有 IO/FC JFS 的 TX JFCE,poll TX CQE(含 READ CQE)并派发
-  void harvestTx() noexcept;
+  // TX CQE 单点收割(epoll 驱动,由 UrmaCqHandler::handlerReady 调用)
+  // 只 poll 指定 jfs_index 的 JFS,而非全量遍历
+  void harvestTx(uint32_t jfs_index) noexcept;
 
   // 路由表委托给 UrmaJfrPool(全局共享)
   void registerSocket(uint64_t socket_id, UrmaAsyncSocket* socket);

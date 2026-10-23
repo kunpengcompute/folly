@@ -34,19 +34,22 @@ class UrmaCqHandler : public EventHandler {
         shared_(shared),
         socket_(nullptr),
         is_tx_(false),
-        is_fc_(is_fc) {
+        is_fc_(is_fc),
+        jfs_index_(0) {
     registerHandler(READ | PERSIST);
   }
 
   // TX 池模式: is_tx_=true, shared_ 指向 UrmaSharedJfr
-  // epoll 触发时调用 shared_->harvestTx() 收割 TX CQE(含 READ CQE)
+  // epoll 触发时调用 shared_->harvestTx(jfs_index_) 单点收割绑定的 JFS
   UrmaCqHandler(EventBase* evb, int fd,
-                UrmaSharedJfr* shared, bool is_tx, bool /*is_fc*/)
+                UrmaSharedJfr* shared, bool is_tx, bool /*is_fc*/,
+                uint32_t jfs_index)
       : EventHandler(evb, NetworkSocket(fd)),
         shared_(shared),
         socket_(nullptr),
         is_tx_(is_tx),
-        is_fc_(false) {
+        is_fc_(false),
+        jfs_index_(jfs_index) {
     registerHandler(READ | PERSIST);
   }
 
@@ -56,7 +59,8 @@ class UrmaCqHandler : public EventHandler {
         shared_(nullptr),
         socket_(socket),
         is_tx_(true),
-        is_fc_(false) {
+        is_fc_(false),
+        jfs_index_(0) {
     registerHandler(READ | PERSIST);
   }
 
@@ -71,6 +75,7 @@ class UrmaCqHandler : public EventHandler {
   UrmaAsyncSocket* socket_;
   bool is_tx_;
   bool is_fc_;
+  uint32_t jfs_index_;  // TX 池模式绑定的 JFS index(单点收割)
 };
 
 } // namespace folly

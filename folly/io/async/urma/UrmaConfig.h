@@ -35,8 +35,8 @@ constexpr uint32_t kUrmaDefaultIdleTimeoutMs = 10;
 constexpr uint64_t kUrmaDefaultPoolSize = 64ULL * 1024 * 1024 * 1024; // 64GB
 
 // ── 池化默认值(设计 §12) ──
-constexpr uint32_t kUrmaDefaultIoJfsCount = 64;
-constexpr uint32_t kUrmaDefaultFcJfsCount = 16;
+constexpr uint32_t kUrmaDefaultIoJfsCount = 4;
+constexpr uint32_t kUrmaDefaultFcJfsCount = 2;
 constexpr uint32_t kUrmaDefaultIoJfrCount = 16;
 constexpr uint32_t kUrmaDefaultFcJfrCount = 4;
 constexpr uint32_t kUrmaDefaultMinWater = 64;
@@ -72,7 +72,7 @@ struct UrmaConfig {
   uint32_t idle_timeout_ms = kUrmaDefaultIdleTimeoutMs;
 
   // ── 握手 ──
-  uint32_t handshake_timeout_ms = 5000;  // URMA 握手超时(毫秒)
+  uint32_t handshake_timeout_ms = 30000;  // URMA 握手超时(毫秒)
 
   // ── MR 内存池 ──
   uint64_t pool_size = kUrmaDefaultPoolSize;

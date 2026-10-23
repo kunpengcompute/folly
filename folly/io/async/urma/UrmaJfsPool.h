@@ -87,6 +87,21 @@ class UrmaJfsPool {
   // 全满时返回 nullptr
   SharedJfs* acquireIoJfs(uint32_t* out_index = nullptr);
 
+  // 按指定 index 获取 IO JFS(CAS sq_inflight,同连接 pin 用)
+  // 指定 JFS 满时返回 nullptr(调用方可 fallback 到 acquireIoJfs)
+  SharedJfs* tryAcquireIoJfsByIndex(uint32_t index) {
+    if (index >= io_jfs_list_.size()) return nullptr;
+    auto& sj = io_jfs_list_[index];
+    uint32_t cur = sj.sq_inflight.load(std::memory_order_acquire);
+    while (cur < sj.sq_depth) {
+      if (sj.sq_inflight.compare_exchange_weak(cur, cur + 1,
+              std::memory_order_acq_rel, std::memory_order_acquire)) {
+        return &sj;
+      }
+    }
+    return nullptr;
+  }
+
   // 归还 IO JFS 的 sq_inflight(TX CQE 完成后调用)
   void releaseIoJfs(uint32_t index);
 

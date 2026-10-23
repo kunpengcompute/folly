@@ -21,7 +21,7 @@ void UrmaCqHandler::handlerReady(uint16_t /*events*/) noexcept {
     // TX 池模式: shared_ 指向 UrmaSharedJfr,收割 TX CQE(含 READ CQE)
     // TX per-socket 模式(旧设计): socket_ 指向 UrmaAsyncSocket
     if (shared_) {
-      shared_->harvestTx();
+      shared_->harvestTx(jfs_index_);  // 单点收割: 只 poll 绑定的 JFS
     } else if (socket_) {
       socket_->pollTx();
       socket_->retryWrite();

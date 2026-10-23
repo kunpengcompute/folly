@@ -14,7 +14,7 @@
  *   writeChain: pollTx → 多 SGE 合并 → post SEND → EAGAIN 挂起
  *   >4KB 大包: sendBigMsgByRead(控制包 SEND_IMM + 对端 READ 拉取 + FREE 释放)
  *   onRxBuf: IOBuf::takeOwnership 零拷贝 → read_queue_ → deliverReadData
- *   onControlMsg: SEND_IMM 控制包(PULL/FREE)路由
+ *   onControlMsgImm: SEND_IMM 控制包(PULL/FREE)路由,从 imm_data 和 recv_buf 解析
  *   pollTx: 回收 SEND/READ completion → 释放 sbuf_ → retryWrite
  *   EAGAIN: pending_write_ 挂起 → TX JFCE 中断 → retryWrite
  */
@@ -119,18 +119,21 @@ class UrmaAsyncSocket : public AsyncTransport {
   // 接收数据(由 UrmaSharedJfr::pollAndDispatch 调用,普通 SEND)
   void onRxBuf(std::unique_ptr<IOBuf> data) noexcept;
 
-  // Phase 3: headroom 路由 — 从 recv buffer 前 64B 解析 header 路由
-  // recv_buf: 接收到的 buffer 起始(header 64B + data)
+  // 独立 buffer 路由 — 从 recv buffer 前 24B 解析 header 路由
+  // recv_buf: 接收到的 buffer 起始(header 24B + data)
   // recv_len: 实际接收字节数
   // slot:     rx_bufs_ 的 slot 索引(补投 recv WR 用)
-  // 由 UrmaSharedJfr::pollAndDispatch 调用
+  // 由 UrmaSharedJfr::pollAndDispatch 调用(仅 SEND 分支,MSG_DATA)
   void onIoMessageReceived(void* recv_buf, uint32_t recv_len,
                            uint32_t slot) noexcept;
 
-  // 控制包/FREE 通知(由 UrmaSharedJfr::pollAndDispatch 按 imm_valid 路由,SEND_IMM)
-  // imm: 编码 msg_id | is_ctl<<56 | data_size<<16
-  // meta: 控制包(PULL)时指向 8 字节 remote_va(FREE 时忽略)
-  void onControlMsg(uint64_t imm, const void* meta) noexcept;
+  // 控制包/FREE 通知(由 UrmaJfrPool::harvestAndDispatch SEND_IMM 分支调用)
+  // type:       MSG_PULL_MEM / MSG_FREE
+  // msg_id:     大包 msg_id(PULL/FREE 匹配)
+  // remote_va:  PULL_MEM 时为远端 buffer 虚拟地址(从 imm_data 取);FREE 时为 0
+  // data_size:  PULL_MEM 时为远端数据长度(从 recv_buf trailing 取);FREE 时为 0
+  void onControlMsgImm(uint8_t type, uint16_t msg_id,
+                       uint64_t remote_va, uint32_t data_size) noexcept;
 
   // 交付缓存数据给当前 read_cb_(支持 movable 和非 movable 两种模式)
   void deliverReadData() noexcept;
@@ -142,7 +145,7 @@ class UrmaAsyncSocket : public AsyncTransport {
   // Phase 5: 处理其他连接 pollTx 收割到的本连接 READ CQE
   // JFS 池化后多连接共享 JFS,pollTx 可能收割到其他连接 post 的 READ CQE,
   // 通过 tx_ctx->socket_id 路由到对应连接调用此方法
-  // msg_id: READ 的 msg_id(对应 PULL_MEM 的 seq)
+  // msg_id: READ 的 msg_id(对应 PULL_MEM 的 msg_id)
   // status: CQE 状态(URMA_CR_SUCCESS 或错误码)
   void handleRemoteReadCqe(uint16_t msg_id, urma_status_t status) noexcept;
 
@@ -242,34 +245,30 @@ class UrmaAsyncSocket : public AsyncTransport {
   // ── 单边 READ 内部函数 ──
   bool sendBigMsgByRead(WriteCallback* cb, std::unique_ptr<IOBuf> node,
                         const std::shared_ptr<BigMsgGroup>& group) noexcept;
-  bool postControlPacket(uint16_t msg_id, uint64_t remote_va,
+  // PULL_MEM 控制包:SEND_IMM,SGE[0]=PullMemControlPacket(32B),imm_data=remote_va
+  // seq: 连接级发送序列号(每 WR 递增,保序用)
+  bool postControlPacket(uint16_t msg_id, uint16_t seq, uint64_t remote_va,
                          uint32_t data_size) noexcept;
   bool startRead(uint16_t msg_id, uint64_t remote_va, uint32_t data_size) noexcept;
-  bool postFreeNotify(uint16_t msg_id) noexcept;
+  // FREE 通知:SEND_IMM,SGE[0]=UrmaMsgHeader(24B),imm_data=msg_id
+  // seq: 连接级发送序列号(每 WR 递增,保序用)
+  bool postFreeNotify(uint16_t msg_id, uint16_t seq) noexcept;
   void onReadComplete() noexcept;
   void onReadFailed(urma_status_t status) noexcept;
   void scanBigMsgTimeout() noexcept;
   void drainRxPendingQueue() noexcept;
-  static uint64_t encodeBigMsgImm(uint16_t msg_id, uint8_t is_ctl, uint32_t data_size) {
-    return (static_cast<uint64_t>(msg_id)) |
-           (static_cast<uint64_t>(is_ctl) << 56) |
-           (static_cast<uint64_t>(data_size) << 16);
-  }
-  static void decodeBigMsgImm(uint64_t imm, uint16_t& msg_id, uint8_t& is_ctl, uint32_t& data_size) {
-    msg_id = static_cast<uint16_t>(imm & 0xFFFF);
-    is_ctl = static_cast<uint8_t>((imm >> 56) & 0xFF);
-    data_size = static_cast<uint32_t>((imm >> 16) & 0xFFFFFFFF);
-  }
 
   EventBase* evb_;
   int tcp_fd_{-1};
   State state_{State::kIdle};
   ReadCallback* read_cb_{nullptr};
 
-  // Phase 3: SocketId(headroom 路由用,接收方据此路由到本 socket)
+  // 独立 buffer 路由:SocketId(接收方据此路由到本 socket)
   SocketId socket_id_{};
-  // Phase 3: per-连接发送序列号(headroom header 中的 seq 字段)
+  // per-连接发送序列号(每 post 一个 WR 递增,DATA/PULL/FREE 都分配,保序用)
   std::atomic<uint16_t> send_seq_{0};
+  // per-连接期望接收序列号(保序校验,与 send_seq_ 对应,接收侧可选校验)
+  std::atomic<uint16_t> expected_seq_{0};
 
   // 性能优化:跟踪本连接活跃的 JFS 位图(避免 pollTx 遍历全部 64 个 JFS)
   // sendChain acquireIoJfs 后置位;pollTx 回收 CQE 后若该 JFS 无本连接在途 WR 则清位
@@ -278,6 +277,15 @@ class UrmaAsyncSocket : public AsyncTransport {
   static constexpr uint32_t kMaxJfsBitmap = 64;
   uint64_t active_jfs_mask_{0};              // 位图:bit i 置位表示 JFS i 有本连接在途 WR
   uint32_t active_jfs_inflight_[kMaxJfsBitmap]{0};  // per-JFS 本连接在途 WR 计数
+
+  // 单连接 pin JFS:首次发送时 round-robin 选定一个 JFS,后续所有发送复用
+  // 保证同连接的 SEND 操作走同一 JFS,硬件保证同 JFS 内 FIFO 顺序
+  // 避免 multi-JFS round-robin 导致的 seq 乱序
+  static constexpr uint32_t kInvalidJfsIndex = 0xFFFFFFFF;
+  uint32_t pinned_jfs_index_{kInvalidJfsIndex};
+
+  // 获取 pin 的 JFS:首次调 acquireIoJfs round-robin 选定,后续复用
+  SharedJfs* acquirePinnedJfs(UrmaJfsPool* pool, uint32_t* out_index);
 
   folly::IOBufQueue read_queue_;
 

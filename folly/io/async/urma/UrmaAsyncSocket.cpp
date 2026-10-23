@@ -12,6 +12,7 @@
 #ifdef FOLLY_HAVE_URMA
 
 #include <algorithm>
+#include <cerrno>
 #include <cstring>
 #include <utility>
 
@@ -25,9 +26,27 @@
 #include <folly/io/async/urma/UrmaHeader.h>
 #include <folly/logging/xlog.h>
 
-#include <unistd.h>
-
 namespace folly {
+
+// 单连接 pin JFS:首次发送时 round-robin 选定一个 JFS,后续所有发送复用
+// 保证同连接的 SEND 操作走同一 JFS,硬件保证同 JFS 内 FIFO 顺序
+SharedJfs* UrmaAsyncSocket::acquirePinnedJfs(UrmaJfsPool* pool,
+                                              uint32_t* out_index) {
+  if (pinned_jfs_index_ != kInvalidJfsIndex) {
+    // 优先用 pin 的 JFS
+    SharedJfs* sj = pool->tryAcquireIoJfsByIndex(pinned_jfs_index_);
+    if (sj) {
+      *out_index = pinned_jfs_index_;
+      return sj;
+    }
+    // pin 的 JFS 满了,fallback 到 round-robin(短暂乱序可接受)
+  }
+  SharedJfs* sj = pool->acquireIoJfs(out_index);
+  if (sj) {
+    pinned_jfs_index_ = *out_index;  // pin 到首次获取的 JFS
+  }
+  return sj;
+}
 
 // 统计 IOBuf chain 中 >peer_rx_buf_size_ 的大包数量(用于 writeChain 完成组计数)
 static uint32_t countBigMsgs(const IOBuf* head, uint32_t peer_rx_buf_size) {
@@ -138,14 +157,17 @@ void UrmaAsyncSocket::onHandshakeReady() {
   // Phase 2: TX CQE 由全局 JFS 池的 CqHandler 处理,不再 per-连接创建 tx_cq_handler_
 
   if (res_.remote_jetty) {
-    XLOG(INFO) << "[URMA-DIAG] onHandshakeReady: registerSocket peer_socket_id="
+    XLOG(DBG) << "[URMA] onHandshakeReady: registerSocket peer_socket_id="
                << res_.peer_socket_id << " peer_io_jetty_id=" << res_.peer_io_jetty_id
                << " this=" << this;
     // Phase 3: 用对端 SocketId 注册(headroom 路由,接收方按 header.src_socket_id 查表)
     shared_->registerSocket(res_.peer_socket_id, this);
+    // TX CQE 路由:harvestTxAndDispatch 收割 READ CQE 后用 tx_ctx->socket_id
+    // (= 本端 socket_id_) 查 socket_map_,需同时注册本端 socket_id
+    shared_->registerSocket(socket_id_.toUint64(), this);
   }
   if (res_.remote_fc_jetty) {
-    XLOG(INFO) << "[URMA-DIAG] onHandshakeReady: registerFcSocket peer_socket_id="
+    XLOG(DBG) << "[URMA] onHandshakeReady: registerFcSocket peer_socket_id="
                << res_.peer_socket_id << " peer_fc_jetty_id=" << res_.peer_fc_jetty_id
                << " this=" << this;
     shared_->registerFcSocket(res_.peer_socket_id, this);
@@ -167,10 +189,29 @@ void UrmaAsyncSocket::onHandshakeReady() {
 
 void UrmaAsyncSocket::onHandshakeError(const std::string& reason) {
   XLOG(ERR) << "UrmaAsyncSocket: handshake error: " << reason;
-  tcp_handshake_handler_.reset();
+  // tcp_handshake_handler_ 和 handshake_ 都不能同步删除 —
+  // onHandshakeError 可能从 TcpHandshakeHandler::handlerReady →
+  // UrmaHandshake::onDataAvailable/timeoutExpired → error_cb_ 调用链进入,
+  // 同步删除会导致当前栈帧 use-after-free (SIGSEGV/SIGBUS)。
+  // 先 unregisterHandler(从 epoll 摘除),再用 runInLoop 异步 delete。
+  if (tcp_handshake_handler_) {
+    auto* handler = tcp_handshake_handler_.release();
+    tcp_handshake_handler_ = nullptr;
+    handler->unregisterHandler();  // 立即从 epoll 摘除,防止再次触发 handlerReady
+    if (evb_) {
+      evb_->runInLoop([handler] { delete handler; });
+    } else {
+      delete handler;
+    }
+  }
   if (handshake_) {
-    delete handshake_;
+    auto* hs = handshake_;
     handshake_ = nullptr;
+    if (evb_) {
+      evb_->runInLoop([hs] { delete hs; });
+    } else {
+      delete hs;
+    }
   }
 
   // Phase 8: 降级 TCP — 握手失败时用已有 tcp_fd_ 创建 AsyncSocket 作为 delegate
@@ -391,6 +432,9 @@ void UrmaAsyncSocket::pollTx() noexcept {
         }
       }
     }
+    // edge-triggered rearm: pollTx 收割 CQE 后必须 rearm,
+    // 否则后续新 CQE 到达时 edge-triggered epoll 不触发(harvestTxAndDispatch 饿死)
+    urma_rearm_jfc(sj->jfc, false);
   }
 }
 
@@ -416,27 +460,13 @@ urma_status_t UrmaAsyncSocket::sendChain(WriteCallback* cb,
     return URMA_FAIL;
   }
 
-  // Phase 6: inline 路径预留(设计 §4.5 inline 快速路径)
-  // 当 payload ≤ max_inline_len - 10(header 开销)时,走 inline SEND(零拷贝,无需 SGE)
-  // 当前硬件 max_inline_len=8,条件不满足,自动走 headroom 路径
-  // 未来硬件支持更大 inline 时,此条件自动启用
-  uint32_t max_inline_len = UrmaInit::getMaxJfsInlineLen();
-  if (chain && !chain->isChained() &&  // 单 IOBuf block
-      max_inline_len > 10 + sizeof(UrmaMsgHeader) &&
-      chain->length() <= max_inline_len - 10) {
-    // inline 快速路径(当前不可达,预留)
-    // 未来实现:post inline SEND,无需 acquireIoJfs/SGE
-    // 暂走 headroom 路径
-  }
-
   while (chain) {
     uint32_t sge_total = 0;
     int num_sge = 0;
 
     uint8_t hw_max_sge = UrmaInit::getMaxJfsSge();
     size_t chain_remaining = chain->countChainElements();
-    // Phase 3: 预留 1 个 SGE 给 header(路径 B:headroom 不足时插入独立 header IOBuf)
-    // 路径 A 复用 headroom 时不会额外占用 SGE,但预留一位保证路径 B 不越界
+    // 独立 buffer 方案:SGE[0] 固定给 header(24B),data SGE 最多 hw_max_sge-1
     uint8_t max_data_sge = static_cast<uint8_t>(
         std::min(chain_remaining, static_cast<size_t>(hw_max_sge - 1)));
     uint8_t sge_capacity = static_cast<uint8_t>(max_data_sge + 1);
@@ -445,22 +475,14 @@ urma_status_t UrmaAsyncSocket::sendChain(WriteCallback* cb,
     // 持有本次 WR 引用的 IOBuf chain(防止 post 期间被释放)
     auto wr_chain_head = std::make_shared<IOBuf>();
 
-    // Phase 3: 记录第一个 IOBuf 指针(用于后续 prepend 写 header)
-    IOBuf* first_buf = nullptr;
-    uint32_t first_data_len = 0;
-
     while (chain && num_sge < max_data_sge) {
       size_t iobuf_len = chain->length();
-      // Phase 3: headroom 路径下总长 = header(64B) + sge_total,
-      // 不能超过 peer_rx_buf_size_(recv buffer 大小)
+      // 总长 = header(24B) + sge_total,不能超过 peer_rx_buf_size_(recv buffer 大小)
       if (sge_total + iobuf_len + sizeof(UrmaMsgHeader) > peer_rx_buf_size_ &&
           num_sge > 0) {
         break;
       }
-      // Phase 3: headroom 路径下 SGE[0] = header(64B) + data,
-      // data 不能超过 peer_rx_buf_size_ - sizeof(UrmaMsgHeader),
-      // 否则接收端 recv buffer(4096B) 装不下 header+data,header 被截断。
-      // 大包判断条件:data_len + 64 > peer_rx_buf_size_ → 走单边 READ
+      // 大包判断条件:data_len + 24 > peer_rx_buf_size_ → 走单边 READ
       if (iobuf_len + sizeof(UrmaMsgHeader) > peer_rx_buf_size_) {
         // §4.7 大包:走单边 READ(控制包 SEND_IMM + 对端 READ 拉取 + FREE)
         auto big = std::move(chain);
@@ -476,18 +498,12 @@ urma_status_t UrmaAsyncSocket::sendChain(WriteCallback* cb,
         if (group) group->done = true;
         return URMA_FAIL;
       }
-      // Phase 3: 先 clone(保留 headroom 引用),把 clone 加入发送链
-      // 关键:必须保留 clone 的裸指针,因为 chain->pop() 会销毁原 head IOBuf
-      // 若保存 chain.get() 作 first_buf,后续 prepend 会访问悬空指针
+      // clone IOBuf 节点,加入发送链
       std::unique_ptr<IOBuf> cloned = chain->cloneOne();
-      (*sge_arr)[num_sge].addr = reinterpret_cast<uint64_t>(cloned->writableData());
-      (*sge_arr)[num_sge].len = static_cast<uint32_t>(iobuf_len);
-      (*sge_arr)[num_sge].tseg = UrmaInit::getPoolTseg();
-      // Phase 3: 记录第一个 clone block(用于 headroom header 写入)
-      if (num_sge == 0) {
-        first_buf = cloned.get();
-        first_data_len = static_cast<uint32_t>(iobuf_len);
-      }
+      // data SGE 从 SGE[1] 开始(SGE[0] 留给 header,稍后填入)
+      (*sge_arr)[num_sge + 1].addr = reinterpret_cast<uint64_t>(cloned->writableData());
+      (*sge_arr)[num_sge + 1].len = static_cast<uint32_t>(iobuf_len);
+      (*sge_arr)[num_sge + 1].tseg = UrmaInit::getPoolTseg();
       wr_chain_head->appendChain(std::move(cloned));
       sge_total += iobuf_len;
       num_sge++;
@@ -496,70 +512,25 @@ urma_status_t UrmaAsyncSocket::sendChain(WriteCallback* cb,
 
     if (num_sge == 0) break;
 
-    // Phase 3: headroom 路由 — 在第一个 IOBuf block 的 headroom 写 UrmaMsgHeader
-    // 优先复用 first_buf 的 headroom(内存池 IOBuf 有 64B headroom);
-    // headroom 不足时(rocket transport 默认 IOBuf 只有 ~16B headroom)
-    // 在 chain 前面插入独立 64B header IOBuf 作为 SGE[0],原 SGE 顺延
+    // 独立 buffer 方案:始终创建独立 header IOBuf 作为 SGE[0]
+    // 不再判断 headroom,不再 prepend,不再区分路径 A/B
     uint16_t seq = send_seq_.fetch_add(1, std::memory_order_relaxed);
-    if (first_buf && first_buf->headroom() >= sizeof(UrmaMsgHeader)) {
-      // 路径 A:复用 headroom,SGE[0] 覆盖 header+data(单 SGE 合并)
-      first_buf->prepend(sizeof(UrmaMsgHeader));
-      auto* hdr = reinterpret_cast<UrmaMsgHeader*>(first_buf->writableData());
-      hdr->magic = URMA_MAGIC;
-      hdr->src_socket_id = socket_id_.toUint64();
-      hdr->seq = seq;
-      hdr->type = MSG_DATA;
-      hdr->msg_count = static_cast<uint8_t>(num_sge);
-      hdr->data_size = sge_total;
-      hdr->data_sge_count = static_cast<uint32_t>(num_sge);
-      std::memset(hdr->sub_len, 0, sizeof(hdr->sub_len));
-      hdr->sub_len[0] = static_cast<uint16_t>(first_data_len);
-      hdr->reserved[0] = 0;
-      hdr->reserved[1] = 0;
-      // SGE[0] 扩展覆盖 header+data
-      (*sge_arr)[0].addr = reinterpret_cast<uint64_t>(first_buf->writableData());
-      (*sge_arr)[0].len = sizeof(UrmaMsgHeader) + first_data_len;
-      sge_total += sizeof(UrmaMsgHeader);
-    } else {
-      // 路径 B:headroom 不足,插入独立 64B header IOBuf 作为 SGE[0]
-      // 原 SGE[0..n-1] 顺延为 SGE[1..n],需检查 max_sge 上限
-      if (num_sge + 1 > hw_max_sge) {
-        // 超限:无法插入 header,报错(理论上 max_sge=13 不会触发)
-        if (cb) cb->writeErr(total_posted, AsyncSocketException(
-            AsyncSocketException::UNKNOWN, "SGE overflow with header"));
-        if (group) group->done = true;
-        return URMA_FAIL;
-      }
-      auto hdr_buf = IOBuf::create(sizeof(UrmaMsgHeader));
-      hdr_buf->append(sizeof(UrmaMsgHeader));
-      auto* hdr = reinterpret_cast<UrmaMsgHeader*>(hdr_buf->writableData());
-      hdr->magic = URMA_MAGIC;
-      hdr->src_socket_id = socket_id_.toUint64();
-      hdr->seq = seq;
-      hdr->type = MSG_DATA;
-      hdr->msg_count = static_cast<uint8_t>(num_sge);
-      hdr->data_size = sge_total;
-      hdr->data_sge_count = static_cast<uint32_t>(num_sge);
-      std::memset(hdr->sub_len, 0, sizeof(hdr->sub_len));
-      hdr->sub_len[0] = static_cast<uint16_t>(first_data_len);
-      hdr->reserved[0] = 0;
-      hdr->reserved[1] = 0;
-      // SGE 数组后移一位,腾出 SGE[0] 给 header
-      for (int k = num_sge; k > 0; --k) {
-        (*sge_arr)[k] = (*sge_arr)[k - 1];
-      }
-      (*sge_arr)[0].addr = reinterpret_cast<uint64_t>(hdr_buf->writableData());
-      (*sge_arr)[0].len = sizeof(UrmaMsgHeader);
-      (*sge_arr)[0].tseg = UrmaInit::getPoolTseg();
-      num_sge += 1;
-      sge_total += sizeof(UrmaMsgHeader);
-      // hdr_buf 加入发送链,保持存活到 TX CQE
-      wr_chain_head->appendChain(std::move(hdr_buf));
-    }
+    auto hdr_buf = IOBuf::create(sizeof(UrmaMsgHeader));
+    hdr_buf->append(sizeof(UrmaMsgHeader));
+    writeHeader(hdr_buf.get(), socket_id_.toUint64(), seq, MSG_DATA, 0);
 
-    // Phase 2: 从 JFS 池获取一个空闲 JFS
+    // SGE[0] = header(24B)
+    (*sge_arr)[0].addr = reinterpret_cast<uint64_t>(hdr_buf->writableData());
+    (*sge_arr)[0].len = sizeof(UrmaMsgHeader);
+    (*sge_arr)[0].tseg = UrmaInit::getPoolTseg();
+    num_sge += 1;
+    sge_total += sizeof(UrmaMsgHeader);
+    // hdr_buf 加入发送链,保持存活到 TX CQE
+    wr_chain_head->appendChain(std::move(hdr_buf));
+
+    // Phase 2: 从 JFS 池获取一个空闲 JFS(pin 到同连接固定 JFS,保证顺序)
     uint32_t jfs_index = 0;
-    SharedJfs* sj = pool->acquireIoJfs(&jfs_index);
+    SharedJfs* sj = acquirePinnedJfs(pool, &jfs_index);
     if (!sj) {
       // 所有 JFS 的 SQ 都满 → EAGAIN
       return URMA_EAGAIN;
@@ -687,66 +658,64 @@ bool UrmaAsyncSocket::sendBigMsgByRead(WriteCallback* cb,
 //              << " remote_va=" << remote_va
 //              << " inflight=" << pending_big_msg_.size();
 
-  if (!postControlPacket(msg_id, remote_va, data_size)) {
+  // 控制消息(PULL_MEM)走 SEND_IMM → onControlMsgImm,不经过 onIoMessageReceived seq 校验。
+  // 不递增 send_seq_,避免大包场景下 expected_seq_ 与 send_seq_ 不同步。
+  if (!postControlPacket(msg_id, 0, remote_va, data_size)) {
     pending_big_msg_.erase(msg_id);
     return false;
   }
   return true;
 }
 
-bool UrmaAsyncSocket::postControlPacket(uint16_t msg_id, uint64_t remote_va,
+bool UrmaAsyncSocket::postControlPacket(uint16_t msg_id, uint16_t seq,
+                                        uint64_t remote_va,
                                         uint32_t data_size) noexcept {
   if (!res_.remote_jetty) return false;
 
-  // Phase 2: 从 JFS 池获取 IO JFS
+  // 从 JFS 池获取 IO JFS
   UrmaJfsPool* pool = UrmaJfsPool::get();
   if (!pool) return false;
   uint32_t jfs_index = 0;
-  SharedJfs* sj = pool->acquireIoJfs(&jfs_index);
+  SharedJfs* sj = acquirePinnedJfs(pool, &jfs_index);
   if (!sj) {
     XLOG(WARN) << "[URMA] postControlPacket: no available JFS";
     return false;
   }
   markActiveJfs(jfs_index);
 
-  // Phase 5: 控制包改用 headroom 小 SEND(替代 SEND_IMM)
-  // 构造 64B header(MSG_PULL_MEM) + 8B remote_va data
-  // header.seq = msg_id(接收侧 onIoMessageReceived 用 seq 作为 msg_id 匹配 READ/FREE)
-  auto hdr_buf = IOBuf::create(sizeof(UrmaMsgHeader) + sizeof(uint64_t));
-  hdr_buf->append(sizeof(UrmaMsgHeader) + sizeof(uint64_t));
-  auto* hdr = reinterpret_cast<UrmaMsgHeader*>(hdr_buf->writableData());
-  hdr->magic = URMA_MAGIC;
-  hdr->src_socket_id = socket_id_.toUint64();
-  hdr->seq = msg_id;  // 控制包用 msg_id 作为 seq(接收侧据此匹配)
-  hdr->type = MSG_PULL_MEM;
-  hdr->msg_count = 1;
-  hdr->data_size = data_size;
-  hdr->data_sge_count = 0;
-  std::memset(hdr->sub_len, 0, sizeof(hdr->sub_len));
-  std::memset(hdr->reserved, 0, sizeof(hdr->reserved));
-  // data 部分:8 字节 remote_va
-  std::memcpy(hdr_buf->writableData() + sizeof(UrmaMsgHeader),
-              &remote_va, sizeof(remote_va));
+  // PULL_MEM 控制包:SEND_IMM + PullMemControlPacket(32B) + imm_data(remote_va)
+  // SGE[0] = PullMemControlPacket(24B header + 4B data_size + 4B padding)
+  // imm_data = remote_va(随 CQE 通告给接收方)
+  // inline_flag=1:32B ≤ max_inline_size,NIC 内联拷贝,无需 MR 注册
+  auto ctrl_buf = IOBuf::create(sizeof(PullMemControlPacket));
+  ctrl_buf->append(sizeof(PullMemControlPacket));
+  auto* pkt = reinterpret_cast<PullMemControlPacket*>(ctrl_buf->writableData());
+  writeHeader(&pkt->header, socket_id_.toUint64(), seq, MSG_PULL_MEM, msg_id);
+  pkt->data_size = data_size;
+  pkt->padding = 0;
 
   auto sge_arr = std::make_shared<std::vector<urma_sge_t>>(1);
-  (*sge_arr)[0].addr = reinterpret_cast<uint64_t>(hdr_buf->writableData());
-  (*sge_arr)[0].len = sizeof(UrmaMsgHeader) + sizeof(uint64_t);
+  (*sge_arr)[0].addr = reinterpret_cast<uint64_t>(ctrl_buf->writableData());
+  (*sge_arr)[0].len = sizeof(PullMemControlPacket);
   (*sge_arr)[0].tseg = UrmaInit::getPoolTseg();
 
   auto* tx_ctx = new TxCompletionCtx();
   tx_ctx->type = TxCompletionCtx::MSG_CTRL_PULL;
   tx_ctx->socket_id = socket_id_.toUint64();
+  tx_ctx->seq = seq;
   tx_ctx->jfs_index = jfs_index;
   tx_ctx->msg_id = msg_id;
   tx_ctx->sge_arr = sge_arr;
-  tx_ctx->send_data = std::move(*hdr_buf);  // 持有 buffer 到 TX CQE
+  tx_ctx->send_data = std::move(*ctrl_buf);  // 持有 buffer 到 TX CQE
 
   urma_jfs_wr_t wr = {};
-  wr.opcode = URMA_OPC_SEND;
+  wr.opcode = URMA_OPC_SEND_IMM;  // SEND_IMM:imm_data 携带 remote_va
   wr.tjetty = res_.remote_jetty;
   wr.flag.bs.complete_enable = 1;
+  wr.flag.bs.inline_flag = 1;  // NIC 内联拷贝 32B,不 DMA
   wr.send.src.sge = sge_arr->data();
   wr.send.src.num_sge = 1;
+  wr.send.imm_data = remote_va;  // 随 CQE 通告给接收方
   wr.user_ctx = reinterpret_cast<uint64_t>(tx_ctx);
   wr.next = nullptr;
 
@@ -764,21 +733,17 @@ bool UrmaAsyncSocket::postControlPacket(uint16_t msg_id, uint64_t remote_va,
 
 // ── 单边 READ:接收方 ──
 
-void UrmaAsyncSocket::onControlMsg(uint64_t imm, const void* meta) noexcept {
-  uint16_t msg_id;
-  uint8_t is_ctl;
-  uint32_t data_size;
-  decodeBigMsgImm(imm, msg_id, is_ctl, data_size);
-  XLOG(DBG) << "[URMA-DIAG] onControlMsg msg_id=" << msg_id
-             << " is_ctl=" << static_cast<int>(is_ctl)
+void UrmaAsyncSocket::onControlMsgImm(uint8_t type, uint16_t msg_id,
+                                       uint64_t remote_va,
+                                       uint32_t data_size) noexcept {
+  XLOG(DBG) << "[URMA] onControlMsgImm type=" << static_cast<int>(type)
+             << " msg_id=" << msg_id
              << " data_size=" << data_size
              << " has_pending_read=" << has_pending_read_;
 
-  if (is_ctl == kCtrlTypeFree) {
+  if (type == MSG_FREE) {
     // 发送方收到 FREE:释放大 buffer。writeSuccess 只在组内全部大包 FREE 后回调一次
     auto it = pending_big_msg_.find(msg_id);
-//                << " found=" << (it != pending_big_msg_.end())
-//                << " inflight=" << pending_big_msg_.size();
     if (it != pending_big_msg_.end() && !it->second.is_free) {
       auto group = it->second.group;
       WriteCallback* cb = it->second.cb;
@@ -795,31 +760,31 @@ void UrmaAsyncSocket::onControlMsg(uint64_t imm, const void* meta) noexcept {
     return;
   }
 
-  if (is_ctl != kCtrlTypePull) {
+  if (type != MSG_PULL_MEM) {
     return;
   }
 
-  // PULL:解码元数据(8 字节 remote_va)
-  uint64_t remote_va = 0;
-  if (meta) {
-    std::memcpy(&remote_va, meta, sizeof(remote_va));
-  }
-//              << " remote_va=" << remote_va << " pending=" << has_pending_read_
-//              << " is_ctl=" << static_cast<int>(is_ctl);
-
+  // PULL_MEM:remote_va 和 data_size 已由调用方从 imm_data 和 recv_buf trailing 解析
   if (has_pending_read_) {
     // 有 READ 在途:控制包进保序队列(等当前 READ 完成)
+    XLOG(DBG) << "[URMA] PULL_MEM queued: msg_id=" << msg_id
+               << " has_pending_read=true pending_read_msg_id=" << pending_read_msg_id_
+               << " qsize=" << rx_pending_queue_.size();
     RxBufItem item;
     item.is_control = true;
     item.msg_id = msg_id;
     item.remote_va = remote_va;
     item.data_size = data_size;
     rx_pending_queue_.push(std::move(item));
-//                << " size=" << data_size << " qsize=" << rx_pending_queue_.size();
     return;
   }
 
+  XLOG(DBG) << "[URMA] PULL_MEM startRead: msg_id=" << msg_id
+             << " data_size=" << data_size;
   has_pending_read_ = startRead(msg_id, remote_va, data_size);
+  if (!has_pending_read_) {
+    XLOG(ERR) << "[URMA] PULL_MEM startRead FAILED: msg_id=" << msg_id;
+  }
 }
 
 bool UrmaAsyncSocket::startRead(uint16_t msg_id, uint64_t remote_va,
@@ -840,7 +805,7 @@ bool UrmaAsyncSocket::startRead(uint16_t msg_id, uint64_t remote_va,
     return false;
   }
   uint32_t jfs_index = 0;
-  SharedJfs* sj = pool->acquireIoJfs(&jfs_index);
+  SharedJfs* sj = acquirePinnedJfs(pool, &jfs_index);
   if (!sj) {
     XLOG(WARN) << "startRead: no available JFS";
     return false;
@@ -889,9 +854,14 @@ bool UrmaAsyncSocket::startRead(uint16_t msg_id, uint64_t remote_va,
     XLOG(ERR) << "startRead: post READ failed, status=" << st << " msg_id=" << msg_id;
     return false;
   }
-  XLOG(DBG) << "[URMA-DIAG] startRead posted msg_id=" << msg_id
-             << " jfs_idx=" << jfs_index << " remote_va=0x" << std::hex
-             << remote_va << std::dec << " size=" << data_size;
+  XLOG(DBG) << "[URMA] startRead posted msg_id=" << msg_id
+             << " jfs_idx=" << jfs_index << " size=" << data_size;
+  // 调度 pollTx 确保 READ CQE 被收割。
+  // startRead 可能从 drainRxPendingQueue 调用(不在 writeChain/onIoMessageReceived 上下文中),
+  // 此时没有后续的 pollTx 调用,READ CQE 会饿死。
+  if (evb_) {
+    evb_->runInLoop([this] { pollTx(); });
+  }
   return true;
 }
 
@@ -900,7 +870,7 @@ void UrmaAsyncSocket::onReadComplete() noexcept {
     XLOG(WARN) << "[URMA] readDone: pending_read_buf_ already reset, skip";
     return;
   }
-  XLOG(DBG) << "[URMA-DIAG] onReadComplete msg_id=" << pending_read_msg_id_
+  XLOG(DBG) << "[URMA] onReadComplete msg_id=" << pending_read_msg_id_
              << " len=" << pending_read_buf_->length();
   auto data = std::move(pending_read_buf_);
   pending_read_sge_.reset();
@@ -917,7 +887,8 @@ void UrmaAsyncSocket::onReadComplete() noexcept {
     return;
   }
 
-  if (!postFreeNotify(pending_read_msg_id_)) {
+  // FREE 通知走 SEND_IMM → onControlMsgImm,不经过 seq 校验,不递增 send_seq_
+  if (!postFreeNotify(pending_read_msg_id_, 0)) {
     XLOG(WARN) << "UrmaAsyncSocket: postFreeNotify failed for msg_id="
                << pending_read_msg_id_;
   }
@@ -937,59 +908,38 @@ void UrmaAsyncSocket::onReadFailed(urma_status_t status) noexcept {
 
 void UrmaAsyncSocket::handleRemoteReadCqe(uint16_t msg_id,
                                           urma_status_t status) noexcept {
-  // Phase 5: 处理其他连接 pollTx/harvestTxAndDispatch 收割到的本连接 READ CQE。
-  // JFS 池化后多连接共享 JFS,READ CQE 可能被其他连接的 poll 收割。
-  // 通过 tx_ctx->socket_id 路由到本连接调用此方法。
-  //
-  // 用 runInLoop 异步执行,避免在 harvestTxAndDispatch 调用栈中同步处理
-  // 导致递归(onReadComplete → deliverReadData → write → sendChain → pollTx)。
   if (msg_id != pending_read_msg_id_) {
+    XLOG(DBG) << "[URMA] handleRemoteReadCqe MISMATCH: msg_id=" << msg_id
+              << " expected=" << pending_read_msg_id_ << " status=" << status;
     return;  // 不是当前等待的 READ,忽略(重复或过时 CQE)
   }
-  if (!evb_) {
-    // 无 EventBase(不应发生),直接处理
-    if (status == URMA_CR_SUCCESS) {
-      onReadComplete();
-    } else {
-      onReadFailed(status);
-    }
-    return;
+  // 同步处理:与 pollTx 中本连接 READ CQE 处理保持一致。
+  // 之前用 runInLoop 异步调度,高 QPS 时 EventBase 事件队列积压导致
+  // onReadComplete 延迟执行,串行 READ 累积延迟超过 RPC timeout。
+  // 串行化保证同时只有 1 个 READ 在途,同步调用不会递归超过 1 层。
+  if (status == URMA_CR_SUCCESS) {
+    onReadComplete();
+  } else {
+    onReadFailed(status);
   }
-  evb_->runInLoop([this, status] {
-    if (status == URMA_CR_SUCCESS) {
-      onReadComplete();
-    } else {
-      onReadFailed(status);
-    }
-  });
 }
 
-bool UrmaAsyncSocket::postFreeNotify(uint16_t msg_id) noexcept {
+bool UrmaAsyncSocket::postFreeNotify(uint16_t msg_id, uint16_t seq) noexcept {
   if (!res_.remote_jetty) return false;
 
-  // Phase 2: 从 JFS 池获取 IO JFS
+  // 从 JFS 池获取 IO JFS
   UrmaJfsPool* pool = UrmaJfsPool::get();
   if (!pool) return false;
   uint32_t jfs_index = 0;
-  SharedJfs* sj = pool->acquireIoJfs(&jfs_index);
+  SharedJfs* sj = acquirePinnedJfs(pool, &jfs_index);
   if (!sj) return false;
   markActiveJfs(jfs_index);
 
-  // Phase 5: FREE 通知改用 headroom 小 SEND(替代 SEND_IMM)
-  // 构造 64B header(MSG_FREE),无 data
-  // header.seq = msg_id(复用对应 PULL_MEM 的 msg_id,发送方据此匹配释放)
+  // FREE 通知:SEND_IMM + UrmaMsgHeader(24B) + imm_data(msg_id)
+  // inline_flag=1:24B ≤ max_inline_size,NIC 内联拷贝,无需 MR 注册
   auto hdr_buf = IOBuf::create(sizeof(UrmaMsgHeader));
   hdr_buf->append(sizeof(UrmaMsgHeader));
-  auto* hdr = reinterpret_cast<UrmaMsgHeader*>(hdr_buf->writableData());
-  hdr->magic = URMA_MAGIC;
-  hdr->src_socket_id = socket_id_.toUint64();
-  hdr->seq = msg_id;  // 复用 PULL_MEM 的 msg_id
-  hdr->type = MSG_FREE;
-  hdr->msg_count = 1;
-  hdr->data_size = 0;
-  hdr->data_sge_count = 0;
-  std::memset(hdr->sub_len, 0, sizeof(hdr->sub_len));
-  std::memset(hdr->reserved, 0, sizeof(hdr->reserved));
+  writeHeader(hdr_buf.get(), socket_id_.toUint64(), seq, MSG_FREE, msg_id);
 
   auto sge_arr = std::make_shared<std::vector<urma_sge_t>>(1);
   (*sge_arr)[0].addr = reinterpret_cast<uint64_t>(hdr_buf->writableData());
@@ -999,17 +949,20 @@ bool UrmaAsyncSocket::postFreeNotify(uint16_t msg_id) noexcept {
   auto* tx_ctx = new TxCompletionCtx();
   tx_ctx->type = TxCompletionCtx::MSG_CTRL_FREE;
   tx_ctx->socket_id = socket_id_.toUint64();
+  tx_ctx->seq = seq;
   tx_ctx->jfs_index = jfs_index;
   tx_ctx->msg_id = msg_id;
   tx_ctx->sge_arr = sge_arr;
   tx_ctx->send_data = std::move(*hdr_buf);  // 持有 buffer 到 TX CQE
 
   urma_jfs_wr_t wr = {};
-  wr.opcode = URMA_OPC_SEND;
+  wr.opcode = URMA_OPC_SEND_IMM;  // SEND_IMM:imm_data 携带 msg_id
   wr.tjetty = res_.remote_jetty;
   wr.flag.bs.complete_enable = 1;
+  wr.flag.bs.inline_flag = 1;  // NIC 内联拷贝 24B,不 DMA
   wr.send.src.sge = sge_arr->data();
   wr.send.src.num_sge = 1;
+  wr.send.imm_data = static_cast<uint64_t>(msg_id);  // 低 16 位有效
   wr.user_ctx = reinterpret_cast<uint64_t>(tx_ctx);
   wr.next = nullptr;
 
@@ -1083,7 +1036,8 @@ void UrmaAsyncSocket::scanBigMsgTimeout() noexcept {
 
     if (p.is_free) {
       // FREE 重发(发送方未确认释放)
-      if (postFreeNotify(it->first)) {
+      // FREE 重发:控制消息不递增 send_seq_
+      if (postFreeNotify(it->first, 0)) {
         p.retries++;
         p.post_time = now;
         XLOG(WARN) << "[URMA] sendBig: resend FREE msg_id=" << it->first
@@ -1095,8 +1049,9 @@ void UrmaAsyncSocket::scanBigMsgTimeout() noexcept {
       // 控制包重发
       uint64_t remote_va = reinterpret_cast<uint64_t>(p.iobuf->data());
       uint32_t data_size = static_cast<uint32_t>(p.iobuf->length());
-      if (postControlPacket(static_cast<uint16_t>(it->first), remote_va,
-                            data_size)) {
+      // PULL_MEM 重发:控制消息不递增 send_seq_
+      if (postControlPacket(static_cast<uint16_t>(it->first), 0,
+                            remote_va, data_size)) {
         p.retries++;
         p.post_time = now;
         XLOG(WARN) << "UrmaAsyncSocket: resend control msg_id=" << it->first
@@ -1114,9 +1069,11 @@ void UrmaAsyncSocket::scanBigMsgTimeout() noexcept {
   }
 }
 
-// ── Phase 3: headroom 路由 ──
-// 从 recv buffer 前 64B 解析 UrmaMsgHeader,按 type 分发
-// recv_buf: 接收到的 buffer 起始(header 64B + data)
+// ── Phase 3: 独立 buffer 路由 ──
+// 从 recv buffer 前 24B 解析 UrmaMsgHeader,仅处理 MSG_DATA
+// MSG_PULL_MEM / MSG_FREE 走 SEND_IMM 路径,由 UrmaJfrPool::harvestAndDispatch
+// 解析 imm_data + PullMemControlPacket 后直接调 onControlMsgImm,不进入此方法
+// recv_buf: 接收到的 buffer 起始(header 24B + data)
 // recv_len: 实际接收字节数
 // slot:     rx_bufs_ 的 slot 索引(补投 recv WR 用)
 void UrmaAsyncSocket::onIoMessageReceived(void* recv_buf, uint32_t recv_len,
@@ -1132,32 +1089,35 @@ void UrmaAsyncSocket::onIoMessageReceived(void* recv_buf, uint32_t recv_len,
     return;
   }
 
-  uint32_t data_len = recv_len - sizeof(UrmaMsgHeader);
-  void* data_ptr = static_cast<uint8_t*>(recv_buf) + sizeof(UrmaMsgHeader);
+  // version 校验(不匹配仅 WARN,不丢弃,向前兼容)
+  if (hdr->version != URMA_VERSION) {
+    XLOG(WARN) << "[URMA] onIoMessageReceived: version mismatch, got="
+               << static_cast<int>(hdr->version)
+               << " expected=" << static_cast<int>(URMA_VERSION)
+               << " type=" << static_cast<int>(hdr->type);
+  }
+
+  // seq 保序校验(可选,不一致仅 WARN 不丢弃)
+  uint16_t expected = expected_seq_.load(std::memory_order_relaxed);
+  if (hdr->seq != expected) {
+    XLOG(WARN) << "[URMA] seq mismatch: expected=" << expected
+               << " got=" << hdr->seq
+               << " type=" << static_cast<int>(hdr->type);
+  }
+  expected_seq_.store(static_cast<uint16_t>(hdr->seq + 1),
+                      std::memory_order_relaxed);
 
   if (hdr->type == MSG_DATA) {
-    // 普通 SEND 数据:跳过 64B header,取 data 部分交付
+    // 普通 SEND 数据:跳过 24B header,取 data 部分交付
+    uint32_t data_len = recv_len - sizeof(UrmaMsgHeader);
+    void* data_ptr = static_cast<uint8_t*>(recv_buf) + sizeof(UrmaMsgHeader);
     auto iobuf = IOBuf::wrapBuffer(data_ptr, data_len);
     onRxBuf(std::move(iobuf));
-  } else if (hdr->type == MSG_PULL_MEM) {
-    // 大包控制包(PULL):meta 在 data 部分(8 字节 remote_va)
-    // 复用 onControlMsg,is_ctl=kCtrlTypePull,imm 编码 msg_id|is_ctl|data_size
-    // msg_id 从 header seq 字段获取(Phase 5 保序后改用独立 msg_id)
-    XLOG(DBG) << "[URMA-DIAG] onIoMessageReceived MSG_PULL_MEM msg_id="
-               << hdr->seq << " data_size=" << hdr->data_size
-               << " data_len=" << data_len;
-    uint64_t imm = encodeBigMsgImm(hdr->seq, kCtrlTypePull,
-                                    hdr->data_size);
-    onControlMsg(imm, data_ptr);
-  } else if (hdr->type == MSG_FREE) {
-    // 大包 FREE 通知:无 meta
-    XLOG(DBG) << "[URMA-DIAG] onIoMessageReceived MSG_FREE msg_id="
-               << hdr->seq;
-    uint64_t imm = encodeBigMsgImm(hdr->seq, kCtrlTypeFree, 0);
-    onControlMsg(imm, nullptr);
   } else {
-    XLOG(WARN) << "[URMA] onIoMessageReceived: unknown type="
-               << static_cast<int>(hdr->type);
+    // MSG_PULL_MEM / MSG_FREE 不应出现在 SEND 路径(应走 SEND_IMM)
+    XLOG(WARN) << "[URMA] onIoMessageReceived: unexpected type="
+               << static_cast<int>(hdr->type)
+               << " in SEND path (expected SEND_IMM), msg_id=" << hdr->msg_id;
   }
 
   // Phase 5: RX 处理后异步调度 pollTx,收割可能在途的 READ/SEND TX CQE。
@@ -1456,6 +1416,7 @@ void UrmaAsyncSocket::destroyUrmaResources() {
   if (res_.remote_jetty) {
     if (auto* pool = UrmaJfrPool::get()) {
       pool->unregisterSocket(res_.peer_socket_id);
+      pool->unregisterSocket(socket_id_.toUint64());
     }
   }
   if (res_.remote_fc_jetty) {
