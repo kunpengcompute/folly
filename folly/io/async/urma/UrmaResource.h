@@ -33,7 +33,7 @@ namespace folly {
 // post 前 new TxCompletionCtx{..., std::move(io_buf)}
 // TX CQE 后 delete ctx → send_data 析构 → block 回收到对应池
 struct TxCompletionCtx {
-  uint64_t socket_id;          // 发送方 SocketId(Phase 3 headroom 路由用,当前未使用)
+  uint64_t socket_id;          // 本端 SocketId(TX CQE 路由用,harvestTxAndDispatch 据此查 socket_map)
   uint16_t seq;                // 消息序列号(Phase 5 保序用,当前未使用)
   uint8_t  type;               // MSG_DATA / MSG_CTRL_PULL / MSG_CTRL_FREE / MSG_READ
   uint8_t  padding;
@@ -75,9 +75,10 @@ struct UrmaResource {
   uint32_t peer_io_jetty_id = 0;
   uint32_t peer_fc_jetty_id = 0;
 
-  // ── 对端 SocketId(Phase 3 headroom 路由用) ──
-  // 接收方收到数据时,从 header.src_socket_id 路由到本 socket
-  // 注册时 key = peer_socket_id(对端发送时写入 header 的 src_socket_id)
+  // ── 对端 SocketId(发送方写入 header.dst_socket_id 的值) ──
+  // 发送方写入 header.dst_socket_id = peer_socket_id(对端 = 接收方本端)
+  // 接收方收到数据后用 header.dst_socket_id 查 socket_map 路由到本 socket
+  // 注册时 key = 本端 socket_id_.toUint64()(接收方查表命中)
   uint64_t peer_socket_id = 0;
 
   // ── 共享层指针(非 owned,Phase 4 由 UrmaJfrPool 持有) ──

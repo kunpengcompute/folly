@@ -42,10 +42,18 @@ class UrmaSharedJfr {
 
   static UrmaSharedJfr* getOrCreate(EventBase* evb);
   static UrmaSharedJfr* get(EventBase* evb);
+  // 连接全断时调用:若路由表为空,从 EventBaseLocal erase 自身,
+  // 释放 CqHandler 和 epoll 注册,防止残留 JFCE fd 在 LT 模式下持续 spin
+  static void releaseIfEmpty(EventBase* evb);
 
   ~UrmaSharedJfr();
 
   bool isValid() const noexcept { return valid_; }
+
+  // 休眠管理:连接全断时休眠 CqHandler(从 epoll 摘除),重连时唤醒(重新武装)
+  // 避免 LT 模式下 JFCE fd 持续 spin 导致 CPU 100%
+  void incActiveConn() noexcept;  // 连接建立(onHandshakeReady)时调用
+  void decActiveConn() noexcept;  // 连接断开(destroyUrmaResources)时调用,归零则休眠
 
   void pollAndDispatch() noexcept;
   void pollFcAndDispatch() noexcept;
@@ -53,6 +61,8 @@ class UrmaSharedJfr {
   // TX CQE 单点收割(epoll 驱动,由 UrmaCqHandler::handlerReady 调用)
   // 只 poll 指定 jfs_index 的 JFS,而非全量遍历
   void harvestTx(uint32_t jfs_index) noexcept;
+  // FC JFS TX CQE 收割(Phase 7)
+  void harvestFcTx(uint32_t jfs_index) noexcept;
 
   // 路由表委托给 UrmaJfrPool(全局共享)
   void registerSocket(uint64_t socket_id, UrmaAsyncSocket* socket);
@@ -95,6 +105,13 @@ class UrmaSharedJfr {
   // TX CqHandler 列表:每个 IO JFS 的 TX JFCE fd 一个
   // 让 READ CQE 有独立的事件驱动收割,不依赖 RX 事件
   std::vector<std::unique_ptr<UrmaCqHandler>> tx_cq_handlers_;
+
+  // 休眠状态:连接全断时 CqHandler 从 epoll 摘除,避免 LT spin
+  std::atomic<uint32_t> active_conn_count_{0};  // per-EventBase 活跃连接数
+  std::atomic<bool> dormant_{false};             // true=CqHandler 已从 epoll 摘除
+
+  void dormant() noexcept;  // 休眠:drain 残留 CQE + unregister 所有 CqHandler
+  void wakeup() noexcept;   // 唤醒:rearm JFC + register 所有 CqHandler
 
   static EventBaseLocal<std::unique_ptr<UrmaSharedJfr>>& registry();
 };

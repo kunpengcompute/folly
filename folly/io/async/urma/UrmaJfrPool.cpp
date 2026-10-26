@@ -268,27 +268,23 @@ void UrmaJfrPool::replenishRxBuf(SharedJfr* jfr, uint32_t slot) noexcept {
 }
 
 // ── 按水位线批量补投 recv WR ──
+// 补投刚回收的 slot(已知空闲),补投到 max_water 水位
 
-void UrmaJfrPool::replenishByWaterMark(SharedJfr* jfr) noexcept {
+void UrmaJfrPool::replenishByWaterMark(SharedJfr* jfr, const uint32_t* free_slots,
+                                        uint32_t free_cnt) noexcept {
   uint32_t posted = jfr->recv_posted.load(std::memory_order_relaxed);
-  if (posted >= jfr->watermark.min_water) {
-    return;  // 水位足够,不补投
+  if (posted >= jfr->watermark.max_water || !free_slots || free_cnt == 0) {
+    return;  // 水位已满或无待补投 slot
   }
 
-  // 补投到 max_water
+  // 计算需补投数量:补投到 max_water,但不超过刚回收的 slot 数
   uint32_t to_post = jfr->watermark.max_water - posted;
-  uint32_t max_slots = static_cast<uint32_t>(jfr->rx_bufs.size());
-  for (uint32_t i = 0; i < to_post; ++i) {
-    // 从 next_free_slot 游标取下一个 slot
-    uint32_t slot = jfr->next_free_slot.fetch_add(1, std::memory_order_relaxed) %
-                    max_slots;
-    if (postRecvWr(jfr, slot)) {
-      jfr->recv_posted.fetch_add(1, std::memory_order_relaxed);
-    } else {
-      // post 失败(slot 可能仍在 RQ 中),回退游标
-      jfr->next_free_slot.fetch_sub(1, std::memory_order_relaxed);
-      break;
-    }
+  uint32_t batch_cnt = std::min(free_cnt, to_post);
+
+  // 批量补投:用 WR 链表一次提交(free_slots 中的 slot 已从 RQ 消费,可安全重投)
+  if (batch_cnt > 0) {
+    postRecvWrBatch(jfr, free_slots, batch_cnt);
+    jfr->recv_posted.fetch_add(batch_cnt, std::memory_order_relaxed);
   }
 }
 
@@ -296,15 +292,20 @@ void UrmaJfrPool::replenishByWaterMark(SharedJfr* jfr) noexcept {
 
 // 内部:收割 CQE 并分发(返回收割的 CQE 数)
 // 被 pollAndDispatch 调用,rearm 后的二次 poll 也复用此函数
+// 任务5:延迟批量补投 — 收割时递减 recv_posted,循环外按水位线批量补投
 uint32_t UrmaJfrPool::harvestAndDispatch(SharedJfr* jfr) noexcept {
   constexpr int POLL_BATCH_MAX = 64;
   urma_cr_t cr[POLL_BATCH_MAX];
-  uint32_t repost_slots[POLL_BATCH_MAX];
+  // 累计所有 batch 的回收 slot,用于循环外水位线补投
+  // 单次 harvestAndDispatch 最多回收的 CQE 数受 CQ 深度限制,
+  // 实际中一次 poll 循环回收数 << POLL_BATCH_MAX,用 4 倍容量保守容纳
+  static constexpr int REPOST_SLOTS_CAP = POLL_BATCH_MAX * 4;
+  uint32_t repost_slots[REPOST_SLOTS_CAP];
+  uint32_t repost_cnt_total = 0;
   uint32_t total_cqes = 0;
   int n;
   while ((n = urma_poll_jfc(jfr->jfc, POLL_BATCH_MAX, cr)) > 0) {
     total_cqes += static_cast<uint32_t>(n);
-    int repost_cnt = 0;
 
     for (int i = 0; i < n; ++i) {
       uint32_t slot = static_cast<uint32_t>(cr[i].user_ctx);
@@ -319,7 +320,9 @@ uint32_t UrmaJfrPool::harvestAndDispatch(SharedJfr* jfr) noexcept {
         if (!ctrl_hdr) {
           XLOG(WARN) << "[URMA] SEND_IMM magic mismatch, slot=" << slot
                      << " recv_len=" << recv_len;
-          repost_slots[repost_cnt++] = slot;
+          if (repost_cnt_total < REPOST_SLOTS_CAP) {
+            repost_slots[repost_cnt_total++] = slot;
+          }
           continue;
         }
         // version 校验(不匹配仅 WARN,不丢弃,向前兼容)
@@ -329,11 +332,13 @@ uint32_t UrmaJfrPool::harvestAndDispatch(SharedJfr* jfr) noexcept {
                      << " expected=" << static_cast<int>(URMA_VERSION)
                      << " type=" << static_cast<int>(ctrl_hdr->type);
         }
-        auto it = socket_map_.find(ctrl_hdr->src_socket_id);
+        auto it = socket_map_.find(ctrl_hdr->dst_socket_id);
         if (it == socket_map_.end()) {
-          XLOG(WARN) << "[URMA] SEND_IMM socket_map miss: src_socket_id="
-                     << ctrl_hdr->src_socket_id;
-          repost_slots[repost_cnt++] = slot;
+          XLOG(WARN) << "[URMA] SEND_IMM socket_map miss: dst_socket_id="
+                     << ctrl_hdr->dst_socket_id;
+          if (repost_cnt_total < REPOST_SLOTS_CAP) {
+            repost_slots[repost_cnt_total++] = slot;
+          }
           continue;
         }
 
@@ -342,7 +347,9 @@ uint32_t UrmaJfrPool::harvestAndDispatch(SharedJfr* jfr) noexcept {
           // imm_data = remote_va(u64),trailing data_size 从 recv_buf offset 24 读取
           if (recv_len < sizeof(PullMemControlPacket)) {
             XLOG(WARN) << "[URMA] PULL_MEM too short: recv_len=" << recv_len;
-            repost_slots[repost_cnt++] = slot;
+            if (repost_cnt_total < REPOST_SLOTS_CAP) {
+              repost_slots[repost_cnt_total++] = slot;
+            }
             continue;
           }
           auto* pkt = static_cast<const PullMemControlPacket*>(recv_buf);
@@ -358,7 +365,9 @@ uint32_t UrmaJfrPool::harvestAndDispatch(SharedJfr* jfr) noexcept {
           XLOG(WARN) << "[URMA] SEND_IMM unexpected type="
                      << static_cast<int>(ctrl_hdr->type);
         }
-        repost_slots[repost_cnt++] = slot;
+        if (repost_cnt_total < REPOST_SLOTS_CAP) {
+          repost_slots[repost_cnt_total++] = slot;
+        }
         continue;
       }
 
@@ -370,28 +379,49 @@ uint32_t UrmaJfrPool::harvestAndDispatch(SharedJfr* jfr) noexcept {
                    << " first4=" << std::hex
                    << (recv_buf ? *static_cast<const uint32_t*>(recv_buf) : 0)
                    << std::dec;
-        repost_slots[repost_cnt++] = slot;
+        if (repost_cnt_total < REPOST_SLOTS_CAP) {
+          repost_slots[repost_cnt_total++] = slot;
+        }
         continue;
       }
 
-      // Phase 3: headroom 路由 — 用 header.src_socket_id 查 socket_map
-      auto it = socket_map_.find(hdr->src_socket_id);
+      // Phase 3: headroom 路由 — 用 header.dst_socket_id 查 socket_map
+      // 发送方写入对端 socket_id(= 接收方本端 socket_id),接收方据此路由
+      auto it = socket_map_.find(hdr->dst_socket_id);
       if (it == socket_map_.end()) {
-        XLOG(WARN) << "[URMA] socket_map miss: src_socket_id=" << hdr->src_socket_id
+        XLOG(WARN) << "[URMA] socket_map miss: dst_socket_id=" << hdr->dst_socket_id
                    << " remote_id=" << cr[i].remote_id.id
                    << " map_size=" << socket_map_.size();
-        repost_slots[repost_cnt++] = slot;
+        if (repost_cnt_total < REPOST_SLOTS_CAP) {
+          repost_slots[repost_cnt_total++] = slot;
+        }
         continue;
       }
 
       // 统一通过 onIoMessageReceived 分发
       it->second->onIoMessageReceived(recv_buf, recv_len, slot);
-      repost_slots[repost_cnt++] = slot;
+      if (repost_cnt_total < REPOST_SLOTS_CAP) {
+        repost_slots[repost_cnt_total++] = slot;
+      }
     }
+  }
 
-    // 批量补投本批回收的 slot:用 WR 链表一次 urma_post_jfr_wr 提交全部
-    if (repost_cnt > 0) {
-      postRecvWrBatch(jfr, repost_slots, repost_cnt);
+  // 延迟批量补投(任务5):本批共回收 repost_cnt_total 个 posted slot,先递减 recv_posted
+  if (repost_cnt_total > 0) {
+    jfr->recv_posted.fetch_sub(repost_cnt_total, std::memory_order_acq_rel);
+  }
+
+  // 水位线补投:recv_posted 低于 min_water 时批量补投到 max_water
+  // 只补投本批回收的 slot(已知空闲);不足部分下次收割继续补,recv_posted 不会持续下降
+  if (repost_cnt_total > 0) {
+    uint32_t posted = jfr->recv_posted.load(std::memory_order_acquire);
+    if (posted < jfr->watermark.min_water) {
+      uint32_t to_post = jfr->watermark.max_water - posted;
+      uint32_t batch = std::min(repost_cnt_total, to_post);
+      if (batch > 0) {
+        postRecvWrBatch(jfr, repost_slots, batch);
+        jfr->recv_posted.fetch_add(batch, std::memory_order_acq_rel);
+      }
     }
   }
   return total_cqes;
@@ -513,15 +543,18 @@ void UrmaJfrPool::pollFcAndDispatch(SharedJfr* jfr) noexcept {
 }
 
 // 内部:收割 FC JFR 的 CQE 并路由(返回收割的 CQE 数)
+// 任务5:延迟批量补投 — 收割时递减 recv_posted,循环外按水位线批量补投
 uint32_t UrmaJfrPool::harvestFcAndDispatch(SharedJfr* jfr) noexcept {
   constexpr int POLL_BATCH_MAX = 64;
   urma_cr_t cr[POLL_BATCH_MAX];
-  uint32_t repost_slots[POLL_BATCH_MAX];
+  // 累计所有 batch 的回收 slot,用于循环外水位线补投
+  static constexpr int REPOST_SLOTS_CAP = POLL_BATCH_MAX * 4;
+  uint32_t repost_slots[REPOST_SLOTS_CAP];
+  uint32_t repost_cnt_total = 0;
   uint32_t total_cqes = 0;
   int n;
   while ((n = urma_poll_jfc(jfr->jfc, POLL_BATCH_MAX, cr)) > 0) {
     total_cqes += static_cast<uint32_t>(n);
-    int repost_cnt = 0;
     for (int i = 0; i < n; ++i) {
       uint32_t slot = static_cast<uint32_t>(cr[i].user_ctx);
       void* recv_buf = jfr->rx_bufs[slot].data;
@@ -531,31 +564,49 @@ uint32_t UrmaJfrPool::harvestFcAndDispatch(SharedJfr* jfr) noexcept {
       if (recv_len < sizeof(uint64_t)) {
         XLOG(WARN) << "[URMA-FC] recv too short, slot=" << slot
                    << " recv_len=" << recv_len;
-        repost_slots[repost_cnt++] = slot;
+        if (repost_cnt_total < REPOST_SLOTS_CAP) {
+          repost_slots[repost_cnt_total++] = slot;
+        }
         continue;
       }
 
-      uint64_t peer_socket_id = 0;
-      std::memcpy(&peer_socket_id, recv_buf, sizeof(uint64_t));
+      uint64_t dst_socket_id = 0;
+      std::memcpy(&dst_socket_id, recv_buf, sizeof(uint64_t));
 
-      auto it = fc_socket_map_.find(peer_socket_id);
+      auto it = fc_socket_map_.find(dst_socket_id);
       if (it == fc_socket_map_.end()) {
-        XLOG(DBG) << "[URMA-FC] fc_socket_map miss: peer_socket_id=0x"
-                   << std::hex << peer_socket_id << std::dec
+        XLOG(DBG) << "[URMA-FC] fc_socket_map miss: dst_socket_id=0x"
+                   << std::hex << dst_socket_id << std::dec
                    << " map_size=" << fc_socket_map_.size();
-        repost_slots[repost_cnt++] = slot;
+        if (repost_cnt_total < REPOST_SLOTS_CAP) {
+          repost_slots[repost_cnt_total++] = slot;
+        }
         continue;
       }
 
       // 分发到目标 UrmaAsyncSocket(Phase 6: REQ/REP/RETURN/ACK 完整处理)
-      // 当前为占位:仅日志记录,FC 消息路由通路已打通
       it->second->onFcMessageReceived(recv_buf, recv_len);
-      repost_slots[repost_cnt++] = slot;
+      if (repost_cnt_total < REPOST_SLOTS_CAP) {
+        repost_slots[repost_cnt_total++] = slot;
+      }
     }
+  }
 
-    // 批量补投本批回收的 slot
-    if (repost_cnt > 0) {
-      postRecvWrBatch(jfr, repost_slots, repost_cnt);
+  // 延迟批量补投(任务5):本批共回收 repost_cnt_total 个 posted slot,先递减 recv_posted
+  if (repost_cnt_total > 0) {
+    jfr->recv_posted.fetch_sub(repost_cnt_total, std::memory_order_acq_rel);
+  }
+
+  // 水位线补投:recv_posted 低于 min_water 时批量补投到 max_water
+  if (repost_cnt_total > 0) {
+    uint32_t posted = jfr->recv_posted.load(std::memory_order_acquire);
+    if (posted < jfr->watermark.min_water) {
+      uint32_t to_post = jfr->watermark.max_water - posted;
+      uint32_t batch = std::min(repost_cnt_total, to_post);
+      if (batch > 0) {
+        postRecvWrBatch(jfr, repost_slots, batch);
+        jfr->recv_posted.fetch_add(batch, std::memory_order_acq_rel);
+      }
     }
   }
   return total_cqes;

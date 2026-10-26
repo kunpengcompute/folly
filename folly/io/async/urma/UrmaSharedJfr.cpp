@@ -27,6 +27,10 @@ EventBaseLocal<std::unique_ptr<UrmaSharedJfr>>& UrmaSharedJfr::registry() {
 UrmaSharedJfr* UrmaSharedJfr::getOrCreate(EventBase* evb) {
   auto* existing = get(evb);
   if (existing && existing->isValid()) {
+    // 休眠态唤醒:新连接建立前先重新武装 CqHandler
+    if (existing->dormant_.load(std::memory_order_acquire)) {
+      existing->wakeup();
+    }
     return existing;
   }
   if (existing) {
@@ -41,6 +45,97 @@ UrmaSharedJfr* UrmaSharedJfr::getOrCreate(EventBase* evb) {
 UrmaSharedJfr* UrmaSharedJfr::get(EventBase* evb) {
   auto* up = registry().get(*evb);
   return up ? up->get() : nullptr;
+}
+
+void UrmaSharedJfr::releaseIfEmpty(EventBase* evb) {
+  if (!evb) return;
+  auto* pool = UrmaJfrPool::get();
+  if (!pool || !pool->socketMapEmpty()) {
+    return;  // 路由表非空,仍有活跃连接
+  }
+  // 路由表为空:所有连接已断开,erase UrmaSharedJfr 触发析构
+  // → 释放 CqHandler(epoll 注销),防止 JFCE fd 在 LT 模式下持续 spin 占 CPU
+  XLOG(INFO) << "UrmaSharedJfr: releaseIfEmpty, socket_map empty, erasing from EventBaseLocal";
+  registry().erase(*evb);
+}
+
+// ── 休眠管理 ──
+
+void UrmaSharedJfr::incActiveConn() noexcept {
+  // 休眠态唤醒:新连接建立前先重新武装 CqHandler
+  if (dormant_.load(std::memory_order_acquire)) {
+    wakeup();
+  }
+  active_conn_count_.fetch_add(1, std::memory_order_acq_rel);
+}
+
+void UrmaSharedJfr::decActiveConn() noexcept {
+  uint32_t prev = active_conn_count_.fetch_sub(1, std::memory_order_acq_rel);
+  if (prev == 1) {
+    // 计数归零:本 EventBase 无活跃连接,休眠 CqHandler
+    dormant();
+  }
+}
+
+void UrmaSharedJfr::dormant() noexcept {
+  // 先 drain 残留 CQE,减少 unregister 后内核 CQ 积压
+  if (io_shared_jfr_) {
+    UrmaJfrPool::get()->pollAndDispatch(io_shared_jfr_);
+  }
+  if (fc_shared_jfr_) {
+    UrmaJfrPool::get()->pollFcAndDispatch(fc_shared_jfr_);
+  }
+  // drain TX CQE(含 READ CQE)
+  if (auto* jfs_pool = UrmaJfsPool::get()) {
+    uint32_t io_cnt = jfs_pool->ioJfsCount();
+    for (uint32_t ji = 0; ji < io_cnt; ++ji) {
+      harvestTx(ji);
+    }
+    uint32_t fc_cnt = jfs_pool->fcJfsCount();
+    for (uint32_t fi = 0; fi < fc_cnt; ++fi) {
+      harvestFcTx(fi);
+    }
+  }
+
+  // 从 epoll 摘除所有 CqHandler(不 delete 对象,保留供 wakeup 复用)
+  if (io_cq_handler_) {
+    io_cq_handler_->unregisterHandler();
+  }
+  if (fc_cq_handler_) {
+    fc_cq_handler_->unregisterHandler();
+  }
+  for (auto& h : tx_cq_handlers_) {
+    if (h) h->unregisterHandler();
+  }
+
+  dormant_.store(true, std::memory_order_release);
+  XLOG(INFO) << "UrmaSharedJfr: dormant (CqHandler unregistered), active_conn=0";
+}
+
+void UrmaSharedJfr::wakeup() noexcept {
+  // 重新武装所有 CqHandler(从 epoll 摘除后重新注册)
+  // registerHandler 内部先 event_del 再 event_add,可安全重复调用
+  if (io_cq_handler_) {
+    io_cq_handler_->registerHandler(EventHandler::READ | EventHandler::PERSIST);
+    // rearm JFC 让 LT 模式下残留 CQE 立即触发
+    if (io_shared_jfr_ && io_shared_jfr_->jfc) {
+      urma_rearm_jfc(io_shared_jfr_->jfc, false);
+    }
+  }
+  if (fc_cq_handler_) {
+    fc_cq_handler_->registerHandler(EventHandler::READ | EventHandler::PERSIST);
+    if (fc_shared_jfr_ && fc_shared_jfr_->jfc) {
+      urma_rearm_jfc(fc_shared_jfr_->jfc, false);
+    }
+  }
+  for (auto& h : tx_cq_handlers_) {
+    if (h) {
+      h->registerHandler(EventHandler::READ | EventHandler::PERSIST);
+    }
+  }
+
+  dormant_.store(false, std::memory_order_release);
+  XLOG(INFO) << "UrmaSharedJfr: wakeup (CqHandler re-registered)";
 }
 
 UrmaSharedJfr::UrmaSharedJfr(EventBase* evb, const UrmaConfig& /*config*/)
@@ -88,16 +183,19 @@ UrmaSharedJfr::UrmaSharedJfr(EventBase* evb, const UrmaConfig& /*config*/)
     tx_cq_handlers_.reserve(fds.size());
     int registered = 0;
     for (const auto& entry : fds) {
-      if (entry.is_fc) continue;  // 只注册 IO JFS 的 TX JFCE
+      // Phase 7: 注册所有 JFS(含 FC JFS)的 TX JFCE fd 到 epoll
+      // FC JFS 的 TX CQE 也需要事件驱动收割,否则 FC 消息的 TX CQE 积压
       if (entry.fd < 0) continue;
       // edge-triggered: 先 rearm 再注册,避免错过已有 CQE
-      auto* sj = jfs_pool->getIoJfsByIndex(entry.jfs_index);
+      SharedJfs* sj = entry.is_fc
+                          ? jfs_pool->getFcJfsByIndex(entry.jfs_index)
+                          : jfs_pool->getIoJfsByIndex(entry.jfs_index);
       if (sj && sj->jfc) {
         urma_rearm_jfc(sj->jfc, false);
       }
       tx_cq_handlers_.push_back(
           std::make_unique<UrmaCqHandler>(evb_, entry.fd, this,
-                                          true, false, entry.jfs_index));
+                                          true, entry.is_fc, entry.jfs_index));
       ++registered;
     }
     XLOG(INFO) << "UrmaSharedJfr: registered " << registered
@@ -140,6 +238,13 @@ void UrmaSharedJfr::harvestTx(uint32_t jfs_index) noexcept {
   // 单点收割: 只 poll 指定 JFS 的 TX CQE(含 READ CQE)
   if (auto* pool = UrmaJfrPool::get()) {
     pool->harvestTxAndDispatch(jfs_index);
+  }
+}
+
+void UrmaSharedJfr::harvestFcTx(uint32_t jfs_index) noexcept {
+  // FC JFS TX CQE 收割(Phase 7)
+  if (auto* pool = UrmaJfrPool::get()) {
+    pool->harvestFcTxAndDispatch();
   }
 }
 

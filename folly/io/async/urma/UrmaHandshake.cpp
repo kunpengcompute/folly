@@ -363,10 +363,10 @@ void UrmaHandshake::processRemoteHello(const v2_wire::HelloMessage& hello) {
     // 在 kWaitHello 阶段 peer_socket_id 已知,此处预注册消除竞态。
     if (auto* jfr_pool = UrmaJfrPool::get()) {
       if (socket_->res_.remote_jetty) {
-        jfr_pool->registerSocket(socket_->res_.peer_socket_id, socket_);
+        jfr_pool->registerSocket(socket_->socket_id_.toUint64(), socket_);
       }
       if (socket_->res_.remote_fc_jetty) {
-        jfr_pool->registerFcSocket(socket_->res_.peer_socket_id, socket_);
+        jfr_pool->registerFcSocket(socket_->socket_id_.toUint64(), socket_);
       }
     }
     // 发 Hello(通过 TCP fd)

@@ -156,10 +156,10 @@ class UrmaAsyncSocket : public AsyncTransport {
   void onFcMessageReceived(void* recv_buf, uint32_t recv_len) noexcept;
 
   // Phase 6: FC 消息处理(REQ/REP/RETURN/ACK)
-  void handleFcReq(uint64_t peer_socket_id, uint16_t credit_cnt,
+  void handleFcReq(uint64_t dst_socket_id, uint16_t credit_cnt,
                     uint16_t fc_seq) noexcept;
   void handleFcRep(uint16_t credit_cnt, uint16_t fc_seq) noexcept;
-  void handleFcReturn(uint64_t peer_socket_id, uint16_t credit_cnt,
+  void handleFcReturn(uint64_t dst_socket_id, uint16_t credit_cnt,
                        uint16_t fc_seq) noexcept;
   void handleFcAck(uint16_t credit_cnt, uint16_t fc_seq) noexcept;
 

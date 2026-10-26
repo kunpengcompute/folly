@@ -21,7 +21,7 @@
  *
  *   FC 消息格式(16B payload):
  *     ┌──────────────┬──────────┬────────────┬──────────┬──────────┐
- *     │ src_socket_id│ msg_type │ credit_cnt │ fc_seq   │ reserved │
+ *     │ dst_socket_id│ msg_type │ credit_cnt │ fc_seq   │ reserved │
  *     │   8 bytes    │ 1 byte   │  2 bytes   │ 2 bytes  │ 3 bytes  │
  *     └──────────────┴──────────┴────────────┴──────────┴──────────┘
  *
@@ -61,7 +61,7 @@ constexpr uint32_t FC_MSG_LEN = 16;
 
 // 序列化 FC 消息到 16B buffer
 // buf: 16B 缓冲区(调用方保证足够大)
-// socket_id: 发送方 SocketId(路由用)
+// socket_id: 目标方 SocketId(发送方的对端 = 接收方的本端,路由用)
 // type: FC 消息类型
 // credit_cnt: credit 数量
 // fc_seq: FC 序列号
@@ -81,7 +81,7 @@ inline void serializeFcMsg(void* buf, uint64_t socket_id, UrmaFcMsgType type,
 
 // 从 16B buffer 反序列化 FC 消息
 // buf: 接收到的 buffer 起始(至少 16B)
-// socket_id: 输出发送方 SocketId
+// socket_id: 输出目标方 SocketId(接收方本端)
 // type: 输出 FC 消息类型
 // credit_cnt: 输出 credit 数量
 // fc_seq: 输出 FC 序列号
@@ -119,8 +119,10 @@ struct UrmaFcState {
   std::atomic<uint32_t> credit_multiple{2};
 
   // 初始化授予的 credit(握手后第一次 REP 授予的数量)
-  // 设计 §4.6:ACK 时 FC REP 授予 INITIAL_CREDIT=rx_depth/16
-  static constexpr uint32_t INITIAL_CREDIT_DIVISOR = 16;
+  // 设计 §4.6:ACK 时 FC REP 授予 INITIAL_CREDIT=rx_depth/DIVISOR
+  // DIVISOR=4: 初始授予 rx_depth/4(320),覆盖 close-loop 并发窗口
+  // credit 流控为软限制(不阻塞发送),实际防溢出由水位线 + recv buffer 池保证
+  static constexpr uint32_t INITIAL_CREDIT_DIVISOR = 4;
 };
 
 } // namespace folly

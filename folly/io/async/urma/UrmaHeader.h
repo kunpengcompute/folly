@@ -48,7 +48,7 @@ enum UrmaMsgType : uint8_t {
 //   version        URMA_VERSION(=1),协议演进兼容性预留
 //   flags          预留标志位(当前恒 0)
 //   type           UrmaMsgType:MSG_DATA / MSG_PULL_MEM / MSG_FREE
-//   src_socket_id  发送方 SocketId(池化 JFR 路由)
+//   dst_socket_id  目标方 SocketId(发送方写入对端 socket_id,接收方据此路由)
 //   seq            连接级发送序列号(每 WR 递增,保序用,与 msg_id 独立)
 //   msg_id         大包消息 ID(PULL/FREE 匹配;DATA 包填 0)
 //                  —— 仅 sendBigMsgByRead 分配,PULL 和对应 FREE 复用
@@ -64,7 +64,7 @@ struct __attribute__((packed)) UrmaMsgHeader {
   uint8_t  flags;           // 5:  预留标志位
   uint8_t  type;            // 6:  UrmaMsgType
   uint8_t  reserved1;       // 7:  对齐
-  uint64_t src_socket_id;   // 8:  发送方 SocketId(池化 JFR 路由)
+  uint64_t dst_socket_id;   // 8:  目标方 SocketId(发送方写对端 socket_id,接收方用本端查表)
   uint16_t seq;             // 16: 连接级发送序列号(保序,每 WR 递增)
   uint16_t msg_id;          // 18: 大包 msg_id(PULL/FREE 匹配;DATA 填 0)
   uint32_t reserved2;       // 20: 对齐 + 预留
@@ -129,7 +129,7 @@ class SocketIdAllocator {
 // 调用后: IOBuf 的 data 区写入完整 header
 //
 // buf:       独立 header IOBuf(已 append 24B)
-// socket_id: 发送方 SocketId
+// socket_id: 目标方 SocketId(发送方的对端 = 接收方的本端)
 // seq:       连接级发送序列号(每 WR 递增,保序用)
 // type:      消息类型(MSG_DATA / MSG_PULL_MEM / MSG_FREE)
 // msg_id:    大包 msg_id(PULL/FREE 匹配;DATA 填 0)
@@ -144,7 +144,7 @@ inline bool writeHeader(IOBuf* buf, uint64_t socket_id, uint16_t seq,
   hdr->flags = 0;
   hdr->type = type;
   hdr->reserved1 = 0;
-  hdr->src_socket_id = socket_id;
+  hdr->dst_socket_id = socket_id;
   hdr->seq = seq;
   hdr->msg_id = msg_id;
   hdr->reserved2 = 0;
@@ -153,7 +153,7 @@ inline bool writeHeader(IOBuf* buf, uint64_t socket_id, uint16_t seq,
 
 // 直接写入 UrmaMsgHeader 结构体(用于控制包 SGE[0] 内联构造)
 // hdr:       目标 UrmaMsgHeader 指针(调用方保证已分配 24B 空间)
-// socket_id: 发送方 SocketId
+// socket_id: 目标方 SocketId(发送方的对端 = 接收方的本端)
 // seq:       连接级发送序列号(每 WR 递增,保序用)
 // type:      消息类型(MSG_DATA / MSG_PULL_MEM / MSG_FREE)
 // msg_id:    大包 msg_id(PULL/FREE 匹配;DATA 填 0)
@@ -165,7 +165,7 @@ inline bool writeHeader(UrmaMsgHeader* hdr, uint64_t socket_id, uint16_t seq,
   hdr->flags = 0;
   hdr->type = type;
   hdr->reserved1 = 0;
-  hdr->src_socket_id = socket_id;
+  hdr->dst_socket_id = socket_id;
   hdr->seq = seq;
   hdr->msg_id = msg_id;
   hdr->reserved2 = 0;

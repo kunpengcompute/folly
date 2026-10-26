@@ -64,7 +64,7 @@ struct __attribute__((packed)) HelloMessage {
   uint64_t seg_len{0};
   uint32_t seg_token_id{0};
   uint32_t fc_jetty_id{0};
-  uint64_t socket_id{0};  // Phase 3: 本端 SocketId(headroom 路由用,接收方据此路由)
+  uint64_t socket_id{0};  // 本端 SocketId(握手通告,对端写入 header.dst_socket_id,接收方据此路由)
 
   void serialize(void* buf) const;
   void deserialize(const void* buf);

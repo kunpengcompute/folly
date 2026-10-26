@@ -155,7 +155,9 @@ class UrmaJfrPool {
   // ── recv buffer 按需投递 ──
   // 补投 recv WR(水位线触发)
   void replenishRxBuf(SharedJfr* jfr, uint32_t slot) noexcept;
-  void replenishByWaterMark(SharedJfr* jfr) noexcept;
+  // 按水位线批量补投:优先补投 free_slots(刚回收的 slot),不足再从游标取
+  void replenishByWaterMark(SharedJfr* jfr, const uint32_t* free_slots = nullptr,
+                            uint32_t free_cnt = 0) noexcept;
 
   // ── credit_pool ──
   // RX CQE 消费后 credit 回池
@@ -164,7 +166,7 @@ class UrmaJfrPool {
   }
 
   // ── 路由表(SocketId → UrmaAsyncSocket*) ──
-  // Phase 3: 按 header.src_socket_id 路由(对端发送时写入 header 的 SocketId)
+  // Phase 3: 按 header.dst_socket_id 路由(对端发送时写入本端 SocketId,接收方据此查表)
   void registerSocket(uint64_t socket_id, UrmaAsyncSocket* socket);
   void unregisterSocket(uint64_t socket_id);
   UrmaAsyncSocket* findSocket(uint64_t socket_id);
@@ -172,6 +174,11 @@ class UrmaJfrPool {
   void registerFcSocket(uint64_t socket_id, UrmaAsyncSocket* socket);
   void unregisterFcSocket(uint64_t socket_id);
   UrmaAsyncSocket* findFcSocket(uint64_t socket_id);
+
+  // 连接全断时判断:路由表为空表示该 EventBase 上无活跃连接
+  bool socketMapEmpty() const {
+    return socket_map_.empty() && fc_socket_map_.empty();
+  }
 
   // ── JFCE fd 注册(供 UrmaCqHandler 使用) ──
   struct JfrFdEntry {
