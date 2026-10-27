@@ -30,21 +30,35 @@
 
 #include <atomic>
 #include <cstdint>
-#include <unordered_map>
+#include <memory>
 #include <vector>
 
+#include <folly/io/async/urma/UrmaRecycleStack.h>
+#include <folly/io/async/urma/UrmaRouteTable.h>
 #include <ub/umdk/urma/urma_api.h>
 
 namespace folly {
 
 class UrmaConfig;
 class UrmaAsyncSocket;
+class UrmaJfrPool;
+struct SharedJfr;
 
 // recv buffer 水位线参数(DPDK mempool 风格)
 struct RecvWaterMark {
   uint32_t min_water = 64;    // 最低水位(低于此值触发补投)
   uint32_t max_water = 256;   // 最高水位(补投到此值)
   uint32_t batch_post = 32;   // 每批补投数量
+};
+
+// 任务 C(H-3):RX slot 回收上下文 —— 常驻于 RxBuf 的稳定存储
+// (rx_bufs 在 init 后不再扩容,生命周期长于一切 IOBuf,评审要点②:
+//  禁止指向 stack/临时对象)。deleter 在任意线程执行,凭此上下文
+// 将 slot 送回 per-JFR 无锁回收栈,由收割线程批量重投。
+struct RxSlotCtx {
+  UrmaJfrPool* pool{nullptr};  // 所属池(回收入口)
+  SharedJfr* jfr{nullptr};      // 所属 JFR(prepare 期回填)
+  uint32_t slot{0};             // rx_bufs 索引
 };
 
 // 单个共享 JFR 的元数据 + recv buffer 池 + credit_pool
@@ -62,11 +76,22 @@ struct SharedJfr {
     void* data = nullptr;
     urma_sge_t sge = {};
     urma_jfr_wr_t wr = {};
+    RxSlotCtx ctx;              // 任务 C:零拷贝交付的 deleter 上下文(常驻稳定存储)
   };
-  std::vector<RxBuf> rx_bufs;   // recv buffer 数组(max_water 大小)
-  std::atomic<uint32_t> recv_posted{0};  // 当前已 post 的 recv WR 数
+  std::vector<RxBuf> rx_bufs;   // recv buffer 数组(max_water 大小,init 后不扩容)
+  std::atomic<uint32_t> recv_posted{0};  // 当前已 post 的 recv WR 数(= RQ 深)
   std::atomic<uint32_t> next_free_slot{0};  // 下一个空闲 slot 游标(补投用)
   RecvWaterMark watermark;
+
+  // ── 任务 C(H-3/H-4):RX 所有权记账(docs/urma-threading.md 不变量 I4) ──
+  // 不变式:recv_posted + transit_cnt + held_count + 回收栈深 == max_water
+  // (转移采用"先加后减"序,瞬态偏差有界;系统级泄漏由 checkRxAccounting 诊断)
+  std::atomic<uint32_t> held_count{0};    // movable 交付未释放数(安全阀上限 = max-min)
+  std::atomic<uint32_t> transit_cnt{0};   // CQE 收割→交付转移中(不变式断言用)
+  // 无锁回收栈(IOBuf deleter 任意线程入栈,收割线程批量弹出重投)
+  std::unique_ptr<UrmaRecycleStack> recycle;
+  // checkRxAccounting 连续越界采样计数(多 EVB 定时器可能并发访问)
+  std::atomic<uint32_t> accounting_bad_streak{0};
 
   // credit_pool(仅 IO JFR 需要,设计 §3.3)
   std::atomic<uint32_t> credit_idle{0};      // 空闲 credit
@@ -83,6 +108,11 @@ struct SharedJfr {
         rx_bufs(std::move(o.rx_bufs)),
         recv_posted(o.recv_posted.load(std::memory_order_relaxed)),
         next_free_slot(o.next_free_slot.load(std::memory_order_relaxed)),
+        held_count(o.held_count.load(std::memory_order_relaxed)),
+        transit_cnt(o.transit_cnt.load(std::memory_order_relaxed)),
+        recycle(std::move(o.recycle)),
+        accounting_bad_streak(
+            o.accounting_bad_streak.load(std::memory_order_relaxed)),
         watermark(o.watermark),
         credit_idle(o.credit_idle.load(std::memory_order_relaxed)),
         credit_allocated(o.credit_allocated.load(std::memory_order_relaxed)),
@@ -98,6 +128,14 @@ struct SharedJfr {
                         std::memory_order_relaxed);
       next_free_slot.store(o.next_free_slot.load(std::memory_order_relaxed),
                            std::memory_order_relaxed);
+      held_count.store(o.held_count.load(std::memory_order_relaxed),
+                       std::memory_order_relaxed);
+      transit_cnt.store(o.transit_cnt.load(std::memory_order_relaxed),
+                        std::memory_order_relaxed);
+      recycle = std::move(o.recycle);
+      accounting_bad_streak.store(
+          o.accounting_bad_streak.load(std::memory_order_relaxed),
+          std::memory_order_relaxed);
       watermark = o.watermark;
       credit_idle.store(o.credit_idle.load(std::memory_order_relaxed),
                         std::memory_order_relaxed);
@@ -145,6 +183,13 @@ class UrmaJfrPool {
   void pollAndDispatch(SharedJfr* jfr) noexcept;
   void pollFcAndDispatch(SharedJfr* jfr) noexcept;
 
+  // ── 任务 B(H-2):TX CQE 属主转发 ──
+  // READ CQE 单点转发:同 EVB 短路(零延迟),跨 EVB runInLoop 转发回属主线程。
+  // 收割线程(harvestTxAndDispatch / UrmaAsyncSocket::pollTx)统一走此协议,
+  // 禁止跨线程直接调用 sock 方法(不变量 I1/I3)。
+  void dispatchReadCqe(uint64_t socket_id, uint16_t msg_id,
+                       urma_status_t status) noexcept;
+
   // TX CQE 单点收割: 只 poll 指定 JFS 的 TX CQE
   // 由 TX JFCE fd 的 epoll 事件驱动(UrmaCqHandler is_tx 模式 → harvestTx)
   void harvestTxAndDispatch(uint32_t jfs_index) noexcept;
@@ -157,7 +202,19 @@ class UrmaJfrPool {
   void replenishRxBuf(SharedJfr* jfr, uint32_t slot) noexcept;
   // 按水位线批量补投:优先补投 free_slots(刚回收的 slot),不足再从游标取
   void replenishByWaterMark(SharedJfr* jfr, const uint32_t* free_slots = nullptr,
-                            uint32_t free_cnt = 0) noexcept;
+                             uint32_t free_cnt = 0) noexcept;
+
+  // ── 任务 C(H-3/H-4):RX 所有权交付与记账(docs/urma-threading.md 不变量 I4) ──
+  // IOBuf deleter 回收入口(任意线程):held-- + slot 入回收栈,不直接 post
+  static void releaseHeldSlot(SharedJfr* jfr, uint32_t slot) noexcept;
+  // 收割线程立即回收(数据已按值消费:控制包/FC/解析失败/降级拷贝):
+  // transit-- + slot 入回收栈
+  static void recycleRxSlot(SharedJfr* jfr, uint32_t slot) noexcept;
+  // 收割线程:批量弹出回收栈并重投(账实严格一致,batch 失败按 bad_wr 精确记账)
+  void repostRecycled(SharedJfr* jfr) noexcept;
+  // 记账不变式诊断(10ms idle timer 周期调用):
+  // recv_posted + transit + held + 回收栈深 ≈ max_water,持续偏差告警
+  void checkRxAccounting(SharedJfr* jfr) noexcept;
 
   // ── credit_pool ──
   // RX CQE 消费后 credit 回池
@@ -167,9 +224,12 @@ class UrmaJfrPool {
 
   // ── 路由表(SocketId → UrmaAsyncSocket*) ──
   // Phase 3: 按 header.dst_socket_id 路由(对端发送时写入本端 SocketId,接收方据此查表)
+  // H-1 修复:分片读写锁 + SafeRouteEntry 安全句柄(接口签名不变,内部委托 route_table_)
   void registerSocket(uint64_t socket_id, UrmaAsyncSocket* socket);
   void unregisterSocket(uint64_t socket_id);
   UrmaAsyncSocket* findSocket(uint64_t socket_id);
+  // H-2 修复:TX CQE 属主转发用,返回安全句柄(持分片读锁拷出后放锁)
+  SafeRouteEntryPtr findRouteEntry(uint64_t socket_id);
 
   void registerFcSocket(uint64_t socket_id, UrmaAsyncSocket* socket);
   void unregisterFcSocket(uint64_t socket_id);
@@ -177,7 +237,7 @@ class UrmaJfrPool {
 
   // 连接全断时判断:路由表为空表示该 EventBase 上无活跃连接
   bool socketMapEmpty() const {
-    return socket_map_.empty() && fc_socket_map_.empty();
+    return route_table_.empty() && fc_route_table_.empty();
   }
 
   // ── JFCE fd 注册(供 UrmaCqHandler 使用) ──
@@ -192,17 +252,23 @@ class UrmaJfrPool {
   ~UrmaJfrPool() = default;
 
   // 创建单个 JFR(含 JFCE + JFC + JFR + recv buffer 预投 + jetty)
-  static bool createJfr(urma_context_t* ctx, SharedJfr* jfr,
+  // pool: 所属池指针(回填 RxSlotCtx.pool,deleter 回收入口用)
+  static bool createJfr(urma_context_t* ctx, UrmaJfrPool* pool, SharedJfr* jfr,
                         uint32_t rx_depth, bool is_fc,
                         const RecvWaterMark& wm);
 
-  // 初始化 recv buffer 池(预投 min_water 个 recv WR)
-  static bool initRxBufPool(SharedJfr* jfr, uint32_t max_bufs);
+  // 初始化 recv buffer 池(预投 min_water 个 recv WR + 任务 C 回收栈)
+  static bool initRxBufPool(UrmaJfrPool* pool, SharedJfr* jfr,
+                            uint32_t max_bufs);
 
   // post 单个 recv WR
   static bool postRecvWr(SharedJfr* jfr, uint32_t slot);
   // 批量 post recv WR(用 WR 链表一次 urma_post_jfr_wr,摊薄系统调用)
   static bool postRecvWrBatch(SharedJfr* jfr, const uint32_t* slots, uint32_t count);
+  // 任务 C:批量 post 并返回实际成功数(失败时 bad_wr 之前的 WR 已入 RQ,
+  // 据此精确记账,保证 recv_posted 账实一致)
+  static uint32_t postRecvWrBatchCount(SharedJfr* jfr, const uint32_t* slots,
+                                       uint32_t count) noexcept;
 
   // 内部:收割 CQE 并 headroom 路由分发(返回收割的 CQE 数)
   // 被 pollAndDispatch 调用,rearm 后的二次 poll 也复用此函数
@@ -221,8 +287,9 @@ class UrmaJfrPool {
   std::atomic<uint32_t> fc_rr_{0};
 
   // 路由表(Phase 3: SocketId 全局路由)
-  std::unordered_map<uint64_t, UrmaAsyncSocket*> socket_map_;
-  std::unordered_map<uint64_t, UrmaAsyncSocket*> fc_socket_map_;
+  // H-1 修复:16 分片 SharedMutex + SafeRouteEntry 安全句柄(替代普通 unordered_map)
+  UrmaRouteTable route_table_;
+  UrmaRouteTable fc_route_table_;
 
   bool inited_{false};
 };

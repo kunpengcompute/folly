@@ -34,6 +34,7 @@
 #include <folly/io/IOBuf.h>
 #include <folly/io/IOBufQueue.h>
 #include <folly/io/async/AsyncSocket.h>
+#include <folly/io/async/AsyncTimeout.h>
 #include <folly/io/async/AsyncTransport.h>
 #include <folly/io/async/EventHandler.h>
 #include <folly/io/async/EventBase.h>
@@ -42,6 +43,7 @@
 #include <folly/io/async/urma/UrmaResource.h>
 #include <folly/io/async/urma/UrmaJfsPool.h>
 #include <folly/io/async/urma/UrmaJfrPool.h>
+#include <folly/io/async/urma/UrmaRouteTable.h>
 #include <folly/io/async/urma/UrmaHeader.h>
 #include <folly/io/async/urma/UrmaFlowControl.h>
 #include <ub/umdk/urma/urma_api.h>
@@ -122,10 +124,12 @@ class UrmaAsyncSocket : public AsyncTransport {
   // 独立 buffer 路由 — 从 recv buffer 前 24B 解析 header 路由
   // recv_buf: 接收到的 buffer 起始(header 24B + data)
   // recv_len: 实际接收字节数
-  // slot:     rx_bufs_ 的 slot 索引(补投 recv WR 用)
-  // 由 UrmaSharedJfr::pollAndDispatch 调用(仅 SEND 分支,MSG_DATA)
-  void onIoMessageReceived(void* recv_buf, uint32_t recv_len,
-                           uint32_t slot) noexcept;
+  // ctx:      任务 C:常驻 RxSlotCtx(deleter 重投凭据,见 UrmaJfrPool.h)
+  // 由 UrmaJfrPool::harvestAndDispatch 调用(仅 SEND 分支,MSG_DATA)
+  // 返回值:  true  = buffer 所有权已随 IOBuf 转移(零拷贝,deleter 负责回收),
+  //          false = 数据已拷出/未消费,收割线程立即回收 slot
+  bool onIoMessageReceived(void* recv_buf, uint32_t recv_len,
+                            RxSlotCtx* ctx) noexcept;
 
   // 控制包/FREE 通知(由 UrmaJfrPool::harvestAndDispatch SEND_IMM 分支调用)
   // type:       MSG_PULL_MEM / MSG_FREE
@@ -145,6 +149,8 @@ class UrmaAsyncSocket : public AsyncTransport {
   // Phase 5: 处理其他连接 pollTx 收割到的本连接 READ CQE
   // JFS 池化后多连接共享 JFS,pollTx 可能收割到其他连接 post 的 READ CQE,
   // 通过 tx_ctx->socket_id 路由到对应连接调用此方法
+  // 任务 B(H-2):跨线程调用一律经 UrmaJfrPool::dispatchReadCqe 转发回本连接
+  // 属主 EVB 后进入此方法(不变量 I1;同 EVB 短路同步调用)
   // msg_id: READ 的 msg_id(对应 PULL_MEM 的 msg_id)
   // status: CQE 状态(URMA_CR_SUCCESS 或错误码)
   void handleRemoteReadCqe(uint16_t msg_id, urma_status_t status) noexcept;
@@ -225,6 +231,24 @@ class UrmaAsyncSocket : public AsyncTransport {
   void onHandshakeError(const std::string& reason);
   void destroyUrmaResources();
 
+  // ── 任务 D(H-5):路由注册 + 活跃连接记账同点绑定(幂等) ──
+  // 注册 IO/FC 路由(幂等:同 socket_id 重注册返回既有 entry)+ 缓存安全句柄
+  // + 首次绑定 incActiveConn。与 res_.remote_jetty 持有状态解耦:
+  // 注册即绑定,注销(destroyUrmaResources)即解绑,降级连接天然对称。
+  // 调用点: onHandshakeReady(客户端/服务端)+ UrmaHandshake::processRemoteHello
+  // (服务端预注册,friend 访问)
+  void registerRoutes() noexcept;
+
+  // ── 任务 B(H-2):析构收尾(sock 置空协议) ──
+  // destroyUrmaResources 已 erase 路由并置空 entry->sock —— 在途转发
+  // lambda 判空跳过,socket 生命周期不再依赖 pending;本函数仅释放句柄引用
+  void drainPendingForwards() noexcept;
+
+  // ── 任务 F(H-7):关闭路径回调补全 ──
+  // destroyUrmaResources 中 reset 前遍历 pending 队列,逐项 writeErr(END_OF_FILE)
+  // (BigMsgGroup done 语义复用 scanBigMsgTimeout 放弃路径:组内恰好一次)
+  void failPendingWrites() noexcept;
+
   // Phase 8: 降级 TCP — 握手失败时用 tcp_fd_ 创建 AsyncSocket 作为 delegate
   // 所有后续 AsyncTransport 操作委托给 delegate,对上层透明
   void fallbackToTcp();
@@ -257,6 +281,20 @@ class UrmaAsyncSocket : public AsyncTransport {
   void onReadFailed(urma_status_t status) noexcept;
   void scanBigMsgTimeout() noexcept;
   void drainRxPendingQueue() noexcept;
+
+  // ── 任务 E(H-6):大包超时扫描定时器(可取消 AsyncTimeout,替代 runAfterDelay) ──
+  // runAfterDelay([this], 100) 不可取消,析构后 100ms 窗口内触发 = UAF;
+  // 改为成员 AsyncTimeout(与 UrmaHandshake 同款模式),close/析构时 cancel。
+  class ScanTimer : private AsyncTimeout {
+   public:
+    explicit ScanTimer(UrmaAsyncSocket* sock)
+        : AsyncTimeout(sock->evb_), sock_(sock) {}
+    void arm() { scheduleTimeout(100); }  // 100ms 周期(设计 §4.7.8)
+   private:
+    void timeoutExpired() noexcept override;
+    UrmaAsyncSocket* sock_;  // socket 存活期由 scan_timer_ 生命周期保证
+  };
+  std::unique_ptr<ScanTimer> scan_timer_;
 
   EventBase* evb_;
   int tcp_fd_{-1};
@@ -301,6 +339,13 @@ class UrmaAsyncSocket : public AsyncTransport {
   uint32_t peer_rx_buf_size_{4096};
 
   std::unique_ptr<TcpHandshakeHandler> tcp_handshake_handler_;
+
+  // ── 任务 B/D:H-2 转发 drain + H-5 记账绑定 ──
+  SafeRouteEntryPtr route_entry_;   // 本连接路由安全句柄(注册时缓存,析构 drain 依据)
+  bool active_conn_bound_{false};   // 活跃连接记账绑定标记(幂等 inc/dec)
+  // ── 任务 D(H-5):destroyUrmaResources 幂等标志 ──
+  // closeNow 与析构双调消除:普通 bool + EVB 断言(隐式同 EVB 串行依赖显式化)
+  bool resources_destroyed_{false};
 
   // 一个 writeChain 内多个大包共享的完成组:
   // writeSuccess 只在组内所有大包都收到对端 FREE 后回调一次

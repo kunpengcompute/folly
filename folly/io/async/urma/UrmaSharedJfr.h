@@ -25,6 +25,7 @@
 #include <memory>
 #include <vector>
 
+#include <folly/io/async/AsyncTimeout.h>
 #include <folly/io/async/EventBaseLocal.h>
 #include <folly/io/async/urma/UrmaConfig.h>
 #include <folly/io/async/urma/UrmaInit.h>
@@ -52,8 +53,11 @@ class UrmaSharedJfr {
 
   // 休眠管理:连接全断时休眠 CqHandler(从 epoll 摘除),重连时唤醒(重新武装)
   // 避免 LT 模式下 JFCE fd 持续 spin 导致 CPU 100%
-  void incActiveConn() noexcept;  // 连接建立(onHandshakeReady)时调用
-  void decActiveConn() noexcept;  // 连接断开(destroyUrmaResources)时调用,归零则休眠
+  // 任务 D(H-5):inc/dec 均在属主 EVB 线程调用(与路由表注册/注销同点绑定,
+  // 见 UrmaAsyncSocket::registerRoutes/destroyUrmaResources),
+  // 计数为普通 uint32_t + EVB 断言显式化(原 std::atomic 隐式依赖显式化)
+  void incActiveConn() noexcept;  // 路由注册(握手就绪/服务端预注册)时调用
+  void decActiveConn() noexcept;  // 路由注销(destroyUrmaResources)时调用,归零则休眠
 
   void pollAndDispatch() noexcept;
   void pollFcAndDispatch() noexcept;
@@ -107,11 +111,29 @@ class UrmaSharedJfr {
   std::vector<std::unique_ptr<UrmaCqHandler>> tx_cq_handlers_;
 
   // 休眠状态:连接全断时 CqHandler 从 epoll 摘除,避免 LT spin
-  std::atomic<uint32_t> active_conn_count_{0};  // per-EventBase 活跃连接数
-  std::atomic<bool> dormant_{false};             // true=CqHandler 已从 epoll 摘除
+  // 任务 D(H-5):active_conn_count_ 由 atomic 降级为普通 uint32_t +
+  // EVB 断言(同 EVB 串行的隐式依赖显式化);dormant_ 保留原子(getOrCreate 跨线程读)
+  uint32_t active_conn_count_{0};        // per-EventBase 活跃连接数(仅属主 EVB 访问)
+  std::atomic<bool> dormant_{false};     // true=CqHandler 已从 epoll 摘除
 
   void dormant() noexcept;  // 休眠:drain 残留 CQE + unregister 所有 CqHandler
   void wakeup() noexcept;   // 唤醒:rearm JFC + register 所有 CqHandler
+
+  // ── 任务 C(H-3/H-4):RX 回收栈重投兜底定时器 ──
+  // 10ms 周期:① 排空本 EVB 选定 IO/FC JFR 的回收栈(防"无新事件导致回收栈滞留",
+  // 上层异步持有 buffer 释放后无 RX/TX 事件驱动的场景);② 记账不变式诊断。
+  // JFR 为进程级共享,多个 UrmaSharedJfr 可能选定同一 JFR,重复排空幂等无害。
+  class RepostTimer : private AsyncTimeout {
+   public:
+    explicit RepostTimer(UrmaSharedJfr* owner)
+        : AsyncTimeout(owner->evb_), owner_(owner) {}
+    void arm() { scheduleTimeout(10); }    // 10ms 自续(任务 C 设计)
+    void disarm() { cancelTimeout(); }   // 私有继承下对外暴露取消
+   private:
+    void timeoutExpired() noexcept override;
+    UrmaSharedJfr* owner_;
+  };
+  std::unique_ptr<RepostTimer> repost_timer_;
 
   static EventBaseLocal<std::unique_ptr<UrmaSharedJfr>>& registry();
 };

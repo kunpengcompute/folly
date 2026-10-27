@@ -14,6 +14,9 @@
 #include <algorithm>
 #include <cstring>
 
+#include <glog/logging.h>
+
+#include <folly/io/async/EventBase.h>
 #include <folly/io/async/urma/UrmaAsyncSocket.h>
 #include <folly/io/async/urma/UrmaConfig.h>
 #include <folly/io/async/urma/UrmaHeader.h>
@@ -23,6 +26,11 @@
 #include <folly/logging/xlog.h>
 
 namespace folly {
+
+// 任务 C:回收栈单轮重投批量上限(摊薄系统调用,同时限制不变式瞬态偏差窗口)
+static constexpr uint32_t kRepostBatchMax = 64;
+// 任务 C:记账不变式连续越界采样阈值(10ms × 5 = 50ms 持续越界才告警)
+static constexpr uint32_t kAccountingSamples = 5;
 
 // ── 进程级单例 ──
 
@@ -34,8 +42,8 @@ UrmaJfrPool* UrmaJfrPool::get() {
 
 // ── 创建单个 JFR(含 JFCE + JFC + JFR + recv buffer 预投) ──
 
-bool UrmaJfrPool::createJfr(urma_context_t* ctx, SharedJfr* jfr,
-                              uint32_t rx_depth, bool is_fc,
+bool UrmaJfrPool::createJfr(urma_context_t* ctx, UrmaJfrPool* pool,
+                              SharedJfr* jfr, uint32_t rx_depth, bool is_fc,
                               const RecvWaterMark& wm) {
   jfr->is_fc = is_fc;
   jfr->rx_depth = rx_depth;
@@ -84,7 +92,7 @@ bool UrmaJfrPool::createJfr(urma_context_t* ctx, SharedJfr* jfr,
   // jfr->jetty_id 在握手时由 jetty->jetty_id.id 填充
 
   // recv buffer 池:按 max_water 预分配 buffer,启动时只预投 min_water 个 recv WR
-  if (!initRxBufPool(jfr, wm.max_water)) {
+  if (!initRxBufPool(pool, jfr, wm.max_water)) {
     XLOG(ERR) << "UrmaJfrPool: init rx buf pool failed";
     urma_delete_jfr(jfr->jfr);
     jfr->jfr = nullptr;
@@ -106,8 +114,15 @@ bool UrmaJfrPool::createJfr(urma_context_t* ctx, SharedJfr* jfr,
 
 // ── 初始化 recv buffer 池 ──
 // 预分配 max_water 个 4KB buffer,但启动时只预投 min_water 个 recv WR
-bool UrmaJfrPool::initRxBufPool(SharedJfr* jfr, uint32_t max_bufs) {
+// 任务 C:同时初始化无锁回收栈 + 回填 RxSlotCtx(常驻稳定存储,评审要点②:
+// ctx 生命周期 = rx_bufs 生命周期,长于一切交付出的 IOBuf)
+bool UrmaJfrPool::initRxBufPool(UrmaJfrPool* pool, SharedJfr* jfr,
+                                uint32_t max_bufs) {
   jfr->rx_bufs.resize(max_bufs);
+  jfr->recycle = std::make_unique<UrmaRecycleStack>();
+  jfr->recycle->init(max_bufs);
+  jfr->held_count.store(0, std::memory_order_relaxed);
+  jfr->transit_cnt.store(0, std::memory_order_relaxed);
   for (uint32_t i = 0; i < max_bufs; ++i) {
     jfr->rx_bufs[i].data = UrmaInit::poolAlloc(URMA_SMALL_BUF_SIZE);
     if (!jfr->rx_bufs[i].data) {
@@ -118,6 +133,7 @@ bool UrmaJfrPool::initRxBufPool(SharedJfr* jfr, uint32_t max_bufs) {
         jfr->rx_bufs[j].data = nullptr;
       }
       jfr->rx_bufs.clear();
+      jfr->recycle.reset();
       return false;
     }
     // 预填充 SGE 和 WR 模板
@@ -128,6 +144,10 @@ bool UrmaJfrPool::initRxBufPool(SharedJfr* jfr, uint32_t max_bufs) {
     jfr->rx_bufs[i].wr.src.num_sge = 1;
     jfr->rx_bufs[i].wr.user_ctx = i;  // slot 索引
     jfr->rx_bufs[i].wr.next = nullptr;
+    // 任务 C:deleter 回收上下文(零拷贝交付后跨线程重投的唯一凭据)
+    jfr->rx_bufs[i].ctx.pool = pool;
+    jfr->rx_bufs[i].ctx.jfr = jfr;
+    jfr->rx_bufs[i].ctx.slot = i;
   }
 
   // 启动时只预投 min_water 个 recv WR(按需投递,设计 §7.3)
@@ -149,6 +169,8 @@ bool UrmaJfrPool::initRxBufPool(SharedJfr* jfr, uint32_t max_bufs) {
 // ── post 单个 recv WR ──
 bool UrmaJfrPool::postRecvWr(SharedJfr* jfr, uint32_t slot) {
   if (slot >= jfr->rx_bufs.size()) return false;
+  // 重置链残留:批量 post 会写 wr->next,单发前清空防止误链(L-10 地雷)
+  jfr->rx_bufs[slot].wr.next = nullptr;
   urma_jfr_wr_t* bad_wr = nullptr;
   urma_status_t ret = urma_post_jfr_wr(jfr->jfr, &jfr->rx_bufs[slot].wr, &bad_wr);
   if (ret != URMA_SUCCESS) {
@@ -190,6 +212,52 @@ bool UrmaJfrPool::postRecvWrBatch(SharedJfr* jfr, const uint32_t* slots, uint32_
   return true;
 }
 
+// ── 任务 C:批量 post 并返回实际成功数(账实严格一致的关键) ──
+// 失败时 urma_post_jfr_wr 已消费 bad_wr 之前的 WR(它们已入 RQ),
+// 按链表节点指针比对定位成功前缀长度,调用方据此递增 recv_posted。
+uint32_t UrmaJfrPool::postRecvWrBatchCount(SharedJfr* jfr,
+                                           const uint32_t* slots,
+                                           uint32_t count) noexcept {
+  if (count == 0) return 0;
+  urma_jfr_wr_t* head = nullptr;
+  urma_jfr_wr_t* tail = nullptr;
+  // 记录链表节点对应的 slots 下标,用于 bad_wr 定位
+  urma_jfr_wr_t* nodes[kRepostBatchMax];
+  uint32_t node_cnt = 0;
+  for (uint32_t i = 0; i < count && node_cnt < kRepostBatchMax; ++i) {
+    uint32_t slot = slots[i];
+    if (slot >= jfr->rx_bufs.size()) continue;
+    urma_jfr_wr_t* wr = &jfr->rx_bufs[slot].wr;
+    wr->next = nullptr;
+    nodes[node_cnt++] = wr;
+    if (!head) {
+      head = wr;
+      tail = wr;
+    } else {
+      tail->next = wr;
+      tail = wr;
+    }
+  }
+  if (!head) return 0;
+  urma_jfr_wr_t* bad_wr = nullptr;
+  urma_status_t ret = urma_post_jfr_wr(jfr->jfr, head, &bad_wr);
+  if (ret == URMA_SUCCESS) {
+    return node_cnt;
+  }
+  XLOG(WARN) << "UrmaJfrPool: postRecvWrBatchCount partial failure, status="
+             << ret << " count=" << node_cnt;
+  if (!bad_wr) {
+    // 契约:失败时 bad_wr 必指向首个失败 WR;防御按 0 成功处理
+    return 0;
+  }
+  for (uint32_t i = 0; i < node_cnt; ++i) {
+    if (nodes[i] == bad_wr) {
+      return i;  // bad_wr 之前的 node_cnt 个已入 RQ
+    }
+  }
+  return 0;
+}
+
 // ── init ──
 
 bool UrmaJfrPool::init(urma_context_t* ctx, const UrmaConfig& config) {
@@ -203,7 +271,7 @@ bool UrmaJfrPool::init(urma_context_t* ctx, const UrmaConfig& config) {
   // IO JFR 池
   io_jfr_list_.resize(config.io_jfr_count);
   for (uint32_t i = 0; i < config.io_jfr_count; ++i) {
-    if (!createJfr(ctx, &io_jfr_list_[i], config.rx_depth, false, wm)) {
+    if (!createJfr(ctx, this, &io_jfr_list_[i], config.rx_depth, false, wm)) {
       XLOG(ERR) << "UrmaJfrPool: create io jfr " << i << " failed";
       return false;
     }
@@ -212,7 +280,7 @@ bool UrmaJfrPool::init(urma_context_t* ctx, const UrmaConfig& config) {
   // FC JFR 池
   fc_jfr_list_.resize(config.fc_jfr_count);
   for (uint32_t i = 0; i < config.fc_jfr_count; ++i) {
-    if (!createJfr(ctx, &fc_jfr_list_[i], config.fc_rx_depth, true, wm)) {
+    if (!createJfr(ctx, this, &fc_jfr_list_[i], config.fc_rx_depth, true, wm)) {
       XLOG(ERR) << "UrmaJfrPool: create fc jfr " << i << " failed";
       return false;
     }
@@ -235,8 +303,8 @@ void UrmaJfrPool::fini() {
   // 进程退出时内核自动回收
   io_jfr_list_.clear();
   fc_jfr_list_.clear();
-  socket_map_.clear();
-  fc_socket_map_.clear();
+  route_table_.clear();
+  fc_route_table_.clear();
   g_jfr_pool = nullptr;
   inited_ = false;
 }
@@ -292,16 +360,17 @@ void UrmaJfrPool::replenishByWaterMark(SharedJfr* jfr, const uint32_t* free_slot
 
 // 内部:收割 CQE 并分发(返回收割的 CQE 数)
 // 被 pollAndDispatch 调用,rearm 后的二次 poll 也复用此函数
-// 任务5:延迟批量补投 — 收割时递减 recv_posted,循环外按水位线批量补投
+//
+// 任务 C(H-3/H-4)记账模型(docs/urma-threading.md 不变量 I4):
+//   收割 CQE:    recv_posted-- + transit++   (WR 离开 RQ,事实计数,无截断)
+//   movable 交付: transit-- + held++         (所有权随 IOBuf 转移,socket 侧完成)
+//   拷贝/控制包:  transit--,slot 入回收栈     (数据已拷出,无持有风险)
+//   deleter 回收: held-- + slot 入回收栈      (任意线程)
+//   重投:         回收栈弹出 N,post 成功 N 个 → recv_posted+=N
+// 旧 REPOST_SLOTS_CAP=256 静态数组整体删除 —— 截断丢 slot 的结构性根因随之消除。
 uint32_t UrmaJfrPool::harvestAndDispatch(SharedJfr* jfr) noexcept {
   constexpr int POLL_BATCH_MAX = 64;
   urma_cr_t cr[POLL_BATCH_MAX];
-  // 累计所有 batch 的回收 slot,用于循环外水位线补投
-  // 单次 harvestAndDispatch 最多回收的 CQE 数受 CQ 深度限制,
-  // 实际中一次 poll 循环回收数 << POLL_BATCH_MAX,用 4 倍容量保守容纳
-  static constexpr int REPOST_SLOTS_CAP = POLL_BATCH_MAX * 4;
-  uint32_t repost_slots[REPOST_SLOTS_CAP];
-  uint32_t repost_cnt_total = 0;
   uint32_t total_cqes = 0;
   int n;
   while ((n = urma_poll_jfc(jfr->jfc, POLL_BATCH_MAX, cr)) > 0) {
@@ -312,6 +381,11 @@ uint32_t UrmaJfrPool::harvestAndDispatch(SharedJfr* jfr) noexcept {
       void* recv_buf = jfr->rx_bufs[slot].data;
       uint32_t recv_len = cr[i].completion_len;
 
+      // 记账(先加后减序:转移期 slot 双计,sum 只朝 M+1 方向瞬态偏差):
+      // WR 离开 RQ,进入交付转移中
+      jfr->transit_cnt.fetch_add(1, std::memory_order_acq_rel);
+      jfr->recv_posted.fetch_sub(1, std::memory_order_acq_rel);
+
       // Phase 3: SEND_IMM 控制包路径(MSG_PULL_MEM / MSG_FREE)
       // 控制包仍写 header 到 recv buffer(用于 socket 路由),imm_data 携带控制元数据
       // 从 recv buffer 前 24B 解析 header → socket 路由 → 从 imm_data 和 trailing field 取控制元数据
@@ -320,9 +394,7 @@ uint32_t UrmaJfrPool::harvestAndDispatch(SharedJfr* jfr) noexcept {
         if (!ctrl_hdr) {
           XLOG(WARN) << "[URMA] SEND_IMM magic mismatch, slot=" << slot
                      << " recv_len=" << recv_len;
-          if (repost_cnt_total < REPOST_SLOTS_CAP) {
-            repost_slots[repost_cnt_total++] = slot;
-          }
+          recycleRxSlot(jfr, slot);
           continue;
         }
         // version 校验(不匹配仅 WARN,不丢弃,向前兼容)
@@ -332,13 +404,11 @@ uint32_t UrmaJfrPool::harvestAndDispatch(SharedJfr* jfr) noexcept {
                      << " expected=" << static_cast<int>(URMA_VERSION)
                      << " type=" << static_cast<int>(ctrl_hdr->type);
         }
-        auto it = socket_map_.find(ctrl_hdr->dst_socket_id);
-        if (it == socket_map_.end()) {
+        auto entry = route_table_.find(ctrl_hdr->dst_socket_id);
+        if (!entry) {
           XLOG(WARN) << "[URMA] SEND_IMM socket_map miss: dst_socket_id="
                      << ctrl_hdr->dst_socket_id;
-          if (repost_cnt_total < REPOST_SLOTS_CAP) {
-            repost_slots[repost_cnt_total++] = slot;
-          }
+          recycleRxSlot(jfr, slot);
           continue;
         }
 
@@ -347,27 +417,26 @@ uint32_t UrmaJfrPool::harvestAndDispatch(SharedJfr* jfr) noexcept {
           // imm_data = remote_va(u64),trailing data_size 从 recv_buf offset 24 读取
           if (recv_len < sizeof(PullMemControlPacket)) {
             XLOG(WARN) << "[URMA] PULL_MEM too short: recv_len=" << recv_len;
-            if (repost_cnt_total < REPOST_SLOTS_CAP) {
-              repost_slots[repost_cnt_total++] = slot;
-            }
+            recycleRxSlot(jfr, slot);
             continue;
           }
           auto* pkt = static_cast<const PullMemControlPacket*>(recv_buf);
           uint64_t remote_va = cr[i].imm_data;
           uint32_t data_size = pkt->data_size;
-          it->second->onControlMsgImm(MSG_PULL_MEM, ctrl_hdr->msg_id,
-                                      remote_va, data_size);
+          entry->sock.load(std::memory_order_acquire)
+              ->onControlMsgImm(MSG_PULL_MEM, ctrl_hdr->msg_id,
+                                remote_va, data_size);
         } else if (ctrl_hdr->type == MSG_FREE) {
           // FREE:SGE[0] = UrmaMsgHeader(24B),imm_data = msg_id(低 16 位有效)
           uint16_t msg_id = static_cast<uint16_t>(cr[i].imm_data);
-          it->second->onControlMsgImm(MSG_FREE, msg_id, 0, 0);
+          entry->sock.load(std::memory_order_acquire)
+              ->onControlMsgImm(MSG_FREE, msg_id, 0, 0);
         } else {
           XLOG(WARN) << "[URMA] SEND_IMM unexpected type="
                      << static_cast<int>(ctrl_hdr->type);
         }
-        if (repost_cnt_total < REPOST_SLOTS_CAP) {
-          repost_slots[repost_cnt_total++] = slot;
-        }
+        // 控制包数据已按值解析拷出,无持有风险:立即回收(不变量 I4 范围裁剪)
+        recycleRxSlot(jfr, slot);
         continue;
       }
 
@@ -379,51 +448,34 @@ uint32_t UrmaJfrPool::harvestAndDispatch(SharedJfr* jfr) noexcept {
                    << " first4=" << std::hex
                    << (recv_buf ? *static_cast<const uint32_t*>(recv_buf) : 0)
                    << std::dec;
-        if (repost_cnt_total < REPOST_SLOTS_CAP) {
-          repost_slots[repost_cnt_total++] = slot;
-        }
+        recycleRxSlot(jfr, slot);
         continue;
       }
 
-      // Phase 3: headroom 路由 — 用 header.dst_socket_id 查 socket_map
+      // Phase 3: headroom 路由 — 用 header.dst_socket_id 查分片路由表
       // 发送方写入对端 socket_id(= 接收方本端 socket_id),接收方据此路由
-      auto it = socket_map_.find(hdr->dst_socket_id);
-      if (it == socket_map_.end()) {
+      auto entry = route_table_.find(hdr->dst_socket_id);
+      if (!entry) {
         XLOG(WARN) << "[URMA] socket_map miss: dst_socket_id=" << hdr->dst_socket_id
                    << " remote_id=" << cr[i].remote_id.id
-                   << " map_size=" << socket_map_.size();
-        if (repost_cnt_total < REPOST_SLOTS_CAP) {
-          repost_slots[repost_cnt_total++] = slot;
-        }
+                   << " map_size=" << route_table_.size();
+        recycleRxSlot(jfr, slot);
         continue;
       }
 
-      // 统一通过 onIoMessageReceived 分发
-      it->second->onIoMessageReceived(recv_buf, recv_len, slot);
-      if (repost_cnt_total < REPOST_SLOTS_CAP) {
-        repost_slots[repost_cnt_total++] = slot;
+      // 统一通过 onIoMessageReceived 分发(所有权交付由返回值区分)
+      // owned=true:  buffer 所有权已随 IOBuf 转移(transit→held),deleter 负责回收
+      // owned=false: 数据已拷出/未消费,本线程立即回收
+      bool owned = entry->sock.load(std::memory_order_acquire)->onIoMessageReceived(
+          recv_buf, recv_len, &jfr->rx_bufs[slot].ctx);
+      if (!owned) {
+        recycleRxSlot(jfr, slot);
       }
     }
   }
 
-  // 延迟批量补投(任务5):本批共回收 repost_cnt_total 个 posted slot,先递减 recv_posted
-  if (repost_cnt_total > 0) {
-    jfr->recv_posted.fetch_sub(repost_cnt_total, std::memory_order_acq_rel);
-  }
-
-  // 水位线补投:recv_posted 低于 min_water 时批量补投到 max_water
-  // 只补投本批回收的 slot(已知空闲);不足部分下次收割继续补,recv_posted 不会持续下降
-  if (repost_cnt_total > 0) {
-    uint32_t posted = jfr->recv_posted.load(std::memory_order_acquire);
-    if (posted < jfr->watermark.min_water) {
-      uint32_t to_post = jfr->watermark.max_water - posted;
-      uint32_t batch = std::min(repost_cnt_total, to_post);
-      if (batch > 0) {
-        postRecvWrBatch(jfr, repost_slots, batch);
-        jfr->recv_posted.fetch_add(batch, std::memory_order_acq_rel);
-      }
-    }
-  }
+  // 任务 C:每轮收割后检查回收栈批量重投(摊薄系统调用)
+  repostRecycled(jfr);
   return total_cqes;
 }
 
@@ -452,6 +504,145 @@ void UrmaJfrPool::pollAndDispatch(SharedJfr* jfr) noexcept {
   // fc_tx_depth=64 的 CQ 足以缓冲,避免每次 RX 事件遍历 FC JFS 产生空轮询自旋锁开销。
 }
 
+// ── 任务 C(H-3/H-4):RX slot 回收与重投 ──
+
+// deleter 回收入口(任意线程,IOBuf 析构时调用):
+// held-- + slot 入无锁回收栈(先入栈后撤销 held,先加后减序)
+// 禁止直接 post —— 跨线程 urma_post 虽功能正确但破坏批量摊薄,且与收割线程竞争。
+void UrmaJfrPool::releaseHeldSlot(SharedJfr* jfr, uint32_t slot) noexcept {
+  if (!jfr || !jfr->recycle) return;
+  jfr->recycle->push(slot);
+  jfr->held_count.fetch_sub(1, std::memory_order_acq_rel);
+}
+
+// 收割线程立即回收(数据已按值消费:控制包/FC/解析失败/降级拷贝):
+// transit-- + slot 入无锁回收栈
+void UrmaJfrPool::recycleRxSlot(SharedJfr* jfr, uint32_t slot) noexcept {
+  if (!jfr || !jfr->recycle) return;
+  jfr->recycle->push(slot);
+  jfr->transit_cnt.fetch_sub(1, std::memory_order_acq_rel);
+}
+
+// 收割线程:批量弹出回收栈并重投。
+// 触发点:① harvestAndDispatch/harvestFcAndDispatch 每轮收割后;
+//        ② UrmaSharedJfr 10ms idle timer 兜底(防"无新事件导致回收栈滞留")。
+// 账实严格一致:batch 失败按 bad_wr 定位成功前缀,只对成功数递增 recv_posted;
+// 失败 slot 退回回收栈,下轮事件重试。
+void UrmaJfrPool::repostRecycled(SharedJfr* jfr) noexcept {
+  if (!jfr || !jfr->recycle || !jfr->jfr) return;
+  uint32_t slots[kRepostBatchMax];
+  while (true) {
+    uint32_t posted = jfr->recv_posted.load(std::memory_order_acquire);
+    if (posted >= jfr->watermark.max_water) return;  // RQ 水位已满
+    uint32_t room = jfr->watermark.max_water - posted;
+    uint32_t want = std::min(room, kRepostBatchMax);
+    uint32_t cnt = jfr->recycle->drain(slots, want);
+    if (cnt == 0) return;
+    uint32_t ok = postRecvWrBatchCount(jfr, slots, cnt);
+    if (ok > 0) {
+      jfr->recv_posted.fetch_add(ok, std::memory_order_acq_rel);
+    }
+    if (ok < cnt) {
+      // 失败部分退回回收栈(下轮事件重试),避免自旋
+      for (uint32_t i = ok; i < cnt; ++i) {
+        jfr->recycle->push(slots[i]);
+      }
+      return;
+    }
+  }
+}
+
+// 任务 C:记账不变式诊断(10ms idle timer 周期调用)。
+// 不变式:recv_posted + transit_cnt + held_count + 回收栈深 == 流通 slot 总数。
+// 注:流通总量 = 启动时预投的 min_water 个(重投只回收已流通 slot,水位不增长,
+//     该行为与检视报告 M-3 描述一致,M-3 完整修复归 M 系列;用 max_water 会误报)。
+// 并发转移期存在有界瞬态偏差(先加后减序 + repost 批次窗口),
+// 故连续 kAccountingSamples 次采样均越界才告警 —— 捕获 H-4 类系统性
+// slot 泄漏/重复(单次截断即永久漂移 ≥1,持续负载下秒级可见),零误报。
+void UrmaJfrPool::checkRxAccounting(SharedJfr* jfr) noexcept {
+  if (!jfr || !jfr->recycle) return;
+  uint32_t circulating = jfr->watermark.min_water;  // 当前流通总量(预投数)
+  // 偏差容忍上界:单轮重投批量 + 并发收割转移数(16 JFR × 少量在途)
+  constexpr uint32_t kSlack = kRepostBatchMax + 16;
+  uint32_t sum = jfr->recv_posted.load(std::memory_order_acquire) +
+                 jfr->transit_cnt.load(std::memory_order_acquire) +
+                 jfr->held_count.load(std::memory_order_acquire) +
+                 jfr->recycle->size();
+  int64_t delta = static_cast<int64_t>(sum) -
+                  static_cast<int64_t>(circulating);
+  if (delta == 0) {
+    jfr->accounting_bad_streak.store(0, std::memory_order_relaxed);
+    return;
+  }
+  // 瞬态:偏差 > 0 且 ≤ kSlack(转移双计窗口);重投窗口可能短暂 < 0
+  if (delta > 0 && static_cast<uint32_t>(delta) <= kSlack) {
+    return;  // 疑似瞬态,不计入连续越界
+  }
+  if (jfr->accounting_bad_streak.fetch_add(1, std::memory_order_relaxed) + 1 >=
+      kAccountingSamples) {
+    jfr->accounting_bad_streak.store(0, std::memory_order_relaxed);
+    XLOG(ERR) << "[URMA] RX accounting invariant VIOLATED: "
+              << "recv_posted=" << jfr->recv_posted.load()
+              << " transit=" << jfr->transit_cnt.load()
+              << " held=" << jfr->held_count.load()
+              << " recycle=" << jfr->recycle->size()
+              << " sum=" << sum << " circulating=" << circulating
+              << " is_fc=" << jfr->is_fc
+              << " (slot leak or duplicate — check deleter/repost paths)";
+    DCHECK(delta == 0);  // debug 构建显式断言,便于 CI 抓获
+  }
+}
+
+// ── 任务 B(H-2):TX CQE(READ)属主转发 ──
+//
+// 协议(docs/urma-threading.md 不变量 I1/I3,sock 置空协议升级版):
+//   1. 先查安全句柄(SafeRouteEntry,shared_ptr 保活);未命中 = 连接已销毁,丢弃。
+//   2. 收割线程恰为属主 EVB → 同步短路调用(与属主析构天然串行,安全),零延迟
+//      (保持小包路径性能,历史全量 runInLoop 回退的教训见 handleRemoteReadCqe 注释)。
+//   3. 跨 EVB → pending++(仅作 entry 保活计数)→ runInEventBaseThread 转发回属主
+//      线程(线程安全通道);msg_id/status 按值捕获于调用方 delete tx_ctx 之前
+//      (评审要点①)。
+//   4. 置空协议:连接销毁(destroyUrmaResources)时 sock 置 nullptr(属主 EVB 写),
+//      在途 lambda(恒在属主 EVB 执行)判空跳过回调 —— 结构性消除 UAF,
+//      替代原"析构自旋等待 pending==0"方案(自旋阻塞本 EVB 队列,lambda
+//      无法执行 → 10ms 超时放行 → UAF,close_loop 高压下真实触发,原 R3 风险)。
+void UrmaJfrPool::dispatchReadCqe(uint64_t socket_id, uint16_t msg_id,
+                                 urma_status_t status) noexcept {
+  auto entry = route_table_.find(socket_id);
+  if (!entry) {
+    XLOG(WARN) << "[URMA] dispatchReadCqe: READ cqe for unregistered socket_id=0x"
+               << std::hex << socket_id << std::dec
+               << " msg_id=" << msg_id << " (connection destroyed?)";
+    return;
+  }
+  EventBase* evb = entry->evb;
+  UrmaAsyncSocket* sock = entry->sock.load(std::memory_order_acquire);
+  if (!evb || !sock) {
+    return;  // 连接销毁中(置空协议):丢弃
+  }
+  if (evb->inRunningEventBaseThread()) {
+    // 同 EVB 短路:零延迟同步调用(当前线程即属主 EVB,与销毁串行,安全)
+    sock->handleRemoteReadCqe(msg_id, status);
+    return;
+  }
+  // 跨 EVB 转发:pending 先增(entry 保活计数),句柄按值捕获。
+  // 线程安全修正:EventBase::runInLoop(Func) 非线程安全(无锁 push_back
+  // 到 loopCallbacks_,DCHECK 仅 debug 生效)—— 跨线程必须走
+  // runInEventBaseThread(notification queue 通道),否则与本 EVB 线程的
+  // runLoopCallbacks 并发破坏 intrusive 链表(4 IO 线程 8M 实测 SIGSEGV)
+  entry->pending.fetch_add(1, std::memory_order_acq_rel);
+  auto guard = entry;  // shared_ptr 拷贝:entry 生命周期 ≥ lambda 生命周期
+  evb->runInEventBaseThread([sock, msg_id, status, guard]() {
+    // 置空协议:连接销毁时 sock 已置 nullptr(属主 EVB 写,lambda 恒在属主
+    // EVB 执行,与置空天然串行)—— 判空跳过,socket 生命周期不再依赖本 lambda
+    if (sock == guard->sock.load(std::memory_order_acquire)) {
+      sock->handleRemoteReadCqe(msg_id, status);
+    }
+    guard->pending.fetch_sub(1, std::memory_order_acq_rel);
+  });
+}
+
+
 void UrmaJfrPool::harvestTxAndDispatch(uint32_t jfs_index) noexcept {
   UrmaJfsPool* jfs_pool = UrmaJfsPool::get();
   if (!jfs_pool) return;
@@ -469,20 +660,21 @@ void UrmaJfrPool::harvestTxAndDispatch(uint32_t jfs_index) noexcept {
       if (!tx_ctx) continue;
 
       if (tx_ctx->type == TxCompletionCtx::MSG_READ) {
-        // READ CQE:通过 socket_id 路由到对应连接
-        UrmaAsyncSocket* peer = findSocket(tx_ctx->socket_id);
-        if (peer) {
-          peer->handleRemoteReadCqe(tx_ctx->msg_id, cr[i].status);
-        } else {
-          XLOG(WARN) << "[URMA] harvestTx: READ cqe for disconnected socket_id=0x"
-                     << std::hex << tx_ctx->socket_id << std::dec
-                     << " msg_id=" << tx_ctx->msg_id;
-        }
+        // 任务 B(H-2):READ CQE 统一走属主转发协议
+        // (同 EVB 短路同步,跨 EVB runInLoop 转发回属主线程);
+        // socket_id/msg_id/status 先按值取走,ctx 在转发前 delete(评审要点①)
+        uint64_t socket_id = tx_ctx->socket_id;
+        uint16_t msg_id = tx_ctx->msg_id;
+        urma_status_t status = cr[i].status;
         jfs_pool->releaseIoJfs(tx_ctx->jfs_index);
         delete tx_ctx;
+        dispatchReadCqe(socket_id, msg_id, status);
       } else {
         // MSG_DATA / MSG_CTRL_PULL / MSG_CTRL_FREE:
         // 归还 sq_inflight + delete ctx → send_data 析构 → block 回收
+        // 资源回收只触碰进程级池(池自身线程安全),收割线程就地完成,零转发;
+        // ctx 内 send_data 的 IoBufBlock 归还收割线程 TLS 缓存,内存全局 MR 池,
+        // 跨线程归还功能正确(行为说明见 docs/urma-threading.md)
         jfs_pool->releaseIoJfs(tx_ctx->jfs_index);
         delete tx_ctx;
       }
@@ -543,14 +735,12 @@ void UrmaJfrPool::pollFcAndDispatch(SharedJfr* jfr) noexcept {
 }
 
 // 内部:收割 FC JFR 的 CQE 并路由(返回收割的 CQE 数)
-// 任务5:延迟批量补投 — 收割时递减 recv_posted,循环外按水位线批量补投
+// 任务 C(H-3/H-4)记账模型与 harvestAndDispatch 同构:
+//   收割 CQE:recv_posted-- + transit++;FC 消息已按值反序列化,立即回收入栈;
+//   每轮收割后回收栈批量重投。REPOST_SLOTS_CAP 截断根因随之消除。
 uint32_t UrmaJfrPool::harvestFcAndDispatch(SharedJfr* jfr) noexcept {
   constexpr int POLL_BATCH_MAX = 64;
   urma_cr_t cr[POLL_BATCH_MAX];
-  // 累计所有 batch 的回收 slot,用于循环外水位线补投
-  static constexpr int REPOST_SLOTS_CAP = POLL_BATCH_MAX * 4;
-  uint32_t repost_slots[REPOST_SLOTS_CAP];
-  uint32_t repost_cnt_total = 0;
   uint32_t total_cqes = 0;
   int n;
   while ((n = urma_poll_jfc(jfr->jfc, POLL_BATCH_MAX, cr)) > 0) {
@@ -560,84 +750,72 @@ uint32_t UrmaJfrPool::harvestFcAndDispatch(SharedJfr* jfr) noexcept {
       void* recv_buf = jfr->rx_bufs[slot].data;
       uint32_t recv_len = cr[i].completion_len;
 
+      // 记账(先加后减序):WR 离开 RQ,进入交付转移中
+      jfr->transit_cnt.fetch_add(1, std::memory_order_acq_rel);
+      jfr->recv_posted.fetch_sub(1, std::memory_order_acq_rel);
+
       // FC 消息:payload 前 8B 携带 SocketId(无 64B headroom header)
       if (recv_len < sizeof(uint64_t)) {
         XLOG(WARN) << "[URMA-FC] recv too short, slot=" << slot
                    << " recv_len=" << recv_len;
-        if (repost_cnt_total < REPOST_SLOTS_CAP) {
-          repost_slots[repost_cnt_total++] = slot;
-        }
+        recycleRxSlot(jfr, slot);
         continue;
       }
 
       uint64_t dst_socket_id = 0;
       std::memcpy(&dst_socket_id, recv_buf, sizeof(uint64_t));
 
-      auto it = fc_socket_map_.find(dst_socket_id);
-      if (it == fc_socket_map_.end()) {
+      auto entry = fc_route_table_.find(dst_socket_id);
+      if (!entry) {
         XLOG(DBG) << "[URMA-FC] fc_socket_map miss: dst_socket_id=0x"
                    << std::hex << dst_socket_id << std::dec
-                   << " map_size=" << fc_socket_map_.size();
-        if (repost_cnt_total < REPOST_SLOTS_CAP) {
-          repost_slots[repost_cnt_total++] = slot;
-        }
+                   << " map_size=" << fc_route_table_.size();
+        recycleRxSlot(jfr, slot);
         continue;
       }
 
-      // 分发到目标 UrmaAsyncSocket(Phase 6: REQ/REP/RETURN/ACK 完整处理)
-      it->second->onFcMessageReceived(recv_buf, recv_len);
-      if (repost_cnt_total < REPOST_SLOTS_CAP) {
-        repost_slots[repost_cnt_total++] = slot;
-      }
+      // 分发到目标 UrmaAsyncSocket(FC 字段已按值反序列化,无持有风险 → 立即回收)
+      entry->sock.load(std::memory_order_acquire)->onFcMessageReceived(recv_buf, recv_len);
+      recycleRxSlot(jfr, slot);
     }
   }
 
-  // 延迟批量补投(任务5):本批共回收 repost_cnt_total 个 posted slot,先递减 recv_posted
-  if (repost_cnt_total > 0) {
-    jfr->recv_posted.fetch_sub(repost_cnt_total, std::memory_order_acq_rel);
-  }
-
-  // 水位线补投:recv_posted 低于 min_water 时批量补投到 max_water
-  if (repost_cnt_total > 0) {
-    uint32_t posted = jfr->recv_posted.load(std::memory_order_acquire);
-    if (posted < jfr->watermark.min_water) {
-      uint32_t to_post = jfr->watermark.max_water - posted;
-      uint32_t batch = std::min(repost_cnt_total, to_post);
-      if (batch > 0) {
-        postRecvWrBatch(jfr, repost_slots, batch);
-        jfr->recv_posted.fetch_add(batch, std::memory_order_acq_rel);
-      }
-    }
-  }
+  // 任务 C:每轮收割后回收栈批量重投
+  repostRecycled(jfr);
   return total_cqes;
 }
 
 // ── 路由表 ──
+// H-1 修复:全部委托 16 分片读写锁路由表,签名不变,调用方零改动
 
 void UrmaJfrPool::registerSocket(uint64_t socket_id, UrmaAsyncSocket* socket) {
-  socket_map_[socket_id] = socket;
+  route_table_.insert(socket_id, socket, socket->getEventBase());
 }
 
 void UrmaJfrPool::unregisterSocket(uint64_t socket_id) {
-  socket_map_.erase(socket_id);
+  route_table_.erase(socket_id);
 }
 
 UrmaAsyncSocket* UrmaJfrPool::findSocket(uint64_t socket_id) {
-  auto it = socket_map_.find(socket_id);
-  return it != socket_map_.end() ? it->second : nullptr;
+  auto entry = route_table_.find(socket_id);
+  return entry ? entry->sock.load(std::memory_order_acquire) : nullptr;
+}
+
+SafeRouteEntryPtr UrmaJfrPool::findRouteEntry(uint64_t socket_id) {
+  return route_table_.find(socket_id);
 }
 
 void UrmaJfrPool::registerFcSocket(uint64_t socket_id, UrmaAsyncSocket* socket) {
-  fc_socket_map_[socket_id] = socket;
+  fc_route_table_.insert(socket_id, socket, socket->getEventBase());
 }
 
 void UrmaJfrPool::unregisterFcSocket(uint64_t socket_id) {
-  fc_socket_map_.erase(socket_id);
+  fc_route_table_.erase(socket_id);
 }
 
 UrmaAsyncSocket* UrmaJfrPool::findFcSocket(uint64_t socket_id) {
-  auto it = fc_socket_map_.find(socket_id);
-  return it != fc_socket_map_.end() ? it->second : nullptr;
+  auto entry = fc_route_table_.find(socket_id);
+  return entry ? entry->sock.load(std::memory_order_acquire) : nullptr;
 }
 
 // ── JFCE fd 列表(供 UrmaCqHandler 注册) ──

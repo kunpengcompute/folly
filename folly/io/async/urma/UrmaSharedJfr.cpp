@@ -11,6 +11,8 @@
 
 #ifdef FOLLY_HAVE_URMA
 
+#include <glog/logging.h>
+
 #include <folly/io/async/EventBase.h>
 #include <folly/io/async/urma/UrmaAsyncSocket.h>
 #include <folly/io/async/urma/UrmaCqHandler.h>
@@ -60,24 +62,38 @@ void UrmaSharedJfr::releaseIfEmpty(EventBase* evb) {
 }
 
 // ── 休眠管理 ──
+// 任务 D(H-5):inc/dec 均在属主 EVB 线程调用且与路由表注册/注销同点绑定,
+// 计数为普通 uint32_t(隐式 EVB 串行依赖以 DCHECK 显式化)。
 
 void UrmaSharedJfr::incActiveConn() noexcept {
+  DCHECK(!evb_ || evb_->inRunningEventBaseThread());
   // 休眠态唤醒:新连接建立前先重新武装 CqHandler
   if (dormant_.load(std::memory_order_acquire)) {
     wakeup();
   }
-  active_conn_count_.fetch_add(1, std::memory_order_acq_rel);
+  ++active_conn_count_;
 }
 
 void UrmaSharedJfr::decActiveConn() noexcept {
-  uint32_t prev = active_conn_count_.fetch_sub(1, std::memory_order_acq_rel);
-  if (prev == 1) {
+  DCHECK(!evb_ || evb_->inRunningEventBaseThread());
+  if (active_conn_count_ == 0) {
+    // 防御:调用方破坏 EVB 约定/绑定不变式时防止下溢(静默假死 → 显式告警)
+    XLOG(ERR) << "UrmaSharedJfr: decActiveConn underflow attempt on evb="
+              << reinterpret_cast<void*>(evb_);
+    return;
+  }
+  if (--active_conn_count_ == 0) {
     // 计数归零:本 EventBase 无活跃连接,休眠 CqHandler
     dormant();
   }
 }
 
 void UrmaSharedJfr::dormant() noexcept {
+  // 任务 D(H-5)防御性重验:drain/unregister 前若计数已非零,
+  // 说明窗口期内有新连接注册 → 放弃休眠(事件断供假死防线)
+  if (active_conn_count_ > 0) {
+    return;
+  }
   // 先 drain 残留 CQE,减少 unregister 后内核 CQ 积压
   if (io_shared_jfr_) {
     UrmaJfrPool::get()->pollAndDispatch(io_shared_jfr_);
@@ -96,6 +112,17 @@ void UrmaSharedJfr::dormant() noexcept {
       harvestFcTx(fi);
     }
   }
+  // 任务 C:休眠前排空回收栈,防止残余 slot 滞留到下次 wakeup
+  if (auto* pool = UrmaJfrPool::get()) {
+    if (io_shared_jfr_) {
+      pool->repostRecycled(io_shared_jfr_);
+      pool->checkRxAccounting(io_shared_jfr_);
+    }
+    if (fc_shared_jfr_) {
+      pool->repostRecycled(fc_shared_jfr_);
+      pool->checkRxAccounting(fc_shared_jfr_);
+    }
+  }
 
   // 从 epoll 摘除所有 CqHandler(不 delete 对象,保留供 wakeup 复用)
   if (io_cq_handler_) {
@@ -106,6 +133,10 @@ void UrmaSharedJfr::dormant() noexcept {
   }
   for (auto& h : tx_cq_handlers_) {
     if (h) h->unregisterHandler();
+  }
+  // 任务 C:休眠时停用回收栈重投定时器(wakeup 时重启)
+  if (repost_timer_) {
+    repost_timer_->disarm();
   }
 
   dormant_.store(true, std::memory_order_release);
@@ -133,9 +164,38 @@ void UrmaSharedJfr::wakeup() noexcept {
       h->registerHandler(EventHandler::READ | EventHandler::PERSIST);
     }
   }
+  // 任务 C:唤醒后排空休眠期间可能滞留的回收栈 + 重启定时器
+  if (auto* pool = UrmaJfrPool::get()) {
+    if (io_shared_jfr_) {
+      pool->repostRecycled(io_shared_jfr_);
+    }
+    if (fc_shared_jfr_) {
+      pool->repostRecycled(fc_shared_jfr_);
+    }
+  }
+  if (repost_timer_) {
+    repost_timer_->arm();
+  }
 
   dormant_.store(false, std::memory_order_release);
   XLOG(INFO) << "UrmaSharedJfr: wakeup (CqHandler re-registered)";
+}
+
+// 任务 C:回收栈重投兜底定时器(10ms 自续)
+// 触发点补充说明:pollAndDispatch/harvestTx 事件驱动为主,本定时器
+// 仅兜底"上层持有 buffer 跨事件周期释放"的滞留场景。
+void UrmaSharedJfr::RepostTimer::timeoutExpired() noexcept {
+  if (auto* pool = UrmaJfrPool::get()) {
+    if (owner_->io_shared_jfr_) {
+      pool->repostRecycled(owner_->io_shared_jfr_);
+      pool->checkRxAccounting(owner_->io_shared_jfr_);
+    }
+    if (owner_->fc_shared_jfr_) {
+      pool->repostRecycled(owner_->fc_shared_jfr_);
+      pool->checkRxAccounting(owner_->fc_shared_jfr_);
+    }
+  }
+  scheduleTimeout(10);  // 自续
 }
 
 UrmaSharedJfr::UrmaSharedJfr(EventBase* evb, const UrmaConfig& /*config*/)
@@ -202,12 +262,21 @@ UrmaSharedJfr::UrmaSharedJfr(EventBase* evb, const UrmaConfig& /*config*/)
                << " TX JFCE fds to epoll";
   }
 
+  // 任务 C:回收栈重投兜底定时器(10ms,见 RepostTimer 注释)
+  repost_timer_ = std::make_unique<RepostTimer>(this);
+  repost_timer_->arm();
+
   valid_ = true;
   XLOG(INFO) << "UrmaSharedJfr: bound to io_jfr[" << io_jfr_index_
              << "] fc_jfr[" << fc_jfr_index_ << "]";
 }
 
 UrmaSharedJfr::~UrmaSharedJfr() {
+  // 任务 C:先停用回收栈重投定时器
+  if (repost_timer_) {
+    repost_timer_->disarm();
+    repost_timer_.reset();
+  }
   // 先清理 TX CqHandler(释放 epoll 注册)
   tx_cq_handlers_.clear();
   if (io_cq_handler_) {

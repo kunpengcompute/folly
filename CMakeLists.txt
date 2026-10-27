@@ -1088,6 +1088,16 @@ if (BUILD_TESTS OR BUILD_BENCHMARKS)
     )
   endif()
 
+  # URMA(SDD-URMA-HFIX-001):路由表/回收栈单测 —— 仅依赖 FOLLY_HAVE_URMA 宏
+  # 与 folly 头,不触碰 urma_api/硬件;无 URMA SDK 的环境跳过构建
+  if (URMA_INCLUDE_DIR AND URMA_LIBRARY)
+    folly_define_tests(
+      DIRECTORY io/async/urma/test/
+        TEST urma_route_table_test SOURCES UrmaRouteTableTest.cpp
+        TEST urma_recycle_stack_test SOURCES UrmaRecycleStackTest.cpp
+    )
+  endif()
+
   get_target_property(pic folly POSITION_INDEPENDENT_CODE)
   if (pic)
     add_library(singleton_thread_local_overload
