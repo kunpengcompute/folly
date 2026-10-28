@@ -44,6 +44,7 @@
 #include <folly/io/async/urma/UrmaJfsPool.h>
 #include <folly/io/async/urma/UrmaJfrPool.h>
 #include <folly/io/async/urma/UrmaRouteTable.h>
+#include <folly/io/async/urma/UrmaSeqReorder.h>
 #include <folly/io/async/urma/UrmaHeader.h>
 #include <folly/io/async/urma/UrmaFlowControl.h>
 #include <ub/umdk/urma/urma_api.h>
@@ -131,6 +132,17 @@ class UrmaAsyncSocket : public AsyncTransport {
   bool onIoMessageReceived(void* recv_buf, uint32_t recv_len,
                             RxSlotCtx* ctx) noexcept;
 
+  // 保序/交付辅助(重排默认开启)
+  // buildOwnedDataFrame: movable 帧构造(held++/transit-- 内完成),失败返回空
+  std::unique_ptr<IOBuf> buildOwnedDataFrame(void* recv_buf, uint32_t recv_len,
+                                             RxSlotCtx* ctx) noexcept;
+  // deliverDataFrame: 帧交付(movable 优先,降级 memcpy),返回 owned
+  bool deliverDataFrame(void* recv_buf, uint32_t recv_len,
+                        RxSlotCtx* ctx) noexcept;
+  // flushReorderBuffer: 重排缓冲强制放行(timeout=0),expected 重同步
+  void flushReorderBuffer(uint16_t& expected,
+                          std::vector<std::unique_ptr<IOBuf>>& out) noexcept;
+
   // 控制包/FREE 通知(由 UrmaJfrPool::harvestAndDispatch SEND_IMM 分支调用)
   // type:       MSG_PULL_MEM / MSG_FREE
   // msg_id:     大包 msg_id(PULL/FREE 匹配)
@@ -138,6 +150,9 @@ class UrmaAsyncSocket : public AsyncTransport {
   // data_size:  PULL_MEM 时为远端数据长度(从 recv_buf trailing 取);FREE 时为 0
   void onControlMsgImm(uint8_t type, uint16_t msg_id,
                        uint64_t remote_va, uint32_t data_size) noexcept;
+  // 段表式 PULL_MEM(免拷贝,PullMemFragPacket 解析后调用,段表已拷出)
+  void onPullMemFrags(uint16_t msg_id, const PullMemFragDesc* frags,
+                      uint16_t frag_count, uint32_t total_size) noexcept;
 
   // 交付缓存数据给当前 read_cb_(支持 movable 和非 movable 两种模式)
   void deliverReadData() noexcept;
@@ -267,13 +282,21 @@ class UrmaAsyncSocket : public AsyncTransport {
   };
 
   // ── 单边 READ 内部函数 ──
-  bool sendBigMsgByRead(WriteCallback* cb, std::unique_ptr<IOBuf> node,
+  // 任务:去 9M tier + 打包分片免拷贝 ——
+  //   发送侧 clone() 源链(零拷贝引用计数共享),遍历物理块生成段表,
+  //   PullMemFragPacket 段表通告接收方;段数 > kMaxPullFrags 自动分批;
+  //   接收方对每段独立 READ(WR 链),DMA 直写本地块 —— 全程无二次拷贝
+  bool sendBigMsgByRead(WriteCallback* cb, std::unique_ptr<IOBuf> chain,
                         const std::shared_ptr<BigMsgGroup>& group) noexcept;
-  // PULL_MEM 控制包:SEND_IMM,SGE[0]=PullMemControlPacket(32B),imm_data=remote_va
-  // seq: 连接级发送序列号(每 WR 递增,保序用)
-  bool postControlPacket(uint16_t msg_id, uint16_t seq, uint64_t remote_va,
-                         uint32_t data_size) noexcept;
-  bool startRead(uint16_t msg_id, uint64_t remote_va, uint32_t data_size) noexcept;
+  // 段表式 PULL_MEM 控制包:SEND_IMM,SGE[0]=PullMemFragPacket(变长段表),
+  // imm_data=total_size(诊断);控制包 ≤ 4K recv buffer
+  bool postControlPacketFrags(uint16_t msg_id, uint16_t seq,
+                              const PullMemFragDesc* frags,
+                              uint16_t frag_count, uint32_t total_size) noexcept;
+  // 段表式 READ(免拷贝):为每段分配本地 dst 块,WR 链一次 post
+  // (每 WR complete,仅尾 WR 携带 ctx → 单 CQE 触发 onReadComplete)
+  bool startRead(uint16_t msg_id, const PullMemFragDesc* frags,
+                 uint16_t frag_count, uint32_t total_size) noexcept;
   // FREE 通知:SEND_IMM,SGE[0]=UrmaMsgHeader(24B),imm_data=msg_id
   // seq: 连接级发送序列号(每 WR 递增,保序用)
   bool postFreeNotify(uint16_t msg_id, uint16_t seq) noexcept;
@@ -281,6 +304,15 @@ class UrmaAsyncSocket : public AsyncTransport {
   void onReadFailed(urma_status_t status) noexcept;
   void scanBigMsgTimeout() noexcept;
   void drainRxPendingQueue() noexcept;
+
+  // ── 保序:重排缓冲超时检查(ScanTimer 100ms tick 驱动) ──
+  // 空洞超时(reorder_timeout_ms)未补齐 → 放行缓冲全部 + 重同步 + WARN
+  void checkReorderTimeout() noexcept;
+
+  // ── FC:周期 credit 归还(ScanTimer 100ms tick 驱动,任务:流控闭环) ──
+  // peer_credit 超过保留阈值(初始授予量)时归还多余 → 接收方 idle 回升,
+  // 修复"只借不还"导致的 credit 统计失效(peer_credit 单调下探)
+  void maybeReturnCredit() noexcept;
 
   // ── 任务 E(H-6):大包超时扫描定时器(可取消 AsyncTimeout,替代 runAfterDelay) ──
   // runAfterDelay([this], 100) 不可取消,析构后 100ms 窗口内触发 = UAF;
@@ -307,6 +339,13 @@ class UrmaAsyncSocket : public AsyncTransport {
   std::atomic<uint16_t> send_seq_{0};
   // per-连接期望接收序列号(保序校验,与 send_seq_ 对应,接收侧可选校验)
   std::atomic<uint16_t> expected_seq_{0};
+  // 保序重排缓冲(默认开启,无开关):
+  // 未来帧暂存按序交付,空洞超时兜底放行;仅属主 EVB 访问,无锁
+  UrmaSeqReorder rx_reorder_;
+  // 保序统计(诊断打点):乱序入缓冲/超时放行/重复丢弃计数
+  uint64_t reorder_buffered_{0};
+  uint64_t reorder_released_{0};
+  uint64_t reorder_dup_dropped_{0};
 
   // 性能优化:跟踪本连接活跃的 JFS 位图(避免 pollTx 遍历全部 64 个 JFS)
   // sendChain acquireIoJfs 后置位;pollTx 回收 CQE 后若该 JFS 无本连接在途 WR 则清位
@@ -369,9 +408,15 @@ class UrmaAsyncSocket : public AsyncTransport {
   static constexpr uint8_t kCtrlTypePull = 1;
   static constexpr uint8_t kCtrlTypeFree = 2;
   static constexpr int kCtrlMsgMaxRetries = 3;
+  // 任务:1M 分片 —— 单次 READ 的最大分片 SGE 数(硬件 max_jfs_sge=13,
+  // 预留 src 块计数余量;8M+thrift 头 ≈ 9 块,benchmark 上限 8M 覆盖;
+  // 超过此限的更长消息自动分段多次 PULL_MEM,接收方 rx_pending_queue_ 串行保序)
+  static constexpr uint32_t kMaxReadFragSge = 12;
 
   struct PendingBigMsg {
-    std::shared_ptr<IOBuf> iobuf;
+    std::shared_ptr<IOBuf> iobuf;   // 源链 clone(零拷贝,引用计数保活)
+    std::vector<PullMemFragDesc> frags;  // 段表(重发用,块地址不变)
+    uint32_t total_size{0};
     std::chrono::steady_clock::time_point post_time;
     uint8_t retries{0};
     bool is_free{false};
@@ -383,8 +428,9 @@ class UrmaAsyncSocket : public AsyncTransport {
   struct RxBufItem {
     bool is_control = false;
     uint16_t msg_id = 0;
-    uint64_t remote_va = 0;
-    uint32_t data_size = 0;
+    // 段表式 PULL(免拷贝):段描述副本 + 总长(旧 va/size 单段语义废弃)
+    std::vector<PullMemFragDesc> frags;
+    uint32_t total_size = 0;
     std::unique_ptr<IOBuf> data;
   };
   std::queue<RxBufItem> rx_pending_queue_;

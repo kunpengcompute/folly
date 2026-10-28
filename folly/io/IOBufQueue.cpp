@@ -251,7 +251,19 @@ pair<void*, std::size_t> IOBufQueue::preallocateSlow(
   // Avoid grabbing update guard, since we're manually setting the cache ptrs.
   flushCache();
   // Allocate a new buffer of the requested max size.
-  unique_ptr<IOBuf> newBuf(IOBuf::create(std::max(min, newAllocationSize)));
+  // URMA 免拷贝分片适配(去 9M tier):
+  //   - 单块上限 1M(池无更大档位,防拒绝);
+  //   - 大块写入(max 参数 = 调用方剩余总量 > 1M)直接分配 1M 块,
+  //     使 QueueAppender::pushAtMost 循环产出 1M 块链(而非 growth 档
+  //     小块),序列化输出天然适配段表 PULL 零拷贝传输。
+  constexpr std::size_t kUrmaMaxBlockAlloc = 1024 * 1024 - 256;
+  std::size_t alloc = std::max(min, newAllocationSize);
+  if (alloc > kUrmaMaxBlockAlloc) {
+    alloc = kUrmaMaxBlockAlloc;
+  } else if (max > kUrmaMaxBlockAlloc && alloc < kUrmaMaxBlockAlloc) {
+    alloc = kUrmaMaxBlockAlloc;  // 大请求:按 1M 块分配
+  }
+  unique_ptr<IOBuf> newBuf(IOBuf::create(alloc));
 
   tailStart_ = newBuf->writableTail();
   cachePtr_->cachedRange = std::pair<uint8_t*, uint8_t*>(

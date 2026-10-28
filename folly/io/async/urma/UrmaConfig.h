@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <string>
 
 #include <ub/umdk/urma/urma_api.h>
@@ -70,6 +71,14 @@ struct UrmaConfig {
 
   // ── 流控 ──
   uint32_t idle_timeout_ms = kUrmaDefaultIdleTimeoutMs;
+
+  // ── 保序(任务:保序功能增强) ──
+  // RX seq 级重排(默认开启,无开关):expected 命中 → 交付并连带交付重排
+  // 队列后续;未来 seq(空洞)→ 入重排缓冲等待补齐;过时/重复 seq → 丢弃;
+  // 空洞超时(reorder_timeout_ms)未补齐则放行重同步(WARN)。
+  // 重试语义:SEND 可靠有序无重传通道(大包 PULL_MEM 已有 7s×3 重发);
+  // 本机制 = 重排等待 + 超时兜底,防御多 JFR 共享收割等瞬态乱序场景。
+  uint32_t reorder_timeout_ms = 200;  // 空洞等待上限
 
   // ── 握手 ──
   uint32_t handshake_timeout_ms = 30000;  // URMA 握手超时(毫秒)

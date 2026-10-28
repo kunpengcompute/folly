@@ -1095,6 +1095,7 @@ if (BUILD_TESTS OR BUILD_BENCHMARKS)
       DIRECTORY io/async/urma/test/
         TEST urma_route_table_test SOURCES UrmaRouteTableTest.cpp
         TEST urma_recycle_stack_test SOURCES UrmaRecycleStackTest.cpp
+        TEST urma_seq_reorder_test SOURCES UrmaSeqReorderTest.cpp
     )
   endif()
 

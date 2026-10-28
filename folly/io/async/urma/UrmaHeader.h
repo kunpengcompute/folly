@@ -81,11 +81,40 @@ static_assert(sizeof(UrmaMsgHeader) == 24, "UrmaMsgHeader must be 24 bytes");
 // 同时 imm_data = remote_va(u64),随 CQE 通告给接收方
 struct __attribute__((packed)) PullMemControlPacket {
   UrmaMsgHeader header;     // 24B
-  uint32_t data_size;       // 28B: 远端数据长度(READ 长度)
+  uint32_t data_size;       // 28B: 远端数据长度(READ 长度,单段模式)
   uint32_t padding;         // 32B: 对齐到 32B
 };
 static_assert(sizeof(PullMemControlPacket) == 32,
               "PullMemControlPacket must be 32 bytes");
+
+// ── 段表式 PULL_MEM(任务:1M 分片免拷贝)──
+// 发送方序列化输出为 1M 块链(IOBufQueue 大块分配 1M 档),传输层零拷贝
+// 直接引用各物理块地址,以段表通告接收方;接收方对每段独立 READ(WR 链),
+// DMA 直写本地 1M 块 —— 全程无二次拷贝(消除旧"整帧单块 → 逐块 memcpy
+// 到 1M 池块"的拷贝路径,同时去除 9M tier 依赖)。
+//
+// 控制包 SGE[0] 指向本结构(变长:头部 40B + 段表 16B×N);
+// 置于 4K recv buffer 内 → 段数上限 kMaxPullFrags;
+// imm_data = total_size(兼容诊断;单段模式仍可用 va+size)
+struct __attribute__((packed)) PullMemFragDesc {
+  uint64_t va;     // 发送方源块地址(MR 池内,DMA 可达)
+  uint32_t len;    // 源块长度
+  uint32_t rsvd;   // 对齐
+};
+static_assert(sizeof(PullMemFragDesc) == 16,
+              "PullMemFragDesc must be 16 bytes");
+
+constexpr uint16_t kMaxPullFrags = 254;  // (4096 - 40) / 16
+
+struct __attribute__((packed)) PullMemFragPacket {
+  UrmaMsgHeader header;   // 24B(type=MSG_PULL_MEM, msg_id)
+  uint16_t frag_count;    // 段数
+  uint16_t rsvd0;         // 对齐
+  uint32_t total_size;    // 总字节数
+  PullMemFragDesc frags[kMaxPullFrags];  // 段表(变长,按 frag_count 有效)
+};
+static_assert(sizeof(PullMemFragPacket) <= 4096,
+              "PullMemFragPacket must fit in 4K recv buffer");
 
 // ── SocketId: 64 位全局唯一标识 ──
 struct SocketId {

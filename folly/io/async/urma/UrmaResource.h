@@ -42,12 +42,16 @@ struct TxCompletionCtx {
   uint16_t padding2;
   folly::IOBuf send_data;      // 持有发送 IOBuf block,RAII 析构回收
   std::shared_ptr<std::vector<urma_sge_t>> sge_arr;  // SGE 数组(保持存活到 post 完成)
+  // 任务:1M 分片 —— READ WR 链(N 个单段 READ,urma rw 仅支持单 src/dst SGE;
+  // 链式 post,仅尾 WR complete_enable=1 产生单 CQE),保活到 CQE
+  std::unique_ptr<urma_jfs_wr_t[]> read_wr_chain;
+  uint32_t read_wr_cnt = 0;
 
   // 消息类型常量
   static constexpr uint8_t MSG_DATA = 0;       // 普通小包 SEND
   static constexpr uint8_t MSG_CTRL_PULL = 1;  // 大包控制包 PULL(SEND_IMM)
   static constexpr uint8_t MSG_CTRL_FREE = 2;  // 大包 FREE 通知(SEND_IMM)
-  static constexpr uint8_t MSG_READ = 3;       // 大包单边 READ
+  static constexpr uint8_t MSG_READ = 3;       // 大包单边 READ(分片 WR 链)
 };
 
 // per-WR 接收 context(设计 §7 RxRecvCtx)

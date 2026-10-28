@@ -70,12 +70,19 @@ class UrmaInit {
 };
 
 // MR 内存池常量(public,供 UrmaInit.cpp 内部函数使用)
+// 任务:1M tier 支持分片,9M tier 缩容 ——
+//   传输层大消息路径(sendBigMsgByRead/startRead)已改 1M 分片逐块 PULL,
+//   不再依赖 9M 单块;但 fbthrift 序列化(RequestChannel/AsyncProcessor)
+//   对大帧整块预分配(框架 writer 空间假设,实测改小导致 memcpy 越界),
+//   保留缩容 9M tier(12/16 → 1/16,约 4GB)作为序列化大帧工作缓冲。
 constexpr size_t URMA_SMALL_BUF_SIZE = 4096;
 constexpr size_t URMA_MEDIUM_BUF_SIZE = 16384;
 constexpr size_t URMA_BIG_BUF_SIZE = 65536;
-constexpr size_t URMA_LARGE_BUF_SIZE = 1048576;
-constexpr size_t URMA_HUGE_BUF_SIZE = 9 * 1024 * 1024; // 9MB,容纳 8MB payload + thrift header
-constexpr size_t URMA_NUM_TIERS = 5;
+constexpr size_t URMA_LARGE_BUF_SIZE = 1048576;  // 1M:分片/序列化块基准
+// 任务:彻底去除 9M tier —— 序列化侧经 IOBufQueue 大块分配直接产出
+// 1M 块链(见 IOBufQueue.cpp 的 urma 适配),传输层零拷贝段表 PULL,
+// 全链路无 >1M 单块需求;>1M 的 poolAlloc 直接拒绝(显性失败)
+constexpr size_t URMA_NUM_TIERS = 4;
 constexpr size_t URMA_NUM_SHARDS = 64;
 
 // IOBuf block headroom 预留大小(DPDK rte_mbuf 风格)

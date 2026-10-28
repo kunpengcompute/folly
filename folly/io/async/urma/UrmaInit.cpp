@@ -18,6 +18,7 @@
 #include <folly/io/async/urma/UrmaJfrPool.h>
 
 #include <cstring>
+#include <cstdlib>
 #include <mutex>
 #include <thread>
 #include <sys/mman.h>
@@ -61,17 +62,19 @@ struct ShardPool {
 static ShardPool g_pools[URMA_NUM_TIERS][URMA_NUM_SHARDS];
 
 // 各级 buffer 大小(= IoBufBlock payload 大小,IoBufBlock header 24B 在 buffer 内)
+// 任务:彻底去除 9M tier(4 级池,1M 块化全链路)
 static constexpr size_t TIER_SIZES[URMA_NUM_TIERS] = {
     URMA_SMALL_BUF_SIZE, URMA_MEDIUM_BUF_SIZE, URMA_BIG_BUF_SIZE,
-    URMA_LARGE_BUF_SIZE, URMA_HUGE_BUF_SIZE};
+    URMA_LARGE_BUF_SIZE};
 // 各级 stride = buffer 大小(无额外 header 开销)
 static constexpr size_t TIER_STRIDES[URMA_NUM_TIERS] = {
     URMA_SMALL_BUF_SIZE, URMA_MEDIUM_BUF_SIZE, URMA_BIG_BUF_SIZE,
-    URMA_LARGE_BUF_SIZE, URMA_HUGE_BUF_SIZE};
+    URMA_LARGE_BUF_SIZE};
 
 // 各级占比,用公分母 16 直接表示:
-//   Small=1/16, Medium=1/16, Big=1/16, Large(1MB)=1/16, Huge(9MB)=12/16
-static constexpr uint32_t TIER_NUMERATOR[URMA_NUM_TIERS] = {1, 1, 1, 1, 12};
+//   Small=1/16, Medium=1/16, Big=1/16, Large(1M)=13/16(9M tier 配额全量
+//   归还 1M,承接序列化块链 + 传输分片)
+static constexpr uint32_t TIER_NUMERATOR[URMA_NUM_TIERS] = {1, 1, 1, 13};
 static constexpr uint32_t TIER_DENOMINATOR = 16;
 
 // 各级在 mmap 中的起始地址和 buffer 数量(运行时由 initMrPool 填充)
@@ -83,15 +86,14 @@ static int poolTier(size_t size) {
   if (size <= URMA_MEDIUM_BUF_SIZE) return 1;
   if (size <= URMA_BIG_BUF_SIZE) return 2;
   if (size <= URMA_LARGE_BUF_SIZE) return 3;
-  if (size <= URMA_HUGE_BUF_SIZE) return 4;
+  // 9M tier 已彻底移除:>1M 单块请求拒绝(全链路已 1M 块化,见段表协议)
   return -1;
 }
 
 // 按 tier stride 移位,使连续 buffer 均匀落到不同 shard
-// shift = log2(stride): Small=12(4KB), Medium=14(16KB), Big=16(64KB),
-//                        Large=20(1MB), Huge=23(9MB)
+// shift = log2(stride): Small=12(4KB), Medium=14(16KB), Big=16(64KB), Large=20(1MB)
 // 移位后连续 buffer 恰好差 1,% 64 得到 0,1,2,...,63 均匀循环
-static constexpr int TIER_SHIFTS[URMA_NUM_TIERS] = {12, 14, 16, 20, 23};
+static constexpr int TIER_SHIFTS[URMA_NUM_TIERS] = {12, 14, 16, 20};
 
 static size_t shardIndex(void* ptr, int tier) {
   return (reinterpret_cast<uintptr_t>(ptr) >> TIER_SHIFTS[tier]) % URMA_NUM_SHARDS;
@@ -192,7 +194,9 @@ void UrmaInit::finiMrPool() {
 void* UrmaInit::poolAlloc(size_t size) {
   int tier = poolTier(size);
   if (tier < 0) {
-    XLOG(WARN) << "UrmaInit: poolAlloc size=" << size << " exceeds max tier (9MB), rejected";
+    XLOG(WARN) << "UrmaInit: poolAlloc size=" << size
+               << " exceeds max tier (1MB) - 9M tier removed, "
+                  "all large paths must use 1M fragmentation";
     return nullptr;
   }
   // 用线程 ID 选起始 shard,优先查自己的 shard,miss 后 steal 其余 shard

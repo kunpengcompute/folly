@@ -12,6 +12,7 @@
 #ifdef FOLLY_HAVE_URMA
 
 #include <algorithm>
+#include <cstddef>
 #include <cstring>
 
 #include <glog/logging.h>
@@ -151,6 +152,8 @@ bool UrmaJfrPool::initRxBufPool(UrmaJfrPool* pool, SharedJfr* jfr,
   }
 
   // 启动时只预投 min_water 个 recv WR(按需投递,设计 §7.3)
+  // 游标初始化为 min_water:[0, min_water) 已预投,[min_water, max_bufs)
+  // 由 repostRecycled 的水位补充逻辑按需推进(M-3 修复)
   uint32_t to_post = jfr->watermark.min_water;
   for (uint32_t i = 0; i < to_post; ++i) {
     if (!postRecvWr(jfr, i)) {
@@ -159,6 +162,7 @@ bool UrmaJfrPool::initRxBufPool(UrmaJfrPool* pool, SharedJfr* jfr,
     }
   }
   jfr->recv_posted.store(to_post, std::memory_order_relaxed);
+  jfr->next_free_slot.store(to_post, std::memory_order_relaxed);
 
   XLOG(INFO) << "UrmaJfrPool: rx buf pool initialized, max_bufs=" << max_bufs
              << " pre_posted=" << to_post
@@ -413,19 +417,26 @@ uint32_t UrmaJfrPool::harvestAndDispatch(SharedJfr* jfr) noexcept {
         }
 
         if (ctrl_hdr->type == MSG_PULL_MEM) {
-          // PULL_MEM:SGE[0] = PullMemControlPacket(32B)
-          // imm_data = remote_va(u64),trailing data_size 从 recv_buf offset 24 读取
-          if (recv_len < sizeof(PullMemControlPacket)) {
+          // PULL_MEM 段表式(免拷贝):SGE[0] = PullMemFragPacket(变长段表)
+          // 头 40B + 段 16B×N;段表按值拷出后 slot 立即回收
+          if (recv_len < offsetof(PullMemFragPacket, frags)) {
             XLOG(WARN) << "[URMA] PULL_MEM too short: recv_len=" << recv_len;
             recycleRxSlot(jfr, slot);
             continue;
           }
-          auto* pkt = static_cast<const PullMemControlPacket*>(recv_buf);
-          uint64_t remote_va = cr[i].imm_data;
-          uint32_t data_size = pkt->data_size;
+          auto* pkt = static_cast<const PullMemFragPacket*>(recv_buf);
+          uint16_t frag_count = pkt->frag_count;
+          if (frag_count == 0 || frag_count > kMaxPullFrags ||
+              recv_len < offsetof(PullMemFragPacket, frags) +
+                             sizeof(PullMemFragDesc) * frag_count) {
+            XLOG(WARN) << "[URMA] PULL_MEM bad frag_count=" << frag_count
+                       << " recv_len=" << recv_len;
+            recycleRxSlot(jfr, slot);
+            continue;
+          }
           entry->sock.load(std::memory_order_acquire)
-              ->onControlMsgImm(MSG_PULL_MEM, ctrl_hdr->msg_id,
-                                remote_va, data_size);
+              ->onPullMemFrags(ctrl_hdr->msg_id, pkt->frags, frag_count,
+                               pkt->total_size);
         } else if (ctrl_hdr->type == MSG_FREE) {
           // FREE:SGE[0] = UrmaMsgHeader(24B),imm_data = msg_id(低 16 位有效)
           uint16_t msg_id = static_cast<uint16_t>(cr[i].imm_data);
@@ -528,6 +539,13 @@ void UrmaJfrPool::recycleRxSlot(SharedJfr* jfr, uint32_t slot) noexcept {
 //        ② UrmaSharedJfr 10ms idle timer 兜底(防"无新事件导致回收栈滞留")。
 // 账实严格一致:batch 失败按 bad_wr 定位成功前缀,只对成功数递增 recv_posted;
 // 失败 slot 退回回收栈,下轮事件重试。
+//
+// 按需投递水位补全(任务:水位功能完整化,修复检视报告 M-3):
+// 旧实现只重投【本池回收的 slot】→ 流通量恒为初始预投的 min_water,
+// max_water 形同虚设;上层零拷贝持有(held)抬高时 RQ 水位无法恢复。
+// 补充逻辑:回收栈排空后 RQ 仍低于 max_water 时,从未投递游标
+// (next_free_slot)取新 slot 补投 —— 流通量逐步增长到 max_water 封顶
+// (预算:posted + transit + held + 回收栈 ≤ max_water,防止超发)。
 void UrmaJfrPool::repostRecycled(SharedJfr* jfr) noexcept {
   if (!jfr || !jfr->recycle || !jfr->jfr) return;
   uint32_t slots[kRepostBatchMax];
@@ -537,18 +555,55 @@ void UrmaJfrPool::repostRecycled(SharedJfr* jfr) noexcept {
     uint32_t room = jfr->watermark.max_water - posted;
     uint32_t want = std::min(room, kRepostBatchMax);
     uint32_t cnt = jfr->recycle->drain(slots, want);
-    if (cnt == 0) return;
-    uint32_t ok = postRecvWrBatchCount(jfr, slots, cnt);
+    if (cnt > 0) {
+      uint32_t ok = postRecvWrBatchCount(jfr, slots, cnt);
+      if (ok > 0) {
+        jfr->recv_posted.fetch_add(ok, std::memory_order_acq_rel);
+      }
+      for (uint32_t i = ok; i < cnt; ++i) {
+        jfr->recycle->push(slots[i]);  // 失败部分退栈,下轮重试
+      }
+      if (ok < cnt) {
+        return;  // post 失败:不继续自旋,下轮事件重试
+      }
+      continue;  // 栈中可能还有,继续排空
+    }
+
+    // ── 水位补充(M-3 修复):回收栈空,RQ 低于 max_water → 游标取新 slot ──
+    // 预算闸门:流通总量(posted+transit+held+栈) ≤ max_water,
+    // 防止 held 高企时超发 slot 超出 buffer 总量
+    uint32_t in_flight = posted +
+                         jfr->transit_cnt.load(std::memory_order_acquire) +
+                         jfr->held_count.load(std::memory_order_acquire) +
+                         jfr->recycle->size();
+    uint32_t budget = jfr->watermark.max_water > in_flight
+                          ? jfr->watermark.max_water - in_flight
+                          : 0;
+    uint32_t supply = std::min({room, budget, kRepostBatchMax});
+    if (supply == 0) {
+      return;  // 预算耗尽(流通已满)或水位已到
+    }
+    uint32_t n = 0;
+    uint32_t cursor = jfr->next_free_slot.load(std::memory_order_acquire);
+    while (n < supply) {
+      if (cursor >= jfr->rx_bufs.size()) {
+        break;  // 游标耗尽(全部 slot 已进入流通)
+      }
+      slots[n++] = cursor++;
+    }
+    if (n == 0) {
+      return;
+    }
+    jfr->next_free_slot.store(cursor, std::memory_order_release);
+    uint32_t ok = postRecvWrBatchCount(jfr, slots, n);
     if (ok > 0) {
       jfr->recv_posted.fetch_add(ok, std::memory_order_acq_rel);
     }
-    if (ok < cnt) {
-      // 失败部分退回回收栈(下轮事件重试),避免自旋
-      for (uint32_t i = ok; i < cnt; ++i) {
-        jfr->recycle->push(slots[i]);
-      }
-      return;
+    for (uint32_t i = ok; i < n; ++i) {
+      // post 失败的游标 slot 退回回收栈(已计入流通,经栈重投)
+      jfr->recycle->push(slots[i]);
     }
+    return;  // 游标补充每轮一次(下轮事件/定时器继续)
   }
 }
 
@@ -561,7 +616,11 @@ void UrmaJfrPool::repostRecycled(SharedJfr* jfr) noexcept {
 // slot 泄漏/重复(单次截断即永久漂移 ≥1,持续负载下秒级可见),零误报。
 void UrmaJfrPool::checkRxAccounting(SharedJfr* jfr) noexcept {
   if (!jfr || !jfr->recycle) return;
-  uint32_t circulating = jfr->watermark.min_water;  // 当前流通总量(预投数)
+  // 流通总量基准(水位补充后动态增长):= max(min_water, 游标推进数)
+  // (游标 = 已进入流通的新 slot 总数;恒 ≥ min_water)
+  uint32_t circulating = std::max(
+      jfr->watermark.min_water,
+      jfr->next_free_slot.load(std::memory_order_acquire));
   // 偏差容忍上界:单轮重投批量 + 并发收割转移数(16 JFR × 少量在途)
   constexpr uint32_t kSlack = kRepostBatchMax + 16;
   uint32_t sum = jfr->recv_posted.load(std::memory_order_acquire) +
