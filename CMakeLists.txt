@@ -1103,3 +1103,12 @@ if (BUILD_TESTS OR BUILD_BENCHMARKS)
 endif()
 
 add_subdirectory(folly)
+
+option(FOLLY_BUILD_URMA_COALESCING_TESTS "Build the dual-host URMA coalescing test" OFF)
+option(FOLLY_BUILD_URMA_READ_TESTS "Build the dual-host URMA READ tests" OFF)
+if(FOLLY_BUILD_URMA_COALESCING_TESTS OR FOLLY_BUILD_URMA_READ_TESTS)
+  if(NOT FOLLY_USE_URMA OR NOT BUILD_SHARED_LIBS)
+    message(FATAL_ERROR "URMA hardware tests require FOLLY_USE_URMA=ON and BUILD_SHARED_LIBS=ON")
+  endif()
+  add_subdirectory(folly/io/async/urma/test)
+endif()
