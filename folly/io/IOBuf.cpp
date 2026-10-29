@@ -431,14 +431,27 @@ void IOBuf::poolReleaseFn(void* buf, void* userData) {
 
 unique_ptr<IOBuf> IOBuf::createFromPoolShared(std::size_t capacity) {
   IoBufBlock* b = share_block(capacity);
-  if (!b) return createCombined(capacity);
+  if (!b) {
+    // 池耗尽 —— 严禁 fallback 到 createCombined:
+    // 非 MR 堆内存不可被 URMA DMA 访问,若上层用作段表 PULL 源或
+    // READ dst 将产生 CQE 错误(远端 READ 失败/数据损坏)。
+    // 正确行为:干净失败(bad_alloc),由上层决定重试或报错。
+    throw_exception<std::bad_alloc>();
+  }
 
   uint32_t offset = b->data_len;
-  b->data_len += static_cast<uint32_t>(capacity);
+  // 截断修正: share_block 可能将 alloc_size 截断到池最大档位(1M),
+  // 但 min_capacity 参数未被截断 → 本函数用原始 capacity 声明 IOBuf
+  // 容量会超过块实际可用空间(b->capacity - offset) → 协议写入越界。
+  // 修正: 取 min(请求容量, 块实际剩余空间)。IOBufQueue::pushAtMost
+  // 基于 tailroom 写入,不受影响;剩余数据由 preallocateSlow 链化。
+  uint32_t remaining = b->capacity - offset;
+  uint32_t actual = std::min(static_cast<uint32_t>(capacity), remaining);
+  b->data_len += actual;
   b->ref_count.fetch_add(1, std::memory_order_acq_rel);
 
   uint8_t* buf = reinterpret_cast<uint8_t*>(b->payloadBegin()) + offset;
-  auto iobuf = takeOwnership(buf, capacity, 0, poolReleaseFn, b);
+  auto iobuf = takeOwnership(buf, actual, 0, poolReleaseFn, b);
   iobuf->block_ = b;
   return iobuf;
 }

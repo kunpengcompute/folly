@@ -111,6 +111,16 @@ IoBufBlock* share_block(size_t min_capacity) {
     c.current_share = ioBufBlockAllocate();
   } else {
     size_t alloc_size = min_capacity + sizeof(IoBufBlock) + headroom;
+    // Pool tier cap: 分级池最大档位为 1M,超出即 poolAlloc 返回 null。
+    // 此处将请求截断到最大档位 —— 上层序列化框架(fbthrift
+    // preprocessSendT/serializeResponse)保持原始调用形式
+    // IOBuf::create(kHeadroomBytes + bufSize) 不感知池限制,
+    // 剩余数据由 IOBufQueue::pushAtMost → preallocateSlow 自动多块链化
+    // (preallocateSlow 已有 kUrmaMaxBlockAlloc = 1M-256 上限)。
+    size_t pool_tier_max = 1024 * 1024;  // URMA_LARGE_BUF_SIZE
+    if (alloc_size > pool_tier_max) {
+      alloc_size = pool_tier_max;
+    }
     c.current_share = allocateFromSystem(alloc_size);
   }
   return c.current_share;
