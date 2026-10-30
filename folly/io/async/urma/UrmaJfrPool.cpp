@@ -41,6 +41,81 @@ UrmaJfrPool* UrmaJfrPool::get() {
   return g_jfr_pool;
 }
 
+// ── 任务 A(SDD-URMA-SHARED-JFS-JFR-002): 进程级远端 import cache ──
+// 对端通告 JFR 级共享 jfr_id → urma_import_jfr 返回 urma_target_jetty_t*
+// (与 wr.tjetty 完全兼容)。同一远端 JFR 的所有连接共享同一 handle。
+// double-checked locking: 读锁快路径(极大概率命中),写锁仅首次 import。
+
+std::shared_mutex UrmaJfrPool::s_import_mtx;
+std::unordered_map<uint32_t, urma_target_jetty_t*>
+    UrmaJfrPool::s_remote_jfr_cache;
+std::unordered_map<uint64_t, urma_target_seg_t*>
+    UrmaJfrPool::s_remote_seg_cache;
+
+urma_target_jetty_t* UrmaJfrPool::importRemoteJfr(const urma_rjfr_t* rjfr) {
+  if (!rjfr) return nullptr;
+  urma_context_t* ctx = UrmaInit::getContext();
+  if (!ctx) return nullptr;
+
+  // 快路径: shared_lock 读 cache(条目数 ≤ 远端 JFR 数,命中率极高)
+  {
+    std::shared_lock<std::shared_mutex> lock(s_import_mtx);
+    auto it = s_remote_jfr_cache.find(rjfr->jfr_id.id);
+    if (it != s_remote_jfr_cache.end()) {
+      return it->second;
+    }
+  }
+  // 慢路径: unique_lock + 二次检查 + import
+  std::unique_lock<std::shared_mutex> lock(s_import_mtx);
+  auto it = s_remote_jfr_cache.find(rjfr->jfr_id.id);
+  if (it != s_remote_jfr_cache.end()) {
+    return it->second;
+  }
+  urma_token_t token = {};
+  urma_target_jetty_t* handle = urma_import_jfr(ctx,
+      const_cast<urma_rjfr_t*>(rjfr), &token);
+  if (!handle) {
+    XLOG(ERR) << "[URMA] importRemoteJfr failed: jfr_id=" << rjfr->jfr_id.id;
+    return nullptr;
+  }
+  s_remote_jfr_cache.emplace(rjfr->jfr_id.id, handle);
+  XLOG(DBG) << "[URMA] importRemoteJfr: jfr_id=" << rjfr->jfr_id.id
+            << " (cached, total=" << s_remote_jfr_cache.size() << ")";
+  return handle;
+}
+
+urma_target_seg_t* UrmaJfrPool::importRemoteSeg(const urma_seg_t* seg) {
+  if (!seg) return nullptr;
+  urma_context_t* ctx = UrmaInit::getContext();
+  if (!ctx) return nullptr;
+
+  // 全局 MR 池远端段: key = seg_va(全进程同一远端设备的池共享一个 seg)
+  uint64_t key = seg->ubva.va;
+  {
+    std::shared_lock<std::shared_mutex> lock(s_import_mtx);
+    auto it = s_remote_seg_cache.find(key);
+    if (it != s_remote_seg_cache.end()) {
+      return it->second;
+    }
+  }
+  std::unique_lock<std::shared_mutex> lock(s_import_mtx);
+  auto it = s_remote_seg_cache.find(key);
+  if (it != s_remote_seg_cache.end()) {
+    return it->second;
+  }
+  urma_token_t token = {};
+  urma_import_seg_flag_t flag = {};
+  urma_target_seg_t* handle = urma_import_seg(ctx,
+      const_cast<urma_seg_t*>(seg), &token, 0, flag);
+  if (!handle) {
+    XLOG(ERR) << "[URMA] importRemoteSeg failed: va=" << key;
+    return nullptr;
+  }
+  s_remote_seg_cache.emplace(key, handle);
+  XLOG(DBG) << "[URMA] importRemoteSeg cached: va=" << key;
+  return handle;
+}
+
 // ── 创建单个 JFR(含 JFCE + JFC + JFR + recv buffer 预投) ──
 
 bool UrmaJfrPool::createJfr(urma_context_t* ctx, UrmaJfrPool* pool,

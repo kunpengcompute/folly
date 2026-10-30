@@ -63,21 +63,19 @@ struct RxRecvCtx {
 };
 
 struct UrmaResource {
-  // ── 本端 jetty(Phase 2:仅用于 jetty_id 通告,发送不再通过 jetty post) ──
-  // Phase 4 JFR 池化后将移除,改为从 UrmaJfrPool 获取 jetty_id
-  urma_jetty_t* io_jetty = nullptr;
-  urma_jetty_t* fc_jetty = nullptr;
+  // 任务 A(SDD-URMA-SHARED-JFS-JFR-002): 去 Jetty —— io_jetty/fc_jetty 已删除。
+  // JFR 自带 jfr_id(urma_jfr_t.jfr_id.id),对端通过 urma_import_jfr 导入。
+  // 本端通告 shared_->ioJfrId()(JFR 级共享,同 EVB 所有连接相同)。
 
-  // ── 远端导入句柄(per-连接,由 UrmaHandshake::importPeer 创建) ──
+  // ── 远端导入句柄(借用指针,由进程级 UrmaJfrPool import cache 持有) ──
+  // 连接断开不 unimport(I1/I4:进程级生命周期)
   urma_target_jetty_t* remote_jetty = nullptr;
   urma_target_jetty_t* remote_fc_jetty = nullptr;
   urma_target_seg_t* remote_seg = nullptr;
 
-  // ── 对端通告的 jetty_id(HelloMessage 里的值,CQE remote_id 匹配用) ──
-  // 注意:urma_import_jetty 返回的 target->id.id 可能与对端真实 jetty_id 不同
-  // 接收侧 CQE 的 remote_id.id 是发送方的本地 jetty_id,即对端 HelloMessage 里的值
-  uint32_t peer_io_jetty_id = 0;
-  uint32_t peer_fc_jetty_id = 0;
+  // ── 对端通告的 jfr_id(HelloMessage 里的值,CQE remote_id 匹配用) ──
+  uint32_t peer_io_jetty_id = 0;  // 语义:对端 IO JFR 的共享 jfr_id
+  uint32_t peer_fc_jetty_id = 0;  // 语义:对端 FC JFR 的共享 jfr_id
 
   // ── 对端 SocketId(发送方写入 header.dst_socket_id 的值) ──
   // 发送方写入 header.dst_socket_id = peer_socket_id(对端 = 接收方本端)

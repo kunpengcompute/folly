@@ -31,6 +31,8 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <shared_mutex>
+#include <unordered_map>
 #include <vector>
 
 #include <folly/io/async/urma/UrmaRecycleStack.h>
@@ -153,6 +155,13 @@ struct SharedJfr {
 class UrmaJfrPool {
  public:
   static UrmaJfrPool* get();
+
+  // ── 任务 A(SDD-URMA-SHARED-JFS-JFR-002): 进程级远端 import cache ──
+  // 对端通告 JFR 级共享 jfr_id 后,通过 urma_import_jfr 导入。
+  // 同一远端 JFR 的所有连接共享同一 imported handle(cache 命中,零额外 syscall)。
+  // 进程退出时 fini 统一 unimport,连接断开不触发(不变量 I1/I3)。
+  static urma_target_jetty_t* importRemoteJfr(const urma_rjfr_t* rjfr);
+  static urma_target_seg_t* importRemoteSeg(const urma_seg_t* seg);
 
   // 初始化 JFR 池(由 UrmaInit::init 调用)
   bool init(urma_context_t* ctx, const UrmaConfig& config);
@@ -292,6 +301,12 @@ class UrmaJfrPool {
   UrmaRouteTable fc_route_table_;
 
   bool inited_{false};
+
+  // ── 任务 A: 进程级远端 import cache(I2) ──
+  // key = jfr_id(远端 JFR 级共享,≤ 远端 JFR 数),条目极少
+  static std::shared_mutex s_import_mtx;
+  static std::unordered_map<uint32_t, urma_target_jetty_t*> s_remote_jfr_cache;
+  static std::unordered_map<uint64_t, urma_target_seg_t*> s_remote_seg_cache;
 };
 
 } // namespace folly

@@ -19,7 +19,6 @@
 #include <folly/io/async/urma/UrmaAsyncSocket.h>
 #include <folly/io/async/urma/UrmaSharedJfr.h>
 #include <folly/io/async/urma/UrmaJfrPool.h>
-#include <folly/io/async/urma/UrmaImportCache.h>
 #include <folly/logging/xlog.h>
 
 namespace folly {
@@ -41,7 +40,7 @@ void HelloMessage::serialize(void* buf) const {
   v16 = htons(impl_ver);    memcpy(p, &v16, 2); p += 2;
   v32 = htonl(buffer_size); memcpy(p, &v32, 4); p += 4;
   v32 = htonl(recv_buffer_cnt); memcpy(p, &v32, 4); p += 4;
-  v32 = htonl(jetty_id);    memcpy(p, &v32, 4); p += 4;
+  v32 = htonl(jfr_id);     memcpy(p, &v32, 4); p += 4;
   memcpy(p, eid, 16);       p += 16;
   v32 = htonl(uasid);       memcpy(p, &v32, 4); p += 4;
   *p = tp_type;             p += 1;
@@ -51,7 +50,7 @@ void HelloMessage::serialize(void* buf) const {
   v64 = htobe64(seg_va);    memcpy(p, &v64, 8); p += 8;
   v64 = htobe64(seg_len);   memcpy(p, &v64, 8); p += 8;
   v32 = htonl(seg_token_id);memcpy(p, &v32, 4); p += 4;
-  v32 = htonl(fc_jetty_id); memcpy(p, &v32, 4); p += 4;
+  v32 = htonl(fc_jfr_id);  memcpy(p, &v32, 4); p += 4;
   v64 = htobe64(socket_id); memcpy(p, &v64, 8); p += 8;
   // total = 4 + 94 = 98
 }
@@ -70,7 +69,7 @@ void HelloMessage::deserialize(const void* buf) {
   memcpy(&v16, p, 2); impl_ver = ntohs(v16); p += 2;
   memcpy(&v32, p, 4); buffer_size = ntohl(v32); p += 4;
   memcpy(&v32, p, 4); recv_buffer_cnt = ntohl(v32); p += 4;
-  memcpy(&v32, p, 4); jetty_id = ntohl(v32); p += 4;
+  memcpy(&v32, p, 4); jfr_id = ntohl(v32); p += 4;
   memcpy(eid, p, 16); p += 16;
   memcpy(&v32, p, 4); uasid = ntohl(v32); p += 4;
   tp_type = *p; p += 1;
@@ -80,7 +79,7 @@ void HelloMessage::deserialize(const void* buf) {
   memcpy(&v64, p, 8); seg_va = be64toh(v64); p += 8;
   memcpy(&v64, p, 8); seg_len = be64toh(v64); p += 8;
   memcpy(&v32, p, 4); seg_token_id = ntohl(v32); p += 4;
-  memcpy(&v32, p, 4); fc_jetty_id = ntohl(v32); p += 4;
+  memcpy(&v32, p, 4); fc_jfr_id = ntohl(v32); p += 4;
   memcpy(&v64, p, 8); socket_id = be64toh(v64); p += 8;
 }
 
@@ -125,15 +124,10 @@ void UrmaHandshake::start(ReadyCallback ready_cb, ErrorCallback error_cb) {
   error_cb_ = std::move(error_cb);
 
   if (is_client_) {
-    // 客户端:先创建资源,再发 Hello
-    allocateResources();
-    // 填充 jetty_id 到 local_hello_
-    if (socket_->res_.io_jetty) {
-      local_hello_.jetty_id = socket_->res_.io_jetty->jetty_id.id;
-    }
-    if (socket_->res_.fc_jetty) {
-      local_hello_.fc_jetty_id = socket_->res_.fc_jetty->jetty_id.id;
-    }
+    // 任务 A: 去 Jetty —— 通告 JFR 级共享 jfr_id(替代 per-连接 jetty_id)
+    // 同一 UrmaSharedJfr(同 EVB)选定同一 JFR → 所有连接通告相同 jfr_id
+    local_hello_.jfr_id = shared_->ioJfrId();
+    local_hello_.fc_jfr_id = shared_->fcJfrId();
     if (urma_context_t* ctx = UrmaInit::getContext()) {
       memcpy(local_hello_.eid, UrmaInit::getLocalEid().raw, 16);
       local_hello_.uasid = ctx->uasid;
@@ -197,12 +191,12 @@ bool UrmaHandshake::validateHello(const v2_wire::HelloMessage& hello) {
     onHandshakeError("recv_buffer_cnt too small");
     return false;
   }
-  if (hello.jetty_id == 0) {
-    onHandshakeError("jetty_id is 0");
+  if (hello.jfr_id == 0) {
+    onHandshakeError("jfr_id is 0");
     return false;
   }
-  if (hello.fc_jetty_id == 0) {
-    onHandshakeError("fc_jetty_id is 0");
+  if (hello.fc_jfr_id == 0) {
+    onHandshakeError("fc_jfr_id is 0");
     return false;
   }
   if (hello.seg_len == 0 || hello.seg_va == 0) {
@@ -213,119 +207,60 @@ bool UrmaHandshake::validateHello(const v2_wire::HelloMessage& hello) {
 }
 
 void UrmaHandshake::allocateResources() {
-  urma_context_t* ctx = UrmaInit::getContext();
-  if (!ctx) {
-    onHandshakeError("UrmaInit not initialized");
-    return;
-  }
-
-  auto& res = socket_->res_;
-
-  // Phase 2: TX JFC/JFCE 由 JFS 池统一管理,不再 per-连接创建
-  // 仅创建 io_jetty/fc_jetty(绑定 JFR,用于 jetty_id 通告对端 import)
-  // jetty 的 jfs_cfg 不再使用(发送走 JFS 池),但 urma_create_jetty 需要 jfs_cfg
-  // 设置 jfs_cfg.jfc = nullptr,depth=0 表示不创建 JFS
-
-  // IO jetty (share_jfr=1,绑定 JFR 提供 jetty_id)
-  urma_jetty_cfg_t io_cfg = {};
-  io_cfg.flag.bs.share_jfr = 1;
-  io_cfg.shared.jfr = shared_->ioJfr();
-  io_cfg.shared.jfc = shared_->ioJfc();
-  io_cfg.jfs_cfg.depth = 1;  // 最小值,jetty 不用于发送
-  io_cfg.jfs_cfg.trans_mode = URMA_TM_RM;
-  io_cfg.jfs_cfg.max_sge = UrmaInit::getMaxJfsSge();
-  io_cfg.jfs_cfg.max_inline_data = UrmaInit::getMaxJfsInlineLen();
-  io_cfg.jfs_cfg.rnr_retry = URMA_DEFAULT_RNR_RETRY;
-  io_cfg.jfs_cfg.err_timeout = URMA_DEFAULT_ERR_TIMEOUT;
-  // urma_jfs_cfg_t.jfc 是 [Required],必须指定。共享 JFR 的 JFC 复用即可
-  io_cfg.jfs_cfg.jfc = shared_->ioJfc();
-  res.io_jetty = urma_create_jetty(ctx, &io_cfg);
-  if (!res.io_jetty) {
-    onHandshakeError("create io_jetty failed");
-    return;
-  }
-
-  // FC jetty (share_jfr=1,绑定 FC JFR 提供 fc_jetty_id)
-  urma_jetty_cfg_t fc_cfg = {};
-  fc_cfg.flag.bs.share_jfr = 1;
-  fc_cfg.shared.jfr = shared_->fcJfr();
-  fc_cfg.shared.jfc = shared_->fcJfc();
-  fc_cfg.jfs_cfg.depth = 1;
-  fc_cfg.jfs_cfg.trans_mode = URMA_TM_RM;
-  fc_cfg.jfs_cfg.max_sge = 1;
-  fc_cfg.jfs_cfg.max_inline_data = UrmaInit::getMaxJfsInlineLen();
-  fc_cfg.jfs_cfg.rnr_retry = URMA_DEFAULT_RNR_RETRY;
-  fc_cfg.jfs_cfg.err_timeout = URMA_DEFAULT_ERR_TIMEOUT;
-  fc_cfg.jfs_cfg.jfc = shared_->fcJfc();
-  res.fc_jetty = urma_create_jetty(ctx, &fc_cfg);
-  if (!res.fc_jetty) {
-    onHandshakeError("create fc_jetty failed");
-    return;
-  }
+  // 任务 A(SDD-URMA-SHARED-JFS-JFR-002): 去 Jetty —— 整个函数体清空。
+  // JFR 自带 jfr_id(urma_jfr_t.jfr_id.id,类型 = urma_jetfr_id_t),
+  // 对端通过 urma_import_jfr(jfr_id) 得到 urma_target_jetty_t*,
+  // 与 wr.tjetty 完全兼容。本端无需创建任何 Jetty。
+  // JFR/JFS/JFC/JFCE 均由进程级 UrmaJfrPool/UrmaJfsPool 持有。
 }
 
 void UrmaHandshake::importPeer(const v2_wire::HelloMessage& hello) {
   urma_context_t* ctx = UrmaInit::getContext();
   auto& res = socket_->res_;
 
-  // 保存对端通告的 jetty_id(CQE remote_id 匹配用)
-  // urma_import_jetty 返回的 target->id.id 可能与对端真实 jetty_id 不同
-  // 接收侧 CQE 的 remote_id.id 是发送方的本地 jetty_id
-  res.peer_io_jetty_id = hello.jetty_id;
-  res.peer_fc_jetty_id = hello.fc_jetty_id;
-  // Phase 3: 保存对端 SocketId(headroom 路由用,接收方据此路由到本 socket)
+  // 保存对端通告的 jfr_id
+  res.peer_io_jetty_id = hello.jfr_id;
+  res.peer_fc_jetty_id = hello.fc_jfr_id;
   res.peer_socket_id = hello.socket_id;
 
-  // 构造 rjetty for IO(参照 brpc urma_endpoint.cpp:567-577)
-  urma_rjetty_t rjetty = {};
-  memcpy(rjetty.jetty_id.eid.raw, hello.eid, 16);
-  rjetty.jetty_id.uasid = hello.uasid;
-  rjetty.jetty_id.id = hello.jetty_id;
-  rjetty.trans_mode = URMA_TM_RM;
-  rjetty.type = URMA_JETTY;
-  rjetty.tp_type = URMA_CTP;
+  // 任务 A: 去 Jetty —— 对端通告 JFR 级共享 jfr_id,
+  // 通过进程级 cache(urma_import_jfr)导入,同远端 JFR 只 import 一次。
+  // 注意: jfr_id 是 urma_jetty_id_t(含 eid+uasid+id),三个字段都必须填充
+  urma_rjfr_t rjfr = {};
+  memcpy(rjfr.jfr_id.eid.raw, hello.eid, 16);
+  rjfr.jfr_id.uasid = hello.uasid;
+  rjfr.jfr_id.id = hello.jfr_id;
+  rjfr.trans_mode = URMA_TM_RM;
+  rjfr.tp_type = URMA_CTP;
+  res.remote_jetty = UrmaJfrPool::importRemoteJfr(&rjfr);
+  if (!res.remote_jetty) {
+    onHandshakeError("import_jfr(IO) failed");
+    return;
+  }
 
-  // 构造 peer_seg(参照 brpc urma_endpoint.cpp:546-560)
+  // import FC JFR
+  urma_rjfr_t fc_rjfr = {};
+  memcpy(fc_rjfr.jfr_id.eid.raw, hello.eid, 16);
+  fc_rjfr.jfr_id.uasid = hello.uasid;
+  fc_rjfr.jfr_id.id = hello.fc_jfr_id;
+  fc_rjfr.trans_mode = URMA_TM_RM;
+  fc_rjfr.tp_type = URMA_CTP;
+  res.remote_fc_jetty = UrmaJfrPool::importRemoteJfr(&fc_rjfr);
+  if (!res.remote_fc_jetty) {
+    onHandshakeError("import_jfr(FC) failed");
+    return;
+  }
+
+  // import 远端 MR 段(全局共享池,进程级 cache)
   urma_seg_t peer_seg = {};
   memcpy(peer_seg.ubva.eid.raw, hello.seg_eid, 16);
   peer_seg.ubva.uasid = hello.seg_uasid;
   peer_seg.ubva.va = hello.seg_va;
   peer_seg.len = hello.seg_len;
   peer_seg.token_id = hello.seg_token_id;
-
-  urma_token_t seg_token = {};
-  urma_import_seg_flag_t seg_flag = {};
-  // import_seg 必须先于 import_jetty(建立 TP 路由)
-  res.remote_seg = urma_import_seg(ctx, &peer_seg, &seg_token, 0, seg_flag);
+  res.remote_seg = UrmaJfrPool::importRemoteSeg(&peer_seg);
   if (!res.remote_seg) {
     onHandshakeError("import_seg failed");
-    return;
-  }
-
-  // Phase 3: import_jetty 通过全局 ImportedJettyCache 缓存复用
-  // 多连接到同一对端时复用同一 import 句柄,ref_count 引用计数管理
-  urma_token_t token = {};
-  res.remote_jetty = ImportedJettyCache::get()->acquire(rjetty, &token);
-  if (!res.remote_jetty) {
-    onHandshakeError("import_jetty(IO) failed");
-    return;  // 析构清理 res.remote_seg
-  }
-
-  // import FC jetty
-  urma_rjetty_t fc_rjetty = {};
-  memcpy(fc_rjetty.jetty_id.eid.raw, hello.eid, 16);
-  fc_rjetty.jetty_id.uasid = hello.uasid;
-  fc_rjetty.jetty_id.id = hello.fc_jetty_id;
-  fc_rjetty.trans_mode = URMA_TM_RM;
-  fc_rjetty.type = URMA_JETTY;
-  fc_rjetty.tp_type = URMA_CTP;
-
-  res.remote_fc_jetty = ImportedJettyCache::get()->acquire(fc_rjetty, &token);
-  if (!res.remote_fc_jetty) {
-    onHandshakeError("import_jetty(FC) failed");
-    // 回滚 IO import
-    ImportedJettyCache::get()->release(res.remote_jetty);
-    res.remote_jetty = nullptr;
     return;
   }
 }
@@ -344,14 +279,10 @@ void UrmaHandshake::processRemoteHello(const v2_wire::HelloMessage& hello) {
     importPeer(hello);
     sendAck();
   } else {
-    // 服务端:收到客户端 Hello → 创建资源 → import peer → 发 Hello → 等 ACK
-    allocateResources();
-    if (socket_->res_.io_jetty) {
-      local_hello_.jetty_id = socket_->res_.io_jetty->jetty_id.id;
-    }
-    if (socket_->res_.fc_jetty) {
-      local_hello_.fc_jetty_id = socket_->res_.fc_jetty->jetty_id.id;
-    }
+    // 服务端:收到客户端 Hello → import peer → 发 Hello → 等 ACK
+    // 任务 A: 去 Jetty —— 直接从 UrmaSharedJfr 获取 JFR 级共享 jfr_id
+    local_hello_.jfr_id = shared_->ioJfrId();
+    local_hello_.fc_jfr_id = shared_->fcJfrId();
     if (urma_context_t* ctx = UrmaInit::getContext()) {
       memcpy(local_hello_.eid, UrmaInit::getLocalEid().raw, 16);
       local_hello_.uasid = ctx->uasid;

@@ -363,6 +363,15 @@ urma_jfc_t* UrmaSharedJfr::fcJfc() const noexcept {
   return fc_shared_jfr_ ? fc_shared_jfr_->jfc : nullptr;
 }
 
+// 任务 A(SDD-URMA-SHARED-JFS-JFR-002): 去 Jetty —— JFR 自带 jfr_id
+uint32_t UrmaSharedJfr::ioJfrId() const noexcept {
+  return (io_shared_jfr_ && io_shared_jfr_->jfr) ? io_shared_jfr_->jfr->jfr_id.id : 0;
+}
+
+uint32_t UrmaSharedJfr::fcJfrId() const noexcept {
+  return (fc_shared_jfr_ && fc_shared_jfr_->jfr) ? fc_shared_jfr_->jfr->jfr_id.id : 0;
+}
+
 } // namespace folly
 
 #endif // FOLLY_HAVE_URMA

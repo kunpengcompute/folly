@@ -27,7 +27,6 @@
 #include <folly/io/async/urma/UrmaInit.h>
 #include <folly/io/async/urma/UrmaJfsPool.h>
 #include <folly/io/async/urma/UrmaJfrPool.h>
-#include <folly/io/async/urma/UrmaImportCache.h>
 #include <folly/io/async/urma/UrmaHeader.h>
 #include <folly/logging/xlog.h>
 
@@ -1998,23 +1997,16 @@ void UrmaAsyncSocket::destroyUrmaResources() {
     UrmaInit::poolFree(ctrl_meta_mr_);
     ctrl_meta_mr_ = nullptr;
   }
-  // 清空保序队列
-  while (!rx_pending_queue_.empty()) {
-    rx_pending_queue_.pop();
-  }
-  // Phase 3: import 句柄通过 ImportedJettyCache 引用计数管理
-  if (res_.remote_fc_jetty) {
-    ImportedJettyCache::get()->release(res_.remote_fc_jetty);
-    res_.remote_fc_jetty = nullptr;
-  }
-  if (res_.remote_jetty) {
-    ImportedJettyCache::get()->release(res_.remote_jetty);
-    res_.remote_jetty = nullptr;
-  }
-  if (res_.remote_seg) {
-    urma_unimport_seg(res_.remote_seg);
-    res_.remote_seg = nullptr;
-  }
+   // 清空保序队列
+   while (!rx_pending_queue_.empty()) {
+     rx_pending_queue_.pop();
+   }
+   // 任务 A(SDD-URMA-SHARED-JFS-JFR-002): 去 Jetty —— 远端 import 句柄
+   // 由进程级 UrmaJfrPool cache 持有,连接断开仅置空借用指针(I1/I4:
+   // 连接零 URMA 对象创建/释放)
+   res_.remote_fc_jetty = nullptr;
+   res_.remote_jetty = nullptr;
+   res_.remote_seg = nullptr;
   // Phase 2: 不再有 sbuf_ 环形数组(TxCompletionCtx 在 pollTx 中 delete)
   ctrl_sge_refs_.clear();
   pending_write_head_.reset();

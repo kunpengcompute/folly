@@ -89,6 +89,12 @@ class UrmaSharedJfr {
   urma_jfr_t* fcJfr() const noexcept;
   urma_jfc_t* fcJfc() const noexcept;
 
+  // 任务 A(SDD-URMA-SHARED-JFS-JFR-002): 去 Jetty —— JFR 自带 jfr_id
+  // (urma_jfr_t.jfr_id.id, 类型 = urma_jetty_id_t),可直接通告对端 import。
+  // 同一 UrmaSharedJfr(同 EVB)选定同一 JFR → 所有连接通告相同 jfr_id。
+  uint32_t ioJfrId() const noexcept;
+  uint32_t fcJfrId() const noexcept;
+
   // 构造函数(EventBaseLocal::try_emplace_with 需要访问)
   UrmaSharedJfr(EventBase* evb, const UrmaConfig& config);
 

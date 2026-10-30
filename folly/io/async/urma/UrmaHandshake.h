@@ -53,7 +53,7 @@ struct __attribute__((packed)) HelloMessage {
   uint16_t impl_ver{IMPL_V2_VERSION};
   uint32_t buffer_size{4096};
   uint32_t recv_buffer_cnt{1024};
-  uint32_t jetty_id{0};
+  uint32_t jfr_id{0};        // 任务 A: 去 Jetty —— 通告 JFR 级共享 jfr_id(替代 jetty_id)
   uint8_t eid[16] = {};
   uint32_t uasid{0};
   uint8_t tp_type{URMA_CTP};
@@ -63,7 +63,7 @@ struct __attribute__((packed)) HelloMessage {
   uint64_t seg_va{0};
   uint64_t seg_len{0};
   uint32_t seg_token_id{0};
-  uint32_t fc_jetty_id{0};
+  uint32_t fc_jfr_id{0};    // 任务 A: FC JFR 级共享 jfr_id(替代 fc_jetty_id)
   uint64_t socket_id{0};  // 本端 SocketId(握手通告,对端写入 header.dst_socket_id,接收方据此路由)
 
   void serialize(void* buf) const;
