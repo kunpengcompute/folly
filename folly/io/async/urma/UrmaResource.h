@@ -37,7 +37,7 @@ struct TxCompletionCtx {
   uint16_t seq;                // 消息序列号(Phase 5 保序用,当前未使用)
   uint8_t  type;               // MSG_DATA / MSG_CTRL_PULL / MSG_CTRL_FREE / MSG_READ
   uint8_t  padding;
-  uint32_t jfs_index;          // 归还 sq_inflight 用(UrmaJfsPool::releaseIoJfs)
+  uint32_t jfs_index;          // 保留兼容字段(per-EVB 独占后固定为 0)
   uint16_t msg_id;             // 大包 msg_id(READ/控制包匹配用)
   uint16_t padding2;
   folly::IOBuf send_data;      // 持有发送 IOBuf block,RAII 析构回收

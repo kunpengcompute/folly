@@ -41,8 +41,7 @@
 #include <folly/net/NetworkSocket.h>
 #include <folly/io/async/urma/UrmaConfig.h>
 #include <folly/io/async/urma/UrmaResource.h>
-#include <folly/io/async/urma/UrmaJfsPool.h>
-#include <folly/io/async/urma/UrmaJfrPool.h>
+#include <folly/io/async/urma/UrmaTransportContext.h>
 #include <folly/io/async/urma/UrmaRouteTable.h>
 #include <folly/io/async/urma/UrmaSeqReorder.h>
 #include <folly/io/async/urma/UrmaHeader.h>
@@ -51,7 +50,6 @@
 
 namespace folly {
 
-class UrmaSharedJfr;
 class UrmaHandshake;
 class UrmaCqHandler;
 
@@ -119,14 +117,14 @@ class UrmaAsyncSocket : public AsyncTransport {
   size_t getRawBytesReceived() const override { return bytes_received_; }
 
   // ---------- URMA 专属 ----------
-  // 接收数据(由 UrmaSharedJfr::pollAndDispatch 调用,普通 SEND)
+  // 接收数据(由 UrmaTransportContext::pollAndDispatch 调用,普通 SEND)
   void onRxBuf(std::unique_ptr<IOBuf> data) noexcept;
 
   // 独立 buffer 路由 — 从 recv buffer 前 24B 解析 header 路由
   // recv_buf: 接收到的 buffer 起始(header 24B + data)
   // recv_len: 实际接收字节数
-  // ctx:      任务 C:常驻 RxSlotCtx(deleter 重投凭据,见 UrmaJfrPool.h)
-  // 由 UrmaJfrPool::harvestAndDispatch 调用(仅 SEND 分支,MSG_DATA)
+  // ctx:      常驻 RxSlotCtx(deleter 重投凭据,见 UrmaTransportContext.h)
+  // 由 UrmaTransportContext::handleRecvCqe 调用(仅 SEND 分支,MSG_DATA)
   // 返回值:  true  = buffer 所有权已随 IOBuf 转移(零拷贝,deleter 负责回收),
   //          false = 数据已拷出/未消费,收割线程立即回收 slot
   bool onIoMessageReceived(void* recv_buf, uint32_t recv_len,
@@ -143,7 +141,7 @@ class UrmaAsyncSocket : public AsyncTransport {
   void flushReorderBuffer(uint16_t& expected,
                           std::vector<std::unique_ptr<IOBuf>>& out) noexcept;
 
-  // 控制包/FREE 通知(由 UrmaJfrPool::harvestAndDispatch SEND_IMM 分支调用)
+  // 控制包/FREE 通知(由 UrmaTransportContext::handleRecvCqe SEND_IMM 分支调用)
   // type:       MSG_PULL_MEM / MSG_FREE
   // msg_id:     大包 msg_id(PULL/FREE 匹配)
   // remote_va:  PULL_MEM 时为远端 buffer 虚拟地址(从 imm_data 取);FREE 时为 0
@@ -164,13 +162,13 @@ class UrmaAsyncSocket : public AsyncTransport {
   // Phase 5: 处理其他连接 pollTx 收割到的本连接 READ CQE
   // JFS 池化后多连接共享 JFS,pollTx 可能收割到其他连接 post 的 READ CQE,
   // 通过 tx_ctx->socket_id 路由到对应连接调用此方法
-  // 任务 B(H-2):跨线程调用一律经 UrmaJfrPool::dispatchReadCqe 转发回本连接
+  // 任务 B(H-2):per-EVB 独占后收割恒属主 EVB,无跨线程转发
   // 属主 EVB 后进入此方法(不变量 I1;同 EVB 短路同步调用)
   // msg_id: READ 的 msg_id(对应 PULL_MEM 的 msg_id)
   // status: CQE 状态(URMA_CR_SUCCESS 或错误码)
   void handleRemoteReadCqe(uint16_t msg_id, urma_status_t status) noexcept;
 
-  // Phase 6: FC 消息接收入口(由 UrmaJfrPool::harvestFcAndDispatch 调用)
+  // Phase 6: FC 消息接收入口(由 UrmaTransportContext::handleRecvCqe FC 分支调用)
   // recv_buf: payload 前 8B 携带对端 SocketId(无 64B headroom header)
   // recv_len: 实际接收字节数
   // 当前为占位实现,REQ/REP/RETURN/ACK 完整处理在 Phase 6 后续补全
@@ -188,23 +186,8 @@ class UrmaAsyncSocket : public AsyncTransport {
   bool sendFcMsg(UrmaFcMsgType type, uint16_t credit_cnt,
                   uint16_t fc_seq) noexcept;
 
-  // 性能优化:活跃 JFS 位图管理
-  // sendChain acquireIoJfs 后调用,置位 + 计数+1
-  void markActiveJfs(uint32_t jfs_index) {
-    if (jfs_index >= kMaxJfsBitmap) return;
-    active_jfs_inflight_[jfs_index]++;
-    active_jfs_mask_ |= (1ULL << jfs_index);
-  }
-  // pollTx 回收 CQE 后调用,计数-1,归零则清位
-  void releaseActiveJfsSlot(uint32_t jfs_index) {
-    if (jfs_index >= kMaxJfsBitmap) return;
-    if (active_jfs_inflight_[jfs_index] > 0) {
-      active_jfs_inflight_[jfs_index]--;
-      if (active_jfs_inflight_[jfs_index] == 0) {
-        active_jfs_mask_ &= ~(1ULL << jfs_index);
-      }
-    }
-  }
+  // SDD-URMA-EVBEXCLUSIVE-001: 独占四件套下 JFS 位图/pin 逻辑整体删除
+  // (I1:每 EVB 只有一个 JFS,pollAndDispatch 统一收割 TX+RX CQE)
 
   // 发送单个 IOBuf chain(多 SGE 合并 → post SEND,或 >4KB 走单边 READ)
   // big_deferred: 本调用有单边 READ 大包发出,writeSuccess 延迟到对端 FREE
@@ -317,16 +300,27 @@ class UrmaAsyncSocket : public AsyncTransport {
   // ── 任务 E(H-6):大包超时扫描定时器(可取消 AsyncTimeout,替代 runAfterDelay) ──
   // runAfterDelay([this], 100) 不可取消,析构后 100ms 窗口内触发 = UAF;
   // 改为成员 AsyncTimeout(与 UrmaHandshake 同款模式),close/析构时 cancel。
-  class ScanTimer : private AsyncTimeout {
+  //
+  // libevent 2.x event_del 无法撤回已就绪事件:如果 timer 事件已在 active
+  // 队列中,reset() 析构后 vtable 破坏,event_base_loop 处理该事件时
+  // 调用 timeoutExpired() → SIGSEGV。用 shared_ptr + alive 标志:
+  //   - timeoutExpired 持有 shared_ptr(延长生命到回调结束)
+  //   - alive_ 标志在 destroyUrmaResources 中置 false → 回调内短路返回
+  //   - scan_timer_.reset() 释放 unique_ptr,但 shared_ptr 引用计数 >0
+  //     (event_base active 队列持有),对象存活到回调结束自然析构
+  class ScanTimer : private AsyncTimeout,
+                     public std::enable_shared_from_this<ScanTimer> {
    public:
     explicit ScanTimer(UrmaAsyncSocket* sock)
         : AsyncTimeout(sock->evb_), sock_(sock) {}
     void arm() { scheduleTimeout(100); }  // 100ms 周期(设计 §4.7.8)
+    void kill() noexcept { alive_.store(false, std::memory_order_release); }
    private:
     void timeoutExpired() noexcept override;
-    UrmaAsyncSocket* sock_;  // socket 存活期由 scan_timer_ 生命周期保证
+    UrmaAsyncSocket* sock_;
+    std::atomic<bool> alive_{true};
   };
-  std::unique_ptr<ScanTimer> scan_timer_;
+  std::shared_ptr<ScanTimer> scan_timer_;
 
   EventBase* evb_;
   int tcp_fd_{-1};
@@ -347,22 +341,8 @@ class UrmaAsyncSocket : public AsyncTransport {
   uint64_t reorder_released_{0};
   uint64_t reorder_dup_dropped_{0};
 
-  // 性能优化:跟踪本连接活跃的 JFS 位图(避免 pollTx 遍历全部 64 个 JFS)
-  // sendChain acquireIoJfs 后置位;pollTx 回收 CQE 后若该 JFS 无本连接在途 WR 则清位
-  // 用 per-JFS 计数 active_jfs_inflight_[idx] 跟踪本连接在该 JFS 上的在途 WR 数
-  // 位图 + 计数数组长度按 io_jfs_count 上限 64 设计
-  static constexpr uint32_t kMaxJfsBitmap = 64;
-  uint64_t active_jfs_mask_{0};              // 位图:bit i 置位表示 JFS i 有本连接在途 WR
-  uint32_t active_jfs_inflight_[kMaxJfsBitmap]{0};  // per-JFS 本连接在途 WR 计数
-
-  // 单连接 pin JFS:首次发送时 round-robin 选定一个 JFS,后续所有发送复用
-  // 保证同连接的 SEND 操作走同一 JFS,硬件保证同 JFS 内 FIFO 顺序
-  // 避免 multi-JFS round-robin 导致的 seq 乱序
-  static constexpr uint32_t kInvalidJfsIndex = 0xFFFFFFFF;
-  uint32_t pinned_jfs_index_{kInvalidJfsIndex};
-
-  // 获取 pin 的 JFS:首次调 acquireIoJfs round-robin 选定,后续复用
-  SharedJfs* acquirePinnedJfs(UrmaJfsPool* pool, uint32_t* out_index);
+  // SDD-URMA-EVBEXCLUSIVE-001: 池化 JFS 位图/pin 逻辑整体删除
+  // (I1:每 EVB 只有一个 JFS,FIFO 由硬件保证)
 
   folly::IOBufQueue read_queue_;
 
@@ -372,7 +352,7 @@ class UrmaAsyncSocket : public AsyncTransport {
   // Phase 8: 降级 TCP delegate(握手失败时创建,接管所有 AsyncTransport 操作)
   AsyncSocket::UniquePtr tcp_delegate_;
 
-  UrmaSharedJfr* shared_{nullptr};
+  UrmaTransportContext* shared_{nullptr};  // per-EVB 独占四件套(I1)
   UrmaHandshake* handshake_{nullptr};
   UrmaResource res_;
   uint32_t peer_rx_buf_size_{4096};

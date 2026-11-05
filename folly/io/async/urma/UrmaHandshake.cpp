@@ -17,8 +17,7 @@
 
 #include <folly/io/async/urma/UrmaInit.h>
 #include <folly/io/async/urma/UrmaAsyncSocket.h>
-#include <folly/io/async/urma/UrmaSharedJfr.h>
-#include <folly/io/async/urma/UrmaJfrPool.h>
+#include <folly/io/async/urma/UrmaTransportContext.h>
 #include <folly/logging/xlog.h>
 
 namespace folly {
@@ -86,7 +85,7 @@ void HelloMessage::deserialize(const void* buf) {
 } // namespace v2_wire
 
 UrmaHandshake::UrmaHandshake(EventBase* evb, int tcp_fd, bool is_client,
-                              UrmaSharedJfr* shared, const UrmaConfig& config,
+                              UrmaTransportContext* shared, const UrmaConfig& config,
                               UrmaAsyncSocket* socket)
     : AsyncTimeout(evb),
       tcp_fd_(tcp_fd),
@@ -232,7 +231,7 @@ void UrmaHandshake::importPeer(const v2_wire::HelloMessage& hello) {
   rjfr.jfr_id.id = hello.jfr_id;
   rjfr.trans_mode = URMA_TM_RM;
   rjfr.tp_type = URMA_CTP;
-  res.remote_jetty = UrmaJfrPool::importRemoteJfr(&rjfr);
+  res.remote_jetty = UrmaInit::importRemoteJfr(&rjfr);
   if (!res.remote_jetty) {
     onHandshakeError("import_jfr(IO) failed");
     return;
@@ -245,7 +244,7 @@ void UrmaHandshake::importPeer(const v2_wire::HelloMessage& hello) {
   fc_rjfr.jfr_id.id = hello.fc_jfr_id;
   fc_rjfr.trans_mode = URMA_TM_RM;
   fc_rjfr.tp_type = URMA_CTP;
-  res.remote_fc_jetty = UrmaJfrPool::importRemoteJfr(&fc_rjfr);
+  res.remote_fc_jetty = UrmaInit::importRemoteJfr(&fc_rjfr);
   if (!res.remote_fc_jetty) {
     onHandshakeError("import_jfr(FC) failed");
     return;
@@ -258,7 +257,7 @@ void UrmaHandshake::importPeer(const v2_wire::HelloMessage& hello) {
   peer_seg.ubva.va = hello.seg_va;
   peer_seg.len = hello.seg_len;
   peer_seg.token_id = hello.seg_token_id;
-  res.remote_seg = UrmaJfrPool::importRemoteSeg(&peer_seg);
+  res.remote_seg = UrmaInit::importRemoteSeg(&peer_seg);
   if (!res.remote_seg) {
     onHandshakeError("import_seg failed");
     return;

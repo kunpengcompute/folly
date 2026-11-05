@@ -54,6 +54,11 @@ class UrmaInit {
   static void poolFree(void* ptr);
   static size_t poolBufSize(size_t requested_size);
 
+  // SDD-URMA-EVBEXCLUSIVE-001: 进程级远端 import cache(从 UrmaJfrPool 迁移)
+  // 同一远端 JFR/seg 只 import 一次,double-checked locking 共享
+  static urma_target_jetty_t* importRemoteJfr(const urma_rjfr_t* rjfr);
+  static urma_target_seg_t* importRemoteSeg(const urma_seg_t* seg);
+
  private:
   UrmaInit() = delete;
 

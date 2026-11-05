@@ -35,11 +35,7 @@ constexpr uint32_t kUrmaDefaultFcTxDepth = 64;
 constexpr uint32_t kUrmaDefaultIdleTimeoutMs = 10;
 constexpr uint64_t kUrmaDefaultPoolSize = 64ULL * 1024 * 1024 * 1024; // 64GB
 
-// ── 池化默认值(设计 §12) ──
-constexpr uint32_t kUrmaDefaultIoJfsCount = 4;
-constexpr uint32_t kUrmaDefaultFcJfsCount = 2;
-constexpr uint32_t kUrmaDefaultIoJfrCount = 16;
-constexpr uint32_t kUrmaDefaultFcJfrCount = 4;
+// ── 水位线默认值(设计 §12) ──
 constexpr uint32_t kUrmaDefaultMinWater = 64;
 constexpr uint32_t kUrmaDefaultMaxWater = 256;
 constexpr uint32_t kUrmaDefaultBatchPost = 32;
@@ -52,17 +48,18 @@ struct UrmaConfig {
   // 空字符串表示使用第一个可用设备(参照 brpc FLAGS_urma_device)
   std::string dev_name;
 
-  // ── JFS 池(发送侧,设计 §12) ──
-  uint32_t io_jfs_count = kUrmaDefaultIoJfsCount;  // IO JFS 数量(进程级共享)
-  uint32_t fc_jfs_count = kUrmaDefaultFcJfsCount;  // FC JFS 数量
-  uint32_t tx_depth = kUrmaDefaultTxDepth;          // 每个 IO JFS 的 SQ 深度
-  uint32_t fc_tx_depth = kUrmaDefaultFcTxDepth;     // 每个 FC JFS 的 SQ 深度
+  // ── IO 线程数(信息字段,由上层 ThriftServer 设置) ──
+  // SDD-URMA-EVBEXCLUSIVE-001: per-EVB 独占四件套后无需池对齐,
+  // 保留字段向后兼容(ThriftServer.cpp 仍设置此值)
+  uint32_t num_io_threads = 0;
 
-  // ── JFR 池(接收侧,设计 §12) ──
-  uint32_t io_jfr_count = kUrmaDefaultIoJfrCount;  // IO JFR 数量(进程级共享)
-  uint32_t fc_jfr_count = kUrmaDefaultFcJfrCount;  // FC JFR 数量
-  uint32_t rx_depth = kUrmaDefaultRxDepth;          // 每个 JFR 的 RQ 深度
-  uint32_t fc_rx_depth = kUrmaDefaultFcRxDepth;     // 每个 FC JFR 的 RQ 深度
+  // ── JFS(发送侧,per-EVB 独占,SDD-URMA-EVBEXCLUSIVE-001) ──
+  uint32_t tx_depth = kUrmaDefaultTxDepth;          // IO JFS 的 SQ 深度
+  uint32_t fc_tx_depth = kUrmaDefaultFcTxDepth;     // FC JFS 的 SQ 深度
+
+  // ── JFR(接收侧,per-EVB 独占,SDD-URMA-EVBEXCLUSIVE-001) ──
+  uint32_t rx_depth = kUrmaDefaultRxDepth;          // IO JFR 的 RQ 深度
+  uint32_t fc_rx_depth = kUrmaDefaultFcRxDepth;     // FC JFR 的 RQ 深度
 
   // ── recv buffer 按需投递(设计 §7,DPDK 水位线) ──
   uint32_t min_water = kUrmaDefaultMinWater;  // 最低水位(低于此值补投)
@@ -72,12 +69,16 @@ struct UrmaConfig {
   // ── 流控 ──
   uint32_t idle_timeout_ms = kUrmaDefaultIdleTimeoutMs;
 
+  // FC 流控闭环开关(默认关:close_loop 场景 credit 软限制为净开销,
+  // per-EVB 独占 + 水位线 + recv buffer 池已防溢出)。
+  // env URMA_FC_ENABLE=1 启用 REQ/REP/RETURN/ACK 完整闭环。
+  bool fc_enable = false;
+
   // ── 保序(任务:保序功能增强) ──
-  // RX seq 级重排(默认开启,无开关):expected 命中 → 交付并连带交付重排
-  // 队列后续;未来 seq(空洞)→ 入重排缓冲等待补齐;过时/重复 seq → 丢弃;
-  // 空洞超时(reorder_timeout_ms)未补齐则放行重同步(WARN)。
-  // 重试语义:SEND 可靠有序无重传通道(大包 PULL_MEM 已有 7s×3 重发);
-  // 本机制 = 重排等待 + 超时兜底,防御多 JFR 共享收割等瞬态乱序场景。
+  // RX seq 级重排(默认关:per-EVB 独占 JFR + TX/RX 独立 JFC 下
+  // URMA SEND 可靠有序,seq 严格递增,重排器恒空)。
+  // env URMA_RX_REORDER=1 启用(多 JFR 共享收割等瞬态乱序场景)。
+  bool rx_reorder_enable = false;
   uint32_t reorder_timeout_ms = 200;  // 空洞等待上限
 
   // ── 握手 ──
@@ -110,20 +111,9 @@ struct UrmaConfig {
       XLOG(WARN) << "fc_tx_depth clamp " << fc_tx_depth << " -> " << max_jfs_depth;
       fc_tx_depth = max_jfs_depth;
     }
-    // JFS 池总量校验
-    uint32_t total_jfs = io_jfs_count + fc_jfs_count;
-    if (total_jfs > cap.max_jfs) {
-      XLOG(WARN) << "JFS total " << total_jfs << " exceed max_jfs " << cap.max_jfs
-                 << ", clamping io_jfs_count";
-      io_jfs_count = std::max(1u, cap.max_jfs - fc_jfs_count);
-    }
-    // JFR 池总量校验
-    uint32_t total_jfr = io_jfr_count + fc_jfr_count;
-    if (total_jfr > cap.max_jfr) {
-      XLOG(WARN) << "JFR total " << total_jfr << " exceed max_jfr " << cap.max_jfr
-                 << ", clamping io_jfr_count";
-      io_jfr_count = std::max(1u, cap.max_jfr - fc_jfr_count);
-    }
+    // SDD-URMA-EVBEXCLUSIVE-001: 池数量字段已移除
+    // per-EVB 独占四件套,每 EVB 恰 1 IO JFS + 1 FC JFS + 1 IO JFR + 1 FC JFR
+    // 硬件限制由 UrmaTransportContext 构造时的 urma_create_jfs/jfr 错误码检查
   }
 };
 

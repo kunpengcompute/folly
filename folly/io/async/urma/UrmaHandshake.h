@@ -30,7 +30,7 @@
 
 namespace folly {
 
-class UrmaSharedJfr;
+class UrmaTransportContext;
 
 namespace v2_wire {
 
@@ -84,7 +84,7 @@ class UrmaHandshake : private AsyncTimeout {
   using ErrorCallback = std::function<void(const std::string&)>;
 
   UrmaHandshake(EventBase* evb, int tcp_fd, bool is_client,
-                UrmaSharedJfr* shared, const UrmaConfig& config,
+                UrmaTransportContext* shared, const UrmaConfig& config,
                 class UrmaAsyncSocket* socket);
 
   // 设置握手超时(毫秒),默认 5000
@@ -121,7 +121,7 @@ class UrmaHandshake : private AsyncTimeout {
 
   int tcp_fd_;
   bool is_client_;
-  UrmaSharedJfr* shared_;
+  UrmaTransportContext* shared_;
   const UrmaConfig& config_;
   class UrmaAsyncSocket* socket_;  // 直接操作 socket->res_
 

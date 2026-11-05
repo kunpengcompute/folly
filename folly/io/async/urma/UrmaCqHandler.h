@@ -8,9 +8,11 @@
  *
  * UrmaCqHandler: EventHandler 子类,将 JFCE fd 注册到 EventBase epoll。
  *
- *   IO JFCE → pollAndDispatch(数据)
- *   FC JFCE → pollFcAndDispatch(流控消息)
- *   TX JFCE → harvestTx(TX CQE 收割,含 READ CQE)
+ *   SDD-URMA-EVBEXCLUSIVE-001 任务 B:TX/RX JFC 分离后 4 实例
+ *   io_rx_cq_handler → ctx->pollAndDispatch(false, false)(IO RX JFC)
+ *   io_tx_cq_handler → ctx->pollAndDispatch(false, true) (IO TX JFC)
+ *   fc_rx_cq_handler → ctx->pollAndDispatch(true,  false)(FC RX JFC)
+ *   fc_tx_cq_handler → ctx->pollAndDispatch(true,  true) (FC TX JFC)
  */
 #pragma once
 
@@ -21,50 +23,18 @@
 
 namespace folly {
 
-class UrmaSharedJfr;
-class UrmaAsyncSocket;
+class UrmaTransportContext;
 
 class UrmaCqHandler : public EventHandler {
  public:
-  // IO/FC 模式: is_tx_=false, shared_ 指向 UrmaSharedJfr
-  // epoll 触发时调用 shared_->pollAndDispatch() 或 pollFcAndDispatch()
+  // 统一构造:ctx 指向 UrmaTransportContext,is_fc 区分 IO/FC,is_tx 区分 TX/RX
+  // epoll 触发时调用 ctx->pollAndDispatch(is_fc, is_tx)
   UrmaCqHandler(EventBase* evb, int fd,
-                UrmaSharedJfr* shared, bool is_fc)
+                UrmaTransportContext* ctx, bool is_fc, bool is_tx)
       : EventHandler(evb, NetworkSocket(fd)),
-        shared_(shared),
-        socket_(nullptr),
-        is_tx_(false),
+        ctx_(ctx),
         is_fc_(is_fc),
-        is_fc_tx_(false),
-        jfs_index_(0) {
-    registerHandler(READ | PERSIST);
-  }
-
-  // TX 池模式: is_tx_=true, shared_ 指向 UrmaSharedJfr
-  // epoll 触发时调用 shared_->harvestTx(jfs_index_) 单点收割绑定的 JFS
-  // is_fc_tx=true 表示 FC JFS 的 TX CQE,调 harvestFcTx 而非 harvestTx
-  UrmaCqHandler(EventBase* evb, int fd,
-                UrmaSharedJfr* shared, bool is_tx, bool is_fc_tx,
-                uint32_t jfs_index)
-      : EventHandler(evb, NetworkSocket(fd)),
-        shared_(shared),
-        socket_(nullptr),
-        is_tx_(is_tx),
-        is_fc_(false),
-        is_fc_tx_(is_fc_tx),
-        jfs_index_(jfs_index) {
-    registerHandler(READ | PERSIST);
-  }
-
-  // TX per-socket 模式(旧设计,保留兼容)
-  UrmaCqHandler(EventBase* evb, int fd, UrmaAsyncSocket* socket)
-      : EventHandler(evb, NetworkSocket(fd)),
-        shared_(nullptr),
-        socket_(socket),
-        is_tx_(true),
-        is_fc_(false),
-        is_fc_tx_(false),
-        jfs_index_(0) {
+        is_tx_(is_tx) {
     registerHandler(READ | PERSIST);
   }
 
@@ -75,12 +45,9 @@ class UrmaCqHandler : public EventHandler {
   void handlerReady(uint16_t /*events*/) noexcept override;
 
  private:
-  UrmaSharedJfr* shared_;
-  UrmaAsyncSocket* socket_;
-  bool is_tx_;
+  UrmaTransportContext* ctx_;
   bool is_fc_;
-  bool is_fc_tx_;       // TX 模式下区分 FC JFS vs IO JFS
-  uint32_t jfs_index_;  // TX 池模式绑定的 JFS index(单点收割)
+  bool is_tx_;
 };
 
 } // namespace folly

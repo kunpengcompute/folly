@@ -23,36 +23,15 @@
 
 #include <folly/io/async/urma/UrmaCqHandler.h>
 #include <folly/io/async/urma/UrmaHandshake.h>
-#include <folly/io/async/urma/UrmaSharedJfr.h>
+#include <folly/io/async/urma/UrmaTransportContext.h>
 #include <folly/io/async/urma/UrmaInit.h>
-#include <folly/io/async/urma/UrmaJfsPool.h>
-#include <folly/io/async/urma/UrmaJfrPool.h>
 #include <folly/io/async/urma/UrmaHeader.h>
 #include <folly/logging/xlog.h>
 
 namespace folly {
 
-// 单连接 pin JFS:首次发送时 round-robin 选定一个 JFS,后续所有发送复用
-// 保证同连接的 SEND 操作走同一 JFS,硬件保证同 JFS 内 FIFO 顺序
-SharedJfs* UrmaAsyncSocket::acquirePinnedJfs(UrmaJfsPool* pool,
-                                              uint32_t* out_index) {
-  if (pinned_jfs_index_ != kInvalidJfsIndex) {
-    // 优先用 pin 的 JFS(保证单连接所有 WR 走同一 JFS,硬件保序)
-    SharedJfs* sj = pool->tryAcquireIoJfsByIndex(pinned_jfs_index_);
-    if (sj) {
-      *out_index = pinned_jfs_index_;
-      return sj;
-    }
-    // pin 的 JFS 的 SQ 已满 → 返回 nullptr(EAGAIN),让上层挂起 pending_write_,
-    // 等 TX CQE 释放 SQ 槽位后重试。不再 fallback round-robin(避免乱序)。
-    return nullptr;
-  }
-  SharedJfs* sj = pool->acquireIoJfs(out_index);
-  if (sj) {
-    pinned_jfs_index_ = *out_index;  // pin 到首次获取的 JFS
-  }
-  return sj;
-}
+// SDD-URMA-EVBEXCLUSIVE-001: acquirePinnedJfs 删除
+// (I1:每 EVB 只有一个 JFS,sq_inflight 由 ctx_->tryAcquireIoSq() 管理)
 
 // 统计 IOBuf chain 中 >peer_rx_buf_size_ 的大包数量(用于 writeChain 完成组计数)
 static uint32_t countBigMsgs(const IOBuf* head, uint32_t peer_rx_buf_size) {
@@ -139,9 +118,9 @@ UrmaAsyncSocket::~UrmaAsyncSocket() {
 // ── 握手 ──
 
 void UrmaAsyncSocket::startHandshake(bool is_client) {
-  shared_ = UrmaSharedJfr::getOrCreate(evb_);
+  shared_ = UrmaTransportContext::getOrCreate(evb_);
   if (!shared_) {
-    onHandshakeError("UrmaSharedJfr::getOrCreate failed");
+    onHandshakeError("UrmaTransportContext::getOrCreate failed");
     return;
   }
   handshake_ = new UrmaHandshake(evb_, tcp_fd_, is_client, shared_,
@@ -198,16 +177,14 @@ void UrmaAsyncSocket::onHandshakeReady() {
 
   handlePendingWrites();
 
-  // Phase 7: 接收方授予初始 credit(FC_REP),让对端可以开始发送
-  // 初始 credit = rx_depth / INITIAL_CREDIT_DIVISOR
-  if (res_.remote_fc_jetty) {
+  // Phase 7: 接收方授予初始 credit(FC_REP)— 仅 fc_enable 时执行
+  if (UrmaInit::getConfig().fc_enable && res_.remote_fc_jetty) {
     uint32_t initial_credit = 0;
-    if (auto* pool = UrmaJfrPool::get()) {
-      if (auto* jfr = pool->getIoJfrByIndex(0)) {
-        initial_credit = jfr->rx_depth / UrmaFcState::INITIAL_CREDIT_DIVISOR;
-        if (initial_credit > 0) {
-          jfr->credit_idle.fetch_sub(initial_credit, std::memory_order_acq_rel);
-          jfr->credit_allocated.fetch_add(initial_credit, std::memory_order_acq_rel);
+    if (shared_) {
+      initial_credit = shared_->creditIdle() / UrmaFcState::INITIAL_CREDIT_DIVISOR;
+      if (initial_credit > 0) {
+        for (uint32_t i = 0; i < initial_credit; ++i) {
+          shared_->tryAllocCredit();
         }
       }
     }
@@ -223,7 +200,7 @@ void UrmaAsyncSocket::onHandshakeReady() {
 
   // 任务 E(H-6):大包超时扫描定时器(可取消 AsyncTimeout 成员,替代
   // 不可取消的 runAfterDelay([this], 100),消除析构后 100ms UAF 窗口)
-  scan_timer_ = std::make_unique<ScanTimer>(this);
+  scan_timer_ = std::make_shared<ScanTimer>(this);
   scan_timer_->arm();
 }
 
@@ -287,23 +264,19 @@ void UrmaAsyncSocket::onHandshakeError(const std::string& reason) {
 // EVB 亲和:全部在属主 EVB 调用(握手线程/连接回调),DORMANT/wakeup 状态机
 //   依赖此串行性(UrmaSharedJfr::active_conn_count_ 为普通 uint32_t + 断言)。
 void UrmaAsyncSocket::registerRoutes() noexcept {
-  auto* pool = UrmaJfrPool::get();
-  if (!pool) return;
+  if (!shared_) return;
 
   XLOG(DBG) << "[URMA] registerRoutes: socket_id=" << socket_id_.toUint64()
             << " peer_io_jetty_id=" << res_.peer_io_jetty_id
             << " active_conn_bound=" << active_conn_bound_ << " this=" << this;
 
   // Phase 3: 用本端 SocketId 注册(接收方按 header.dst_socket_id 查表路由)
-  // 发送方写入 header.dst_socket_id = peer_socket_id(对端 = 接收方本端)
-  // TX CQE 路由:harvestTxAndDispatch 用 tx_ctx->socket_id(本端)查表,同 key 命中
-  pool->registerSocket(socket_id_.toUint64(), this);
-  // 任务 B(H-2):缓存安全句柄(析构 drain 自旋 pending 的对象)
+  shared_->registerSocket(socket_id_.toUint64(), this);
   if (!route_entry_) {
-    route_entry_ = pool->findRouteEntry(socket_id_.toUint64());
+    route_entry_ = shared_->findRouteEntry(socket_id_.toUint64());
   }
   if (res_.remote_fc_jetty) {
-    pool->registerFcSocket(socket_id_.toUint64(), this);
+    shared_->registerFcSocket(socket_id_.toUint64(), this);
   }
 
   // 记账绑定:首次注册时恰好一次 inc(预注册与 onHandshakeReady 幂等)
@@ -493,8 +466,6 @@ void UrmaAsyncSocket::writeChain(WriteCallback* cb, std::unique_ptr<IOBuf>&& cha
     return;
   }
 
-  pollTx();
-
   uint32_t total_posted = 0;
   bool big_deferred = false;
   urma_status_t ret = sendChain(cb, chain, total_posted, big_deferred, group);
@@ -506,10 +477,8 @@ void UrmaAsyncSocket::writeChain(WriteCallback* cb, std::unique_ptr<IOBuf>&& cha
     pw->next = nullptr;
     pending_write_head_ = std::move(pw);
     pending_write_tail_ = pending_write_head_.get();
-    // Phase 2: 武装全局 JFS 池的 TX JFCE 中断,等待 CQE 唤醒
-    if (auto* pool = UrmaJfsPool::get()) {
-      pool->rearmAllTxJfce();
-    }
+    // SDD-URMA-EVBEXCLUSIVE-001: TX CQE 由 pollAndDispatch 统一收割(I3)
+    // 无需 rearmAllTxJfce —— 共享 JFC 的 JFCE 已由 CqHandler 注册 epoll
   } else if (ret == URMA_SUCCESS) {
 //                << " big_deferred=" << big_deferred
 //                << " pending_big=" << pending_big_msg_.size();
@@ -520,73 +489,12 @@ void UrmaAsyncSocket::writeChain(WriteCallback* cb, std::unique_ptr<IOBuf>&& cha
 }
 
 // ── TX completion ──
-
+// SDD-URMA-EVBEXCLUSIVE-001: pollTx 整体删除
+// (I3:TX CQE 由 pollAndDispatch(is_tx=true) 独立收割 —— WRITE/READ CQE 在
+//  pollAndDispatchTxOnly 中处理,sq_inflight 归还 + socket 路由均在收割分派器完成)
+// pollTx 保留为空函数,供现有调用点(startRead/deliverDataFrame 等)无编译断裂
 void UrmaAsyncSocket::pollTx() noexcept {
-  if (state_ != State::kOpen) return;
-  UrmaJfsPool* pool = UrmaJfsPool::get();
-  if (!pool) return;
-  // 性能优化:只扫本连接活跃 JFS 位图(避免遍历全部 64 个 JFS)
-  // 位图为 0 时直接返回,零系统调用
-  // Phase 5: 跨连接的 TX CQE 收割由 UrmaJfrPool::harvestTxAndDispatch 负责
-  // (在 pollAndDispatch 中顺带收割所有 JFS 的 TX CQE 并路由)。
-  // pollTx 只负责收割本连接 mask 置位的 JFS 上的 CQE(本连接 post 的 SEND/CTRL)。
-  if (active_jfs_mask_ == 0) return;
-
-  urma_cr_t cr[POLL_BATCH_MAX];
-  uint64_t mask = active_jfs_mask_;
-  while (mask) {
-    uint32_t ji = __builtin_ctzll(mask);
-    mask &= (mask - 1);
-    SharedJfs* sj = pool->getIoJfsByIndex(ji);
-    if (!sj || !sj->jfc) continue;
-    int n;
-    while ((n = urma_poll_jfc(sj->jfc, POLL_BATCH_MAX, cr)) > 0) {
-      for (int i = 0; i < n; ++i) {
-        auto* tx_ctx = reinterpret_cast<TxCompletionCtx*>(cr[i].user_ctx);
-        if (!tx_ctx) continue;
-
-        if (tx_ctx->type == TxCompletionCtx::MSG_READ) {
-          // READ CQE:本连接 post 的 READ(handleRemoteReadCqe 路由来的)
-          // 或其他连接 post 的 READ(本连接 mask 恰好置位此 JFS)
-          if (tx_ctx->socket_id == socket_id_.toUint64()) {
-            if (tx_ctx->msg_id != pending_read_msg_id_) {
-              releaseActiveJfsSlot(tx_ctx->jfs_index);
-              pool->releaseIoJfs(tx_ctx->jfs_index);
-              delete tx_ctx;
-              continue;
-            }
-            if (cr[i].status == URMA_CR_SUCCESS) {
-              onReadComplete();
-            } else {
-              onReadFailed(cr[i].status);
-            }
-            releaseActiveJfsSlot(tx_ctx->jfs_index);
-            pool->releaseIoJfs(tx_ctx->jfs_index);
-            delete tx_ctx;
-          } else {
-            // 其他连接的 READ CQE:任务 B(H-2)统一走属主转发协议
-            // (同 EVB 短路同步,跨 EVB runInLoop 转发回属主线程,不变量 I1/I3)
-            uint64_t socket_id = tx_ctx->socket_id;
-            uint16_t msg_id = tx_ctx->msg_id;
-            urma_status_t status = cr[i].status;
-            pool->releaseIoJfs(tx_ctx->jfs_index);
-            delete tx_ctx;
-            if (auto* jfr_pool = UrmaJfrPool::get()) {
-              jfr_pool->dispatchReadCqe(socket_id, msg_id, status);
-            }
-          }
-        } else {
-          // MSG_DATA / MSG_CTRL_PULL / MSG_CTRL_FREE
-          releaseActiveJfsSlot(tx_ctx->jfs_index);
-          pool->releaseIoJfs(tx_ctx->jfs_index);
-          delete tx_ctx;
-        }
-      }
-    }
-    // edge-triggered rearm: pollTx 收割 CQE 后必须 rearm,
-    // 否则后续新 CQE 到达时 edge-triggered epoll 不触发(harvestTxAndDispatch 饿死)
-    urma_rearm_jfc(sj->jfc, false);
-  }
+  // no-op: TX CQE 由 UrmaTransportContext::pollAndDispatch(is_tx=true) 独立收割(I3)
 }
 
 void UrmaAsyncSocket::retryWrite() noexcept {
@@ -604,32 +512,32 @@ urma_status_t UrmaAsyncSocket::sendChain(WriteCallback* cb,
     return URMA_EAGAIN;
   }
 
-  // Phase 7: credit 流控(软限制)— peer_credit <= 0 时发 FC_REQ 申请额度
-  // 但不阻塞发送(EAGAIN 会串行化 close-loop 请求,导致 QPS 暴跌 350 倍)
-  // credit 机制保留用于统计和诊断,实际防溢出由水位线 + recv buffer 池保证
-  if (fc_state_.peer_credit.load(std::memory_order_acquire) <= 0) {
+  // Phase 7: credit 流控(软限制)— 仅 fc_enable 时触发 FC_REQ
+  // close_loop 场景下 FC 闭环为净开销(per-EVB 独占 + 水位线已防溢出),
+  // 默认禁用,消除跨线程 FC 消息通知导致的 P99 尾部延迟雪崩。
+  if (UrmaInit::getConfig().fc_enable &&
+      fc_state_.peer_credit.load(std::memory_order_acquire) <= 0) {
     uint32_t multiple = fc_state_.credit_multiple.load(std::memory_order_relaxed);
-    auto* jfr_pool = UrmaJfrPool::get();
     uint16_t req_cnt = 1;
-    if (jfr_pool) {
-      if (auto* jfr = jfr_pool->getIoJfrByIndex(0)) {
-        req_cnt = static_cast<uint16_t>(
-            std::max(1u, multiple * jfr->rx_depth /
-                          UrmaFcState::INITIAL_CREDIT_DIVISOR));
-      }
+    if (shared_) {
+      req_cnt = static_cast<uint16_t>(
+          std::max(1u, multiple * shared_->creditIdle() /
+                        UrmaFcState::INITIAL_CREDIT_DIVISOR));
     }
     uint16_t req_seq = fc_state_.fc_seq_next.fetch_add(1, std::memory_order_relaxed);
     sendFcMsg(FC_REQ, req_cnt, req_seq);
-    XLOG(DBG) << "[URMA-FC] sendChain credit=0, req_cnt=" << req_cnt
-              << " (soft limit, not blocking) socket_id=0x"
-              << std::hex << socket_id_.toUint64() << std::dec;
     // 不返回 EAGAIN,继续发送(软限制)
   }
 
-  UrmaJfsPool* pool = UrmaJfsPool::get();
-  if (!pool) {
+  if (!shared_) {
     if (cb) cb->writeErr(0, AsyncSocketException(
-        AsyncSocketException::UNKNOWN, "JFS pool not initialized"));
+        AsyncSocketException::UNKNOWN, "TransportContext not initialized"));
+    return URMA_FAIL;
+  }
+  EvbJfs* io_jfs = shared_->ioJfs();
+  if (!io_jfs || !io_jfs->jfs) {
+    if (cb) cb->writeErr(0, AsyncSocketException(
+        AsyncSocketException::UNKNOWN, "IO JFS not available"));
     return URMA_FAIL;
   }
 
@@ -713,29 +621,21 @@ urma_status_t UrmaAsyncSocket::sendChain(WriteCallback* cb,
     // hdr_buf 加入发送链,保持存活到 TX CQE
     wr_chain_head->appendChain(std::move(hdr_buf));
 
-    // Phase 2: 从 JFS 池获取一个空闲 JFS(pin 到同连接固定 JFS,保证顺序)
-    uint32_t jfs_index = 0;
-    SharedJfs* sj = acquirePinnedJfs(pool, &jfs_index);
-    if (!sj) {
-      // 所有 JFS 的 SQ 都满 → EAGAIN
+    // SDD-URMA-EVBEXCLUSIVE-001: 独占 JFS,sq_inflight 由 ctx_->tryAcquireIoSq() 管理
+    if (!shared_->tryAcquireIoSq()) {
+      // SQ 满 → EAGAIN
       return URMA_EAGAIN;
     }
 
     // Phase 2: 创建 TxCompletionCtx,move IOBuf chain 到 ctx
-    // post 前 move-in,TX CQE 后 delete ctx → send_data 析构 → block 回收
     auto* tx_ctx = new TxCompletionCtx();
     tx_ctx->socket_id = socket_id_.toUint64();
     tx_ctx->seq = seq;
     tx_ctx->type = TxCompletionCtx::MSG_DATA;
-    tx_ctx->jfs_index = jfs_index;
+    tx_ctx->jfs_index = 0;  // 独占只有一个 JFS,index 无意义(保留字段)
     tx_ctx->msg_id = 0;
-    // 将 wr_chain_head move 到 ctx 的 send_data(持有 block 引用)
     tx_ctx->send_data = std::move(*wr_chain_head);
-    // SGE 数组也由 ctx 管理(保持存活到硬件处理完毕)
     tx_ctx->sge_arr = sge_arr;
-
-    // 性能优化:置位本连接活跃 JFS 位图(pollTx 只扫位图置位的 JFS)
-    markActiveJfs(jfs_index);
 
     urma_jfs_wr_t wr = {};
     wr.opcode = URMA_OPC_SEND;
@@ -748,15 +648,15 @@ urma_status_t UrmaAsyncSocket::sendChain(WriteCallback* cb,
 
     total_posted += sge_total;
     urma_jfs_wr_t* bad_wr = nullptr;
-    urma_status_t ret = urma_post_jfs_wr(sj->jfs, &wr, &bad_wr);
+    urma_status_t ret = urma_post_jfs_wr(io_jfs->jfs, &wr, &bad_wr);
     if (ret == URMA_SUCCESS) {
-      // tx_ctx 持有 send_data(IOBuf chain) + sge_arr,TX CQE 后 delete 回收
-      // Phase 7: 消耗一个 credit(软限制,允许负数,用于统计)
-      fc_state_.peer_credit.fetch_sub(1, std::memory_order_acq_rel);
+      if (UrmaInit::getConfig().fc_enable) {
+        fc_state_.peer_credit.fetch_sub(1, std::memory_order_acq_rel);
+      }
       continue;
     }
-    // post 失败:回收 ctx + 归还 sq_inflight
-    pool->releaseIoJfs(jfs_index);
+    // post 失败:归还 sq_inflight + 回收 ctx
+    shared_->releaseIoSq();
     delete tx_ctx;
     if (ret == URMA_EAGAIN) {
       return URMA_EAGAIN;
@@ -771,8 +671,6 @@ urma_status_t UrmaAsyncSocket::sendChain(WriteCallback* cb,
 }
 
 void UrmaAsyncSocket::handlePendingWrites() noexcept {
-  pollTx();
-
   while (pending_write_head_) {
     auto* pw = pending_write_head_.get();
     std::unique_ptr<IOBuf> chain = std::move(pw->buf);
@@ -789,10 +687,7 @@ void UrmaAsyncSocket::handlePendingWrites() noexcept {
                                   pw->big_group);
     if (ret == URMA_EAGAIN) {
       pw->buf = std::move(chain);
-      // Phase 2: 武装全局 JFS 池的 TX JFCE 中断
-      if (auto* pool = UrmaJfsPool::get()) {
-        pool->rearmAllTxJfce();
-      }
+      // SDD-URMA-EVBEXCLUSIVE-001: TX CQE 由 pollAndDispatch 统一收割(I3)
       return;
     }
     if (ret == URMA_SUCCESS) {
@@ -913,16 +808,14 @@ bool UrmaAsyncSocket::postControlPacketFrags(
   if (!res_.remote_jetty) return false;
   if (!frags || frag_count == 0 || frag_count > kMaxPullFrags) return false;
 
-  // 从 JFS 池获取 IO JFS
-  UrmaJfsPool* pool = UrmaJfsPool::get();
-  if (!pool) return false;
-  uint32_t jfs_index = 0;
-  SharedJfs* sj = acquirePinnedJfs(pool, &jfs_index);
-  if (!sj) {
-    XLOG(WARN) << "[URMA] postControlPacketFrags: no available JFS";
+  // SDD-URMA-EVBEXCLUSIVE-001: 独占 IO JFS
+  if (!shared_) return false;
+  EvbJfs* io_jfs = shared_->ioJfs();
+  if (!io_jfs || !io_jfs->jfs) return false;
+  if (!shared_->tryAcquireIoSq()) {
+    XLOG(WARN) << "[URMA] postControlPacketFrags: SQ full";
     return false;
   }
-  markActiveJfs(jfs_index);
 
   size_t pkt_len = sizeof(PullMemFragPacket) -  // 头 40B
                   sizeof(PullMemFragDesc) * (kMaxPullFrags - frag_count);
@@ -944,7 +837,7 @@ bool UrmaAsyncSocket::postControlPacketFrags(
   tx_ctx->type = TxCompletionCtx::MSG_CTRL_PULL;
   tx_ctx->socket_id = socket_id_.toUint64();
   tx_ctx->seq = seq;
-  tx_ctx->jfs_index = jfs_index;
+  tx_ctx->jfs_index = 0;
   tx_ctx->msg_id = msg_id;
   tx_ctx->sge_arr = sge_arr;
   tx_ctx->send_data = std::move(*ctrl_buf);  // 持有段表 buffer 到 TX CQE
@@ -960,9 +853,9 @@ bool UrmaAsyncSocket::postControlPacketFrags(
   wr.next = nullptr;
 
   urma_jfs_wr_t* bad_wr = nullptr;
-  urma_status_t st = urma_post_jfs_wr(sj->jfs, &wr, &bad_wr);
+  urma_status_t st = urma_post_jfs_wr(io_jfs->jfs, &wr, &bad_wr);
   if (st != URMA_SUCCESS) {
-    pool->releaseIoJfs(jfs_index);
+    shared_->releaseIoSq();
     delete tx_ctx;
     XLOG(ERR) << "[URMA] ctrlPullFrags FAIL msg_id=" << msg_id
               << " frags=" << frag_count << " total=" << total_size
@@ -1074,19 +967,20 @@ bool UrmaAsyncSocket::startRead(uint16_t msg_id, const PullMemFragDesc* frags,
     }
   }
 
-  // Phase 2: 从 JFS 池获取 IO JFS
-  UrmaJfsPool* pool = UrmaJfsPool::get();
-  if (!pool) {
-    XLOG(ERR) << "startRead: JFS pool not available";
+  // SDD-URMA-EVBEXCLUSIVE-001: 独占 IO JFS
+  if (!shared_) {
+    XLOG(ERR) << "startRead: no TransportContext";
     return false;
   }
-  uint32_t jfs_index = 0;
-  SharedJfs* sj = acquirePinnedJfs(pool, &jfs_index);
-  if (!sj) {
-    XLOG(WARN) << "startRead: no available JFS";
+  EvbJfs* io_jfs = shared_->ioJfs();
+  if (!io_jfs || !io_jfs->jfs) {
+    XLOG(ERR) << "startRead: IO JFS not available";
     return false;
   }
-  markActiveJfs(jfs_index);
+  if (!shared_->tryAcquireIoSq()) {
+    XLOG(WARN) << "startRead: SQ full";
+    return false;
+  }
 
   // SGE 布局:每段 2 项(src 段 i / dst 本地块 i)
   auto sge_arr = std::make_shared<std::vector<urma_sge_t>>(2 * size_t(frag_count));
@@ -1110,7 +1004,7 @@ bool UrmaAsyncSocket::startRead(uint16_t msg_id, const PullMemFragDesc* frags,
   auto* tx_ctx = new TxCompletionCtx();
   tx_ctx->type = TxCompletionCtx::MSG_READ;
   tx_ctx->socket_id = socket_id_.toUint64();
-  tx_ctx->jfs_index = jfs_index;
+  tx_ctx->jfs_index = 0;
   tx_ctx->msg_id = msg_id;
   tx_ctx->sge_arr = sge_arr;
   // READ 的 dst 段块链通过 pending_read_buf_ 持有
@@ -1142,9 +1036,9 @@ bool UrmaAsyncSocket::startRead(uint16_t msg_id, const PullMemFragDesc* frags,
 
   urma_jfs_wr_t* bad_wr = nullptr;
   urma_status_t st =
-      urma_post_jfs_wr(sj->jfs, &tx_ctx->read_wr_chain[0], &bad_wr);
+      urma_post_jfs_wr(io_jfs->jfs, &tx_ctx->read_wr_chain[0], &bad_wr);
   if (st != URMA_SUCCESS) {
-    pool->releaseIoJfs(jfs_index);
+    shared_->releaseIoSq();
     delete tx_ctx;
     pending_read_sge_.reset();
     pending_read_buf_.reset();
@@ -1153,17 +1047,9 @@ bool UrmaAsyncSocket::startRead(uint16_t msg_id, const PullMemFragDesc* frags,
     return false;
   }
   XLOG(DBG) << "[URMA] startRead posted msg_id=" << msg_id
-            << " jfs_idx=" << jfs_index << " total=" << total_size
+            << " total=" << total_size
             << " frags=" << frag_count;
-  // 调度 pollTx 确保 READ CQE 被收割(可能从 drainRxPendingQueue 调用,
-  // 无后续 pollTx 上下文;线程安全:跨 EVB 走 runInEventBaseThread)
-  if (evb_) {
-    if (evb_->inRunningEventBaseThread()) {
-      evb_->runInLoop([this] { pollTx(); });
-    } else {
-      evb_->runInEventBaseThread([this] { pollTx(); });
-    }
-  }
+  // TX CQE 由 CqHandler 事件驱动收割,pollTx 已删除,无需调度
   return true;
 }
 
@@ -1231,13 +1117,11 @@ void UrmaAsyncSocket::handleRemoteReadCqe(uint16_t msg_id,
 bool UrmaAsyncSocket::postFreeNotify(uint16_t msg_id, uint16_t seq) noexcept {
   if (!res_.remote_jetty) return false;
 
-  // 从 JFS 池获取 IO JFS
-  UrmaJfsPool* pool = UrmaJfsPool::get();
-  if (!pool) return false;
-  uint32_t jfs_index = 0;
-  SharedJfs* sj = acquirePinnedJfs(pool, &jfs_index);
-  if (!sj) return false;
-  markActiveJfs(jfs_index);
+  // SDD-URMA-EVBEXCLUSIVE-001: 独占 IO JFS
+  if (!shared_) return false;
+  EvbJfs* io_jfs = shared_->ioJfs();
+  if (!io_jfs || !io_jfs->jfs) return false;
+  if (!shared_->tryAcquireIoSq()) return false;
 
   // FREE 通知:SEND_IMM + UrmaMsgHeader(24B) + imm_data(msg_id)
   // inline_flag=1:24B ≤ max_inline_size,NIC 内联拷贝,无需 MR 注册
@@ -1254,7 +1138,7 @@ bool UrmaAsyncSocket::postFreeNotify(uint16_t msg_id, uint16_t seq) noexcept {
   tx_ctx->type = TxCompletionCtx::MSG_CTRL_FREE;
   tx_ctx->socket_id = socket_id_.toUint64();
   tx_ctx->seq = seq;
-  tx_ctx->jfs_index = jfs_index;
+  tx_ctx->jfs_index = 0;
   tx_ctx->msg_id = msg_id;
   tx_ctx->sge_arr = sge_arr;
   tx_ctx->send_data = std::move(*hdr_buf);  // 持有 buffer 到 TX CQE
@@ -1271,9 +1155,9 @@ bool UrmaAsyncSocket::postFreeNotify(uint16_t msg_id, uint16_t seq) noexcept {
   wr.next = nullptr;
 
   urma_jfs_wr_t* bad_wr = nullptr;
-  urma_status_t st = urma_post_jfs_wr(sj->jfs, &wr, &bad_wr);
+  urma_status_t st = urma_post_jfs_wr(io_jfs->jfs, &wr, &bad_wr);
   if (st != URMA_SUCCESS) {
-    pool->releaseIoJfs(jfs_index);
+    shared_->releaseIoSq();
     delete tx_ctx;
     return false;
   }
@@ -1377,8 +1261,14 @@ void UrmaAsyncSocket::scanBigMsgTimeout() noexcept {
 // 消除旧 runAfterDelay([this]) 析构后 100ms 窗口 UAF(检视报告 H-6)。
 // 除大包扫描外,同时驱动:保序重排超时检查 + FC credit 周期归还。
 void UrmaAsyncSocket::ScanTimer::timeoutExpired() noexcept {
+  // alive_ 标志:destroyUrmaResources 置 false 后不再访问 sock_
+  // (libevent 2.x event_del 无法撤回已就绪事件,timer 可能在
+  // scan_timer_.reset() 后仍触发,此时 alive_==false 短路返回)
+  if (!alive_.load(std::memory_order_acquire)) {
+    return;
+  }
   if (sock_->state_ != State::kOpen) {
-    return;  // socket 已关闭:停止自续(定时器随 scan_timer_.reset() 销毁)
+    return;  // socket 已关闭:停止自续
   }
   sock_->scanBigMsgTimeout();
   sock_->checkReorderTimeout();
@@ -1390,6 +1280,7 @@ void UrmaAsyncSocket::ScanTimer::timeoutExpired() noexcept {
 // 空洞在 reorder_timeout_ms 内未补齐 → 放行缓冲全部(seq 升序交付)+
 // expected 重同步 + WARN 计数。正常流量下缓冲恒空,零开销。
 void UrmaAsyncSocket::checkReorderTimeout() noexcept {
+  if (!UrmaInit::getConfig().rx_reorder_enable) return;
   if (rx_reorder_.empty()) {
     return;
   }
@@ -1419,6 +1310,7 @@ void UrmaAsyncSocket::checkReorderTimeout() noexcept {
 // rx_depth/DIVISOR)时,归还多余部分 → 接收方 idle 回升 → 下一轮 REQ 可再授予。
 // 闭环:REQ(借) → REP(授) → 消耗 → RETURN(还) → idle 回升 → ...
 void UrmaAsyncSocket::maybeReturnCredit() noexcept {
+  if (!UrmaInit::getConfig().fc_enable) return;
   if (state_ != State::kOpen || !res_.remote_fc_jetty) {
     return;
   }
@@ -1428,11 +1320,9 @@ void UrmaAsyncSocket::maybeReturnCredit() noexcept {
   }
   // 保留水位 = 初始授予量(覆盖 close-loop 并发窗口)
   int32_t keep = 0;
-  if (auto* pool = UrmaJfrPool::get()) {
-    if (auto* jfr = pool->getIoJfrByIndex(0)) {
-      keep = static_cast<int32_t>(
-          jfr->rx_depth / UrmaFcState::INITIAL_CREDIT_DIVISOR);
-    }
+  if (shared_) {
+    keep = static_cast<int32_t>(
+        shared_->rxDepth() / UrmaFcState::INITIAL_CREDIT_DIVISOR);
   }
   if (pc <= keep) {
     return;  // 未超保留水位,无需归还
@@ -1488,26 +1378,26 @@ bool UrmaAsyncSocket::onIoMessageReceived(void* recv_buf, uint32_t recv_len,
     XLOG(WARN) << "[URMA] onIoMessageReceived: unexpected type="
                << static_cast<int>(hdr->type)
                << " in SEND path (expected SEND_IMM), msg_id=" << hdr->msg_id;
-    if (evb_) {
-      evb_->runInLoop([this] { pollTx(); });
-    }
     return false;
   }
 
-  // ── seq 保序(默认开启,无开关)──
-  //   expected 命中 → 交付并连带交付重排队列后续;
-  //   未来 seq(空洞)→ movable 构造入重排缓冲(等待补齐);
-  //   过时/重复 seq → 丢弃(回收 slot);
-  //   空洞由 checkReorderTimeout(ScanTimer 100ms)超时兜底放行。
-  //   重试语义:SEND 可靠有序无重传通道(大包 PULL_MEM 已有 7s×3 重发);
-  //   重排缓冲 = 瞬态乱序容忍,超时放行 = 兜底"重试完成"路径
+  // ── seq 保序(默认关:per-EVB 独占 JFR + TX/RX 独立 JFC 下
+  //   URMA SEND 可靠有序,seq 严格递增,重排器恒空)──
+  //   rx_reorder_enable=true 时走完整重排逻辑(多 JFR 共享场景);
+  //   默认 false:直接交付,零 seq 校验开销。
+  if (!UrmaInit::getConfig().rx_reorder_enable) {
+    bool owned = deliverDataFrame(recv_buf, recv_len, ctx);
+    expected_seq_.store(static_cast<uint16_t>(hdr->seq + 1),
+                        std::memory_order_relaxed);
+    return owned;
+  }
+
   uint16_t expected = expected_seq_.load(std::memory_order_relaxed);
   if (hdr->seq == expected) {
     bool owned = deliverDataFrame(recv_buf, recv_len, ctx);
     expected_seq_.store(static_cast<uint16_t>(expected + 1),
                         std::memory_order_relaxed);
     if (!rx_reorder_.empty()) {
-      // 连带交付重排队列中的连续帧
       std::vector<std::unique_ptr<IOBuf>> drained;
       rx_reorder_.drainInOrder(expected, drained);
       for (auto& buf : drained) {
@@ -1519,15 +1409,13 @@ bool UrmaAsyncSocket::onIoMessageReceived(void* recv_buf, uint32_t recv_len,
 
   int32_t dist = UrmaSeqReorder::seqDist(hdr->seq, expected);
   if (dist > 0) {
-      // 未来帧(空洞):movable 构造入重排缓冲,等待中间帧补齐
       auto held_buf = buildOwnedDataFrame(recv_buf, recv_len, ctx);
       if (held_buf && rx_reorder_.push(hdr->seq, std::move(held_buf),
                                         std::chrono::steady_clock::now())) {
         ++reorder_buffered_;
-        return true;  // slot 随 movable 转移,由缓冲 IOBuf 的 deleter 回收
+        return true;
       }
       if (held_buf) {
-        // 缓冲满(防洪泛上限):放行本帧 + 冲刷缓冲全部 + 重同步
         XLOG(WARN) << "[URMA] reorder buffer full, flush+resync: got="
                    << hdr->seq << " expected=" << expected
                    << " depth=" << rx_reorder_.size();
@@ -1541,16 +1429,13 @@ bool UrmaAsyncSocket::onIoMessageReceived(void* recv_buf, uint32_t recv_len,
                             std::memory_order_relaxed);
         return owned;
       }
-      // movable 构造失败(超 held 预算等):落入下方拷贝交付路径
   } else {
-    // 过时/重复帧:丢弃(URMA SEND 可靠传输下出现 = 异常重放,防重复交付)
     ++reorder_dup_dropped_;
     XLOG(WARN) << "[URMA] dup/stale seq dropped: got=" << hdr->seq
                << " expected=" << expected;
-    return false;  // 收割线程回收 slot
+    return false;
   }
 
-  // movable 不可用的放行:交付本帧并重同步
   bool owned = deliverDataFrame(recv_buf, recv_len, ctx);
   expected_seq_.store(static_cast<uint16_t>(hdr->seq + 1),
                       std::memory_order_relaxed);
@@ -1570,7 +1455,7 @@ void UrmaAsyncSocket::flushReorderBuffer(
 // 返回空 = 无法 movable(拷贝路径由调用方另行处理);held++/transit-- 由本函数完成
 std::unique_ptr<IOBuf> UrmaAsyncSocket::buildOwnedDataFrame(
     void* recv_buf, uint32_t recv_len, RxSlotCtx* ctx) noexcept {
-  SharedJfr* jfr = ctx->jfr;
+  EvbJfr* jfr = ctx->jfr;
   if (!jfr || !jfr->recycle) {
     return nullptr;
   }
@@ -1592,55 +1477,28 @@ std::unique_ptr<IOBuf> UrmaAsyncSocket::buildOwnedDataFrame(
       data_ptr, data_len,
       [](void*, void* ud) {
         auto* rc = static_cast<RxSlotCtx*>(ud);
-        UrmaJfrPool::releaseHeldSlot(rc->jfr, rc->slot);
+        UrmaTransportContext::releaseHeldSlot(rc->ctx, rc->jfr, rc->slot);
       },
       ctx);
 }
 
 // MSG_DATA 帧交付:movable 优先(零拷贝),降级 memcpy;append read_queue_ +
-// deliverReadData + 调度 pollTx。返回 true = slot 已随 movable 转移
+// deliverReadData。返回 true = slot 已随 movable 转移
+// TX CQE 由 UrmaTransportContext::pollAndDispatch(is_tx=true) 独立收割,
+// 不再在 RX 路径调度 pollTx(原 schedulePollTx 是 no-op 残留,纯 runInLoop 开销)。
 bool UrmaAsyncSocket::deliverDataFrame(void* recv_buf, uint32_t recv_len,
                                         RxSlotCtx* ctx) noexcept {
   uint32_t data_len = recv_len - sizeof(UrmaMsgHeader);
   void* data_ptr = static_cast<uint8_t*>(recv_buf) + sizeof(UrmaMsgHeader);
-  SharedJfr* jfr = ctx->jfr;
-
-  // Phase 5: RX 处理后异步调度 pollTx,收割可能在途的 READ/SEND TX CQE。
-  // 线程安全修正:runInLoop(Func) 非线程安全 —— 同 EVB 直用(快路径),
-  // 跨 EVB(JFR 共享场景)走 runInEventBaseThread(notification queue)。
-  auto schedulePollTx = [this]() {
-    if (!evb_) {
-      return;
-    }
-    if (evb_->inRunningEventBaseThread()) {
-      evb_->runInLoop([this] { pollTx(); });
-    } else {
-      evb_->runInEventBaseThread([this] { pollTx(); });
-    }
-  };
 
   if (auto held_buf = buildOwnedDataFrame(recv_buf, recv_len, ctx)) {
     onRxBuf(std::move(held_buf));
-    schedulePollTx();
     return true;  // 所有权已转移,收割线程不再回收
   }
 
-  // 降级 memcpy 路径(超 held 预算 / data_len==0 / FORCE_COPY):
-  // 正确性等价旧行为,性能局部退化 + 打点(R1 安全阀)
-  if (jfr && data_len > 0) {
-    uint32_t held = jfr->held_count.load(std::memory_order_acquire);
-    uint32_t held_budget =
-        jfr->watermark.max_water - jfr->watermark.min_water;
-    if (held >= held_budget) {
-      XLOG(DBG) << "[URMA] RX held budget exhausted, fallback to memcpy: "
-                << "held=" << held << " budget=" << held_budget
-                << " socket_id=0x" << std::hex << socket_id_.toUint64()
-                << std::dec;
-    }
-  }
+  // 降级 memcpy 路径(超 held 预算 / data_len==0 / FORCE_COPY)
   auto iobuf = IOBuf::copyBuffer(data_ptr, data_len);
   onRxBuf(std::move(iobuf));
-  schedulePollTx();
   return false;  // 数据已拷出,收割线程立即回收 slot
 }
 
@@ -1702,28 +1560,16 @@ void UrmaAsyncSocket::handleFcReq(uint64_t dst_socket_id, uint16_t credit_cnt,
   }
   fc_state_.fc_last_req_seq.store(fc_seq, std::memory_order_release);
 
-  // 从 per-JFR credit_idle 扣减(通过 UrmaJfrPool)
-  // 授予数量 = min(请求量, credit_idle)
+  // SDD-URMA-EVBEXCLUSIVE-001: credit 从 ctx_->credit_idle 扣减(same-thread I2)
   uint32_t granted = 0;
-  if (auto* pool = UrmaJfrPool::get()) {
-    if (auto* jfr = pool->getIoJfrByIndex(0)) {  // 简化:用第一个 IO JFR
-      uint32_t idle = jfr->credit_idle.load(std::memory_order_acquire);
-      uint32_t to_grant = std::min(static_cast<uint32_t>(credit_cnt), idle);
-      if (to_grant > 0) {
-        // 原子扣减 credit_idle
-        uint32_t cur = idle;
-        while (cur >= to_grant) {
-          if (jfr->credit_idle.compare_exchange_weak(
-                  cur, cur - to_grant,
-                  std::memory_order_acq_rel, std::memory_order_acquire)) {
-            granted = to_grant;
-            break;
-          }
-        }
-      }
-      // credit_allocated += granted
-      if (granted > 0) {
-        jfr->credit_allocated.fetch_add(granted, std::memory_order_release);
+  if (shared_) {
+    uint32_t idle = shared_->creditIdle();
+    uint32_t to_grant = std::min(static_cast<uint32_t>(credit_cnt), idle);
+    for (uint32_t i = 0; i < to_grant; ++i) {
+      if (shared_->tryAllocCredit()) {
+        ++granted;
+      } else {
+        break;
       }
     }
   }
@@ -1782,11 +1628,8 @@ void UrmaAsyncSocket::handleFcRep(uint16_t credit_cnt, uint16_t fc_seq) noexcept
 void UrmaAsyncSocket::handleFcReturn(uint64_t dst_socket_id,
                                        uint16_t credit_cnt,
                                        uint16_t fc_seq) noexcept {
-  if (auto* pool = UrmaJfrPool::get()) {
-    if (auto* jfr = pool->getIoJfrByIndex(0)) {
-      jfr->credit_idle.fetch_add(credit_cnt, std::memory_order_release);
-      jfr->credit_allocated.fetch_sub(credit_cnt, std::memory_order_acq_rel);
-    }
+  if (shared_) {
+    shared_->releaseCredit(credit_cnt);  // allocated -= cnt; idle += cnt
   }
   fc_state_.peer_granted.fetch_sub(credit_cnt, std::memory_order_acq_rel);
 
@@ -1817,13 +1660,12 @@ bool UrmaAsyncSocket::sendFcMsg(UrmaFcMsgType type, uint16_t credit_cnt,
     return false;
   }
 
-  UrmaJfsPool* pool = UrmaJfsPool::get();
-  if (!pool) return false;
-
-  uint32_t fc_jfs_index = 0;
-  SharedJfs* fc_jfs = pool->acquireFcJfs(&fc_jfs_index);
-  if (!fc_jfs) {
-    XLOG(DBG) << "[URMA-FC] acquireFcJfs failed (SQ full)";
+  // SDD-URMA-EVBEXCLUSIVE-001: 独占 FC JFS
+  if (!shared_) return false;
+  EvbJfs* fc_jfs = shared_->fcJfs();
+  if (!fc_jfs || !fc_jfs->jfs) return false;
+  if (!shared_->tryAcquireFcSq()) {
+    XLOG(DBG) << "[URMA-FC] FC SQ full";
     return false;
   }
 
@@ -1845,7 +1687,7 @@ bool UrmaAsyncSocket::sendFcMsg(UrmaFcMsgType type, uint16_t credit_cnt,
   tx_ctx->socket_id = socket_id_.toUint64();
   tx_ctx->seq = fc_seq;
   tx_ctx->type = TxCompletionCtx::MSG_CTRL_PULL;  // 复用控制包类型(FC CQE 回收路径相同)
-  tx_ctx->jfs_index = fc_jfs_index;
+  tx_ctx->jfs_index = 0;
   tx_ctx->msg_id = 0;
   tx_ctx->sge_arr = sge_arr;
   tx_ctx->send_data = std::move(*fc_iobuf);
@@ -1863,14 +1705,12 @@ bool UrmaAsyncSocket::sendFcMsg(UrmaFcMsgType type, uint16_t credit_cnt,
   urma_status_t ret = urma_post_jfs_wr(fc_jfs->jfs, &wr, &bad_wr);
   if (ret != URMA_SUCCESS) {
     XLOG(WARN) << "[URMA-FC] post_jfs_wr failed: " << ret;
-    pool->releaseFcJfs(fc_jfs_index);
+    shared_->releaseFcSq();
     delete tx_ctx;
     return false;
   }
 
-  // 武装 FC TX JFCE 中断(SQ 可能满,等待 CQE 唤醒)
-  pool->rearmAllFcTxFce();
-
+  // SDD-URMA-EVBEXCLUSIVE-001: 无需 rearmAllFcTxFce(I3:TX JFC 独立收割)
   return true;
 }
 
@@ -1878,7 +1718,6 @@ bool UrmaAsyncSocket::sendFcMsg(UrmaFcMsgType type, uint16_t credit_cnt,
 
 void UrmaAsyncSocket::onRxBuf(std::unique_ptr<IOBuf> data) noexcept {
   bytes_received_ += data->length();
-//              << " pending=" << has_pending_read_;
   if (has_pending_read_) {
     RxBufItem item;
     item.is_control = false;
@@ -1940,8 +1779,7 @@ void UrmaAsyncSocket::closeNow() {
     tcp_delegate_->shutdownWrite();
     return;
   }
-  // Phase 2: poll JFS 池的 TX CQE 回收资源
-  pollTx();
+  // TX CQE 由 CqHandler 事件驱动收割,pollTx 已删除
 }
 
 void UrmaAsyncSocket::shutdownWriteNow() {
@@ -1962,15 +1800,26 @@ void UrmaAsyncSocket::destroyUrmaResources() {
   resources_destroyed_ = true;
   DCHECK(!evb_ || evb_->inRunningEventBaseThread());
 
-  // 任务 B(H-2):第一步路由摘表 + sock 置空(置空协议)——
-  // erase 后跨线程转发不再增长;entry->sock 置空使在途转发 lambda
-  // (恒在本 EVB 队列执行,与置空天然串行)判空跳过,socket 可安全析构
-  if (auto* pool = UrmaJfrPool::get()) {
-    pool->unregisterSocket(socket_id_.toUint64());
-    pool->unregisterFcSocket(socket_id_.toUint64());
+  // SDD-URMA-EVBEXCLUSIVE-001: 路由摘表 + sock 置空(置空协议)
+  if (shared_) {
+    shared_->unregisterSocket(socket_id_.toUint64());
+    shared_->unregisterFcSocket(socket_id_.toUint64());
   }
   if (route_entry_) {
     route_entry_->sock.store(nullptr, std::memory_order_release);
+  }
+  // 任务 E(H-6):取消大包扫描定时器
+  // libevent 2.x event_del 无法撤回已就绪事件:如果 timer 事件已在 active
+  // 队列中,直接 reset() 析构后 vtable 破坏,event_base_loop 处理该事件时
+  // 调用 timeoutExpired() → SIGSEGV。改为:
+  //   1. kill() 设置 alive_=false(原子,timeoutExpired 中短路返回)
+  //   2. runInLoop 延迟 reset()(下一轮 loop 当前事件已处理完毕,event_del 安全)
+  if (scan_timer_) {
+    scan_timer_->kill();
+    auto timer = std::move(scan_timer_);
+    if (evb_) {
+      evb_->runInLoop([timer = std::move(timer)] {});
+    }
   }
   // 任务 D(H-5):记账解绑(dec 绑定在路由注销处,与注册同点幂等对称;
   // 与 res_.remote_jetty 解耦,降级连接天然对称)
@@ -1979,10 +1828,6 @@ void UrmaAsyncSocket::destroyUrmaResources() {
     if (shared_) {
       shared_->decActiveConn();
     }
-  }
-  // 任务 E(H-6):取消大包扫描定时器(不可取消的 runAfterDelay 已替换)
-  if (scan_timer_) {
-    scan_timer_.reset();
   }
 
   // 任务 F(H-7):关闭路径回调补全 —— reset 前遍历 pending 队列,

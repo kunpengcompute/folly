@@ -11,32 +11,13 @@
 
 #ifdef FOLLY_HAVE_URMA
 
-#include <folly/io/async/urma/UrmaAsyncSocket.h>
-#include <folly/io/async/urma/UrmaSharedJfr.h>
+#include <folly/io/async/urma/UrmaTransportContext.h>
 
 namespace folly {
 
 void UrmaCqHandler::handlerReady(uint16_t /*events*/) noexcept {
-  if (is_tx_) {
-    // TX 池模式: shared_ 指向 UrmaSharedJfr,收割 TX CQE(含 READ CQE)
-    if (shared_) {
-      if (is_fc_tx_) {
-        shared_->harvestFcTx(jfs_index_);  // FC JFS TX CQE 收割
-      } else {
-        shared_->harvestTx(jfs_index_);  // IO JFS TX CQE 收割
-      }
-    } else if (socket_) {
-      socket_->pollTx();
-      socket_->retryWrite();
-    }
-  } else if (is_fc_) {
-    if (shared_) {
-      shared_->pollFcAndDispatch();
-    }
-  } else {
-    if (shared_) {
-      shared_->pollAndDispatch();
-    }
+  if (ctx_) {
+    ctx_->pollAndDispatch(is_fc_, is_tx_);
   }
 }
 

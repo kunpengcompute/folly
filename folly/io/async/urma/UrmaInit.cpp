@@ -14,13 +14,13 @@
 #include <folly/io/IOBuf.h>
 #include <folly/memory/IoBufPool.h>
 #include <folly/logging/xlog.h>
-#include <folly/io/async/urma/UrmaJfsPool.h>
-#include <folly/io/async/urma/UrmaJfrPool.h>
 
 #include <cstring>
 #include <cstdlib>
 #include <mutex>
+#include <shared_mutex>
 #include <thread>
+#include <unordered_map>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -246,6 +246,14 @@ void UrmaInit::init(const UrmaConfig& config) {
   }
   s_config = config;
 
+  // 环境变量覆盖:FC 流控 / 保序重排(默认均关,close_loop 场景净开销)
+  if (const char* e = getenv("URMA_FC_ENABLE")) {
+    s_config.fc_enable = (e[0] == '1');
+  }
+  if (const char* e = getenv("URMA_RX_REORDER")) {
+    s_config.rx_reorder_enable = (e[0] == '1');
+  }
+
   // 1. URMA 库初始化
   urma_init_attr_t init_attr = {};
   urma_status_t status = urma_init(&init_attr);
@@ -292,6 +300,16 @@ void UrmaInit::init(const UrmaConfig& config) {
   s_config.validateAndClamp(dev_attr.dev_cap, 0, 0);
   s_max_jfs_sge = dev_attr.dev_cap.max_jfs_sge > 0 ? dev_attr.dev_cap.max_jfs_sge : 6;
   s_max_jfs_inline_len = dev_attr.dev_cap.max_jfs_inline_len > 0 ? dev_attr.dev_cap.max_jfs_inline_len : 8;
+  XLOG(INFO) << "UrmaInit: device cap: max_jfs_depth=" << dev_attr.dev_cap.max_jfs_depth
+             << " max_jfr_depth=" << dev_attr.dev_cap.max_jfr_depth
+             << " max_jfc_depth=" << dev_attr.dev_cap.max_jfc_depth
+             << " max_jfs_sge=" << static_cast<unsigned>(dev_attr.dev_cap.max_jfs_sge)
+             << " max_jfs_inline_len=" << dev_attr.dev_cap.max_jfs_inline_len;
+  XLOG(INFO) << "UrmaInit: config after clamp: rx_depth=" << s_config.rx_depth
+             << " tx_depth=" << s_config.tx_depth
+             << " fc_rx_depth=" << s_config.fc_rx_depth
+             << " fc_tx_depth=" << s_config.fc_tx_depth
+             << " pool_size=" << s_config.pool_size;
 
   // 4. EID 发现(参照 brpc urma_get_eid_list)
   uint32_t eid_cnt = 0;
@@ -326,43 +344,15 @@ void UrmaInit::init(const UrmaConfig& config) {
     return;
   }
 
-  // 7. JFS 池(进程级共享,设计 §4)
-  // 创建 io_jfs_count 个 IO JFS + fc_jfs_count 个 FC JFS
-  // 替代 per-连接 JFS,所有 UrmaAsyncSocket 共享
-  auto* jfs_pool = new UrmaJfsPool();
-  if (!jfs_pool->init(s_ctx, s_config, s_max_jfs_sge, s_max_jfs_inline_len)) {
-    XLOG(ERR) << "UrmaInit: JFS pool init failed, URMA disabled";
-    delete jfs_pool;
-    finiMrPool();
-    urma_delete_context(s_ctx);
-    s_ctx = nullptr;
-    urma_uninit();
-    return;
-  }
+  // SDD-URMA-EVBEXCLUSIVE-001: JFS/JFR 池已移除
+  // 四件套由 UrmaTransportContext::getOrCreate 在首连接时惰性创建(I4)
+  // 无需在此处创建进程级池
 
   // 8. 启用 IOBuf block headroom 预留(DPDK rte_mbuf 风格)
   // 必须在 setIoBufBlockAllocFree 之前设置,使后续所有 block 分配都预留 headroom
   g_urma_headroom.store(kUrmaHeadroom, std::memory_order_release);
 
-  // 9. JFR 池(进程级共享,设计 §3)
-  // 创建 io_jfr_count 个 IO JFR + fc_jfr_count 个 FC JFR
-  // 替代 per-EventBase JFR,所有 UrmaSharedJfr 共享
-  auto* jfr_pool = new UrmaJfrPool();
-  if (!jfr_pool->init(s_ctx, s_config)) {
-    XLOG(ERR) << "UrmaInit: JFR pool init failed, URMA disabled";
-    delete jfr_pool;
-    if (UrmaJfsPool* jpool = UrmaJfsPool::get()) {
-      jpool->fini();
-      delete jpool;
-    }
-    finiMrPool();
-    urma_delete_context(s_ctx);
-    s_ctx = nullptr;
-    urma_uninit();
-    return;
-  }
-
-  // 10. folly IOBuf 注入(三步)
+  // 9. folly IOBuf 注入(三步)
   setIoBufBlockAllocFree(
       &UrmaInit::poolAlloc, &UrmaInit::poolFree, &UrmaInit::poolBufSize);
   IOBuf::enableMemoryPool();
@@ -374,10 +364,7 @@ void UrmaInit::init(const UrmaConfig& config) {
              << " max_sge=" << static_cast<unsigned>(s_max_jfs_sge)
              << " headroom=" << kUrmaHeadroom
              << " pool_size=" << s_mmap_size
-             << " io_jfs=" << s_config.io_jfs_count
-             << " fc_jfs=" << s_config.fc_jfs_count
-             << " io_jfr=" << s_config.io_jfr_count
-             << " fc_jfr=" << s_config.fc_jfr_count;
+             << " (per-EVB exclusive four-piece set, SDD-URMA-EVBEXCLUSIVE-001)";
 }
 
 void UrmaInit::fini() {
@@ -390,22 +377,80 @@ void UrmaInit::fini() {
   g_urma_headroom.store(0, std::memory_order_release);
   setIoBufBlockAllocFree(&std::malloc, &std::free, nullptr);
 
-  // JFS 池清理(仅清空列表,不删除硬件资源)
-  if (UrmaJfsPool* pool = UrmaJfsPool::get()) {
-    pool->fini();
-    delete pool;
-  }
-
-  // JFR 池清理(仅清空列表,不删除硬件资源)
-  if (UrmaJfrPool* pool = UrmaJfrPool::get()) {
-    pool->fini();
-    delete pool;
-  }
+  // SDD-URMA-EVBEXCLUSIVE-001: JFS/JFR 池已移除
+  // 四件套由 UrmaTransportContext 析构在 EVB 销毁时清理
+  // 硬件资源依赖进程退出时内核回收(同 brpc 策略)
 
   // MR 内存池(mmap + register_seg)不 munmap——依赖进程退出时内核回收
   // URMA context 不删除——同上
   urma_uninit();
   s_inited_ = false;
+}
+
+// ── SDD-URMA-EVBEXCLUSIVE-001: 进程级远端 import cache(从 UrmaJfrPool 迁移) ──
+static std::shared_mutex s_import_mtx;
+static std::unordered_map<uint32_t, urma_target_jetty_t*> s_remote_jfr_cache;
+static std::unordered_map<uint64_t, urma_target_seg_t*> s_remote_seg_cache;
+
+urma_target_jetty_t* UrmaInit::importRemoteJfr(const urma_rjfr_t* rjfr) {
+  if (!rjfr) return nullptr;
+  urma_context_t* ctx = getContext();
+  if (!ctx) return nullptr;
+
+  {
+    std::shared_lock<std::shared_mutex> lock(s_import_mtx);
+    auto it = s_remote_jfr_cache.find(rjfr->jfr_id.id);
+    if (it != s_remote_jfr_cache.end()) {
+      return it->second;
+    }
+  }
+  std::unique_lock<std::shared_mutex> lock(s_import_mtx);
+  auto it = s_remote_jfr_cache.find(rjfr->jfr_id.id);
+  if (it != s_remote_jfr_cache.end()) {
+    return it->second;
+  }
+  urma_token_t token = {};
+  urma_target_jetty_t* handle = urma_import_jfr(ctx,
+      const_cast<urma_rjfr_t*>(rjfr), &token);
+  if (!handle) {
+    XLOG(ERR) << "[URMA] importRemoteJfr failed: jfr_id=" << rjfr->jfr_id.id;
+    return nullptr;
+  }
+  s_remote_jfr_cache.emplace(rjfr->jfr_id.id, handle);
+  XLOG(DBG) << "[URMA] importRemoteJfr: jfr_id=" << rjfr->jfr_id.id
+            << " (cached, total=" << s_remote_jfr_cache.size() << ")";
+  return handle;
+}
+
+urma_target_seg_t* UrmaInit::importRemoteSeg(const urma_seg_t* seg) {
+  if (!seg) return nullptr;
+  urma_context_t* ctx = getContext();
+  if (!ctx) return nullptr;
+
+  uint64_t key = seg->ubva.va;
+  {
+    std::shared_lock<std::shared_mutex> lock(s_import_mtx);
+    auto it = s_remote_seg_cache.find(key);
+    if (it != s_remote_seg_cache.end()) {
+      return it->second;
+    }
+  }
+  std::unique_lock<std::shared_mutex> lock(s_import_mtx);
+  auto it = s_remote_seg_cache.find(key);
+  if (it != s_remote_seg_cache.end()) {
+    return it->second;
+  }
+  urma_token_t token = {};
+  urma_import_seg_flag_t flag = {};
+  urma_target_seg_t* handle = urma_import_seg(ctx,
+      const_cast<urma_seg_t*>(seg), &token, 0, flag);
+  if (!handle) {
+    XLOG(ERR) << "[URMA] importRemoteSeg failed: va=" << key;
+    return nullptr;
+  }
+  s_remote_seg_cache.emplace(key, handle);
+  XLOG(DBG) << "[URMA] importRemoteSeg cached: va=" << key;
+  return handle;
 }
 
 } // namespace folly
