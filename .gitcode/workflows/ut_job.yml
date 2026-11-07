@@ -1,0 +1,51 @@
+name: UT Job
+
+on:
+  workflow_call:
+    inputs:
+      runs_on_flavor:
+        required: true
+        type: string
+      docker_img:
+        required: true
+        type: string
+      pr_id:
+        required: true
+        type: string
+      branch:            # PR 目标分支（供 ut_ci.sh 的 codeBranch 用）
+        required: true
+        type: string
+      default_branch:    # 默认分支（脚本回退 checkout 用）
+        required: true
+        type: string
+
+jobs:
+  JOB_Compile:
+    name: UT
+    select: selected_by_default
+    runs-on: [ self-hosted, os=euler, arch=arm64, type=pr, "${{ inputs.runs_on_flavor }}" ]
+    container:
+      image: ${{ inputs.docker_img }}
+    steps:
+      - name: fast_checkout
+        identifier: fast_checkout
+        uses: checkout
+        with:
+          # fork PR 预合并引用会被安全拦截，需显式放行（pwn request 防护）
+          allow-unsafe-pr-checkout: true
+          ref: refs/merge-requests/${{ inputs.pr_id }}/merge
+      - name: checkout_default_scripts   # 脚本缺失回退：预合入代码缺脚本时改用基分支副本
+        uses: checkout
+        with:
+          ref: ${{ inputs.default_branch }}
+          path: base-scripts
+      - name: ut
+        run: |-
+          export codeBranch="${{ inputs.branch }}"
+          if [ -f .gitcode/scripts/ut_ci.sh ]; then
+            sh .gitcode/scripts/ut_ci.sh                # 预合入代码自带 → 用它
+          elif [ -f base-scripts/.gitcode/scripts/ut_ci.sh ]; then
+            sh base-scripts/.gitcode/scripts/ut_ci.sh   # 缺失 → 用基分支副本
+          else
+            echo "ERROR: ut_ci.sh 在预合入代码和基分支中均不存在"; exit 1
+          fi
