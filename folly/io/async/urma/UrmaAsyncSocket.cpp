@@ -439,6 +439,17 @@ void UrmaAsyncSocket::writeChain(WriteCallback* cb, std::unique_ptr<IOBuf>&& cha
     return;
   }
 
+  // 跨线程转发:确保 sendChain 在 EVB 线程执行(I2 same-thread 不变量)
+  // close_loop 回调通过 .via(cpu_executor) 在 CPU 线程调用 writeChain,
+  // 非属主 EVB 线程访问 per-EVB UrmaTransportContext 四件套(sq_inflight 等非原子变量)会 data race
+  if (evb_ && !evb_->inRunningEventBaseThread()) {
+    evb_->runInEventBaseThread(
+        [this, cb, chain = std::move(chain), flags]() mutable {
+          writeChain(cb, std::move(chain), flags);
+        });
+    return;
+  }
+
   // 本 writeChain 的完成组:组内所有大包收到对端 FREE 后 writeSuccess 只回调一次
   auto group = std::make_shared<BigMsgGroup>();
   // 大包完成计数移交 sendBigMsgByRead(按 1M 分片块逐块计数,离散块独立 PULL)
@@ -920,11 +931,10 @@ void UrmaAsyncSocket::onPullMemFrags(uint16_t msg_id,
   }
 }
 
-// ── 接收侧段表 READ(免拷贝)──
-// 每段独立 (src=发送方块 va/len, dst=本地 poolAlloc 块),WR 链一次 post;
-// 每 WR complete_enable=1(实测:仅尾完成时链不执行),仅尾 WR 携带 ctx
-// → 非尾 CQE user_ctx=0 被 harvest 跳过,尾 CQE 触发 onReadComplete;
-// 段块链 DMA 直写,零拷贝交付 read_queue_。
+// ── 接收侧段表 READ(免拷贝,WR 链串行 post)──
+// 每段 (src=发送方块 va/len, dst=本地 poolAlloc 块),wr.next 串联成链;
+// 仅尾 WR complete_enable + user_ctx,硬件作为单一事务串行执行,
+// 尾 WR CQE 触发 onReadComplete。段块链 DMA 直写,零拷贝交付 read_queue_。
 bool UrmaAsyncSocket::startRead(uint16_t msg_id, const PullMemFragDesc* frags,
                                 uint16_t frag_count,
                                 uint32_t total_size) noexcept {
@@ -978,7 +988,7 @@ bool UrmaAsyncSocket::startRead(uint16_t msg_id, const PullMemFragDesc* frags,
     return false;
   }
   if (!shared_->tryAcquireIoSq()) {
-    XLOG(WARN) << "startRead: SQ full";
+    XLOG(WARN) << "startRead: SQ full, msg_id=" << msg_id;
     return false;
   }
 
@@ -1001,61 +1011,58 @@ bool UrmaAsyncSocket::startRead(uint16_t msg_id, const PullMemFragDesc* frags,
     }
   }
 
+  // 构建 WR 链:wr.next 串联 N 段,仅尾 WR complete_enable + user_ctx
+  auto wr_chain = std::make_unique<urma_jfs_wr_t[]>(frag_count);
+  for (uint16_t i = 0; i < frag_count; ++i) {
+    wr_chain[i] = {};
+    wr_chain[i].opcode = URMA_OPC_READ;
+    wr_chain[i].tjetty = res_.remote_jetty;
+    wr_chain[i].rw.src.sge = &(*sge_arr)[2 * size_t(i)];
+    wr_chain[i].rw.src.num_sge = 1;
+    wr_chain[i].rw.dst.sge = &(*sge_arr)[2 * size_t(i) + 1];
+    wr_chain[i].rw.dst.num_sge = 1;
+    wr_chain[i].next = (i + 1 < frag_count) ? &wr_chain[i + 1] : nullptr;
+  }
+  // 仅尾 WR 产生 CQE + 携带 user_ctx
+  wr_chain[frag_count - 1].flag.bs.complete_enable = 1;
+
   auto* tx_ctx = new TxCompletionCtx();
   tx_ctx->type = TxCompletionCtx::MSG_READ;
   tx_ctx->socket_id = socket_id_.toUint64();
   tx_ctx->jfs_index = 0;
   tx_ctx->msg_id = msg_id;
   tx_ctx->sge_arr = sge_arr;
-  // READ 的 dst 段块链通过 pending_read_buf_ 持有
-
-  // WR 链:每段一个单 src/dst READ(urma rw 单 SGE 限制)
   tx_ctx->read_wr_cnt = frag_count;
-  tx_ctx->read_wr_chain.reset(new urma_jfs_wr_t[frag_count]);
-  for (uint16_t i = 0; i < frag_count; ++i) {
-    urma_jfs_wr_t& wr = tx_ctx->read_wr_chain[i];
-    wr = {};
-    wr.opcode = URMA_OPC_READ;
-    wr.tjetty = res_.remote_jetty;
-    wr.flag.bs.complete_enable = 1;
-    wr.rw.src.sge = &(*sge_arr)[2 * size_t(i)];
-    wr.rw.src.num_sge = 1;
-    wr.rw.dst.sge = &(*sge_arr)[2 * size_t(i) + 1];
-    wr.rw.dst.num_sge = 1;
-    wr.next = (i + 1 < frag_count)
-                  ? &tx_ctx->read_wr_chain[i + 1]
-                  : nullptr;
-    wr.user_ctx = (i + 1 == frag_count)
-                      ? reinterpret_cast<uint64_t>(tx_ctx)
-                      : 0;  // 仅尾 WR 携带 ctx
+
+  // 尾 WR 携带 user_ctx(必须在 move 前设置)
+  wr_chain[frag_count - 1].user_ctx = reinterpret_cast<uint64_t>(tx_ctx);
+  tx_ctx->read_wr_chain = std::move(wr_chain);
+  wr_chain = nullptr;  // 已 move
+
+  urma_jfs_wr_t* bad_wr = nullptr;
+  urma_status_t st = urma_post_jfs_wr(io_jfs->jfs, tx_ctx->read_wr_chain.get(), &bad_wr);
+  if (st != URMA_SUCCESS) {
+    XLOG(ERR) << "startRead: post WR chain failed status=" << st
+              << " msg_id=" << msg_id;
+    shared_->releaseIoSq();
+    delete tx_ctx;
+    return false;
   }
 
+  // 赋值在途状态
   pending_read_msg_id_ = msg_id;
   pending_read_buf_ = std::move(head);
   pending_read_sge_ = sge_arr;
 
-  urma_jfs_wr_t* bad_wr = nullptr;
-  urma_status_t st =
-      urma_post_jfs_wr(io_jfs->jfs, &tx_ctx->read_wr_chain[0], &bad_wr);
-  if (st != URMA_SUCCESS) {
-    shared_->releaseIoSq();
-    delete tx_ctx;
-    pending_read_sge_.reset();
-    pending_read_buf_.reset();
-    XLOG(ERR) << "startRead: post READ chain failed, status=" << st
-              << " msg_id=" << msg_id << " frags=" << frag_count;
-    return false;
-  }
   XLOG(DBG) << "[URMA] startRead posted msg_id=" << msg_id
-            << " total=" << total_size
-            << " frags=" << frag_count;
+            << " frags=" << frag_count << " total=" << total_size;
   // TX CQE 由 CqHandler 事件驱动收割,pollTx 已删除,无需调度
   return true;
 }
 
 void UrmaAsyncSocket::onReadComplete() noexcept {
   if (!pending_read_buf_) {
-    XLOG(WARN) << "[URMA] readDone: pending_read_buf_ already reset, skip";
+    XLOG(WARN) << "[URMA] readDone: buf already reset, skip";
     return;
   }
   XLOG(DBG) << "[URMA] onReadComplete msg_id=" << pending_read_msg_id_
@@ -1091,26 +1098,26 @@ void UrmaAsyncSocket::onReadFailed(urma_status_t status) noexcept {
   pending_read_buf_.reset();
   pending_read_sge_.reset();
   has_pending_read_ = false;
+
   drainRxPendingQueue();
 }
 
 void UrmaAsyncSocket::handleRemoteReadCqe(uint16_t msg_id,
                                           urma_status_t status) noexcept {
-  if (msg_id != pending_read_msg_id_) {
-    XLOG(DBG) << "[URMA] handleRemoteReadCqe MISMATCH: msg_id=" << msg_id
-             << " expected=" << pending_read_msg_id_ << " status=" << status;
-    return;  // 不是当前等待的 READ,忽略(重复或过时 CQE)
+  // WR 链串行 post:仅尾 WR 产生 1 个 CQE,直接 finalize
+  if (pending_read_msg_id_ != msg_id) {
+    XLOG(DBG) << "[URMA] handleRemoteReadCqe MISMATCH/stale: msg_id=" << msg_id
+             << " status=" << status;
+    return;  // 过时 CQE
   }
+
   // 任务 B(H-2):本方法只在属主 EVB 线程执行 ——
   // 跨 EVB 收割的 READ CQE 由 UrmaJfrPool::dispatchReadCqe 统一转发
   // (同 EVB 短路同步调用,零延迟;跨 EVB 经 runInLoop 转发,不变量 I1)。
-  // 旧"全量 runInLoop"方案因高 QPS 事件队列积压曾回退为同步直调
-  // (见 dispatchReadCqe 选型:同 EVB 短路 + 跨 EVB 转发兼得两者);
-  // 串行化保证同时只有 1 个 READ 在途,同步调用不会递归超过 1 层。
-  if (status == URMA_CR_SUCCESS) {
-    onReadComplete();
-  } else {
+  if (status != URMA_CR_SUCCESS) {
     onReadFailed(status);
+  } else {
+    onReadComplete();
   }
 }
 

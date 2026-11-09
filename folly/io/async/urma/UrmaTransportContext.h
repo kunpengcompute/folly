@@ -307,6 +307,23 @@ class UrmaTransportContext {
 
   // per-EVB registry
   static EventBaseLocal<std::unique_ptr<UrmaTransportContext>>& registry();
+
+  // ── 诊断打点(CQE 收割事件链路追踪)──
+  // 目的:定位 1K payload P50=100ms 固定延迟根因
+  struct DiagCounters {
+    std::atomic<uint64_t> handler_ready_io_rx{0};   // handlerReady 调用次数(IO RX)
+    std::atomic<uint64_t> handler_ready_io_tx{0};   // handlerReady 调用次数(IO TX)
+    std::atomic<uint64_t> wait_le0_skip{0};         // wait_jfc<=0 提前退出次数
+    std::atomic<uint64_t> poll_rx_cqe{0};           // RX CQE 收割总数
+    std::atomic<uint64_t> poll_tx_cqe{0};           // TX CQE 收割总数
+    std::atomic<uint64_t> rearm_fail{0};            // rearm 失败次数
+    std::atomic<uint64_t> repost_timer_tick{0};     // RepostTimer 触发次数
+    std::atomic<uint64_t> last_log_us{0};           // 上次打点日志时间
+    uint64_t last_handler_rx{0};                     // 上次打点时 handler_ready_io_rx 快照
+    uint64_t last_handler_tx{0};                     // 上次打点时 handler_ready_io_tx 快照
+  };
+  DiagCounters diag_{};
+  void logDiagIfDue() noexcept;
 };
 
 } // namespace folly

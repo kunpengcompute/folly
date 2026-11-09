@@ -27,6 +27,33 @@ namespace folly {
 // 任务 C:回收栈单轮重投批量上限
 static constexpr uint32_t kRepostBatchMax = 64;
 
+// 诊断打点:单调微秒时钟
+static uint64_t diag_now_us() noexcept {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return static_cast<uint64_t>(ts.tv_sec) * 1000000ULL + ts.tv_nsec / 1000;
+}
+
+void UrmaTransportContext::logDiagIfDue() noexcept {
+  uint64_t now = diag_now_us();
+  uint64_t last = diag_.last_log_us.load(std::memory_order_relaxed);
+  if (now - last < 1000000) return;  // 1s 最多打一次
+  if (!diag_.last_log_us.compare_exchange_strong(last, now)) return;
+  uint64_t rx_ready = diag_.handler_ready_io_rx.load(std::memory_order_relaxed);
+  uint64_t tx_ready = diag_.handler_ready_io_tx.load(std::memory_order_relaxed);
+  uint64_t d_rx = rx_ready - diag_.last_handler_rx;
+  uint64_t d_tx = tx_ready - diag_.last_handler_tx;
+  diag_.last_handler_rx = rx_ready;
+  diag_.last_handler_tx = tx_ready;
+  XLOG(INFO) << "[URMA-DIAG] io_rx_ready=" << rx_ready << "(+" << d_rx << ")"
+             << " io_tx_ready=" << tx_ready << "(+" << d_tx << ")"
+             << " wait_le0=" << diag_.wait_le0_skip.load()
+             << " rx_cqe=" << diag_.poll_rx_cqe.load()
+             << " tx_cqe=" << diag_.poll_tx_cqe.load()
+             << " rearm_fail=" << diag_.rearm_fail.load()
+             << " repost_tick=" << diag_.repost_timer_tick.load();
+}
+
 // ── per-EVB registry ──
 
 EventBaseLocal<std::unique_ptr<UrmaTransportContext>>&
@@ -441,6 +468,12 @@ void UrmaTransportContext::pollAndDispatch(bool is_fc, bool is_tx) noexcept {
   // 此窗口期 epoll 可能仍有残留触发)
   if (dormant_.load(std::memory_order_acquire)) return;
 
+  // [DIAG] 记录 handlerReady → pollAndDispatch 入口
+  if (!is_fc) {
+    if (is_tx) diag_.handler_ready_io_tx.fetch_add(1, std::memory_order_relaxed);
+    else       diag_.handler_ready_io_rx.fetch_add(1, std::memory_order_relaxed);
+  }
+
   urma_jfc_t* jfc = nullptr;
   urma_jfce_t* jfce = nullptr;
   if (is_fc) {
@@ -464,11 +497,17 @@ void UrmaTransportContext::pollAndDispatch(bool is_fc, bool is_tx) noexcept {
 
   // ① wait:消费 JFCE 事件通知(epoll 已触发,非阻塞立即返回)
   urma_jfc_t* ev = nullptr;
-  if (urma_wait_jfc(jfce, 1, kWaitNoBlock, &ev) <= 0) {
+  int wait_ret = urma_wait_jfc(jfce, 1, kWaitNoBlock, &ev);
+  if (wait_ret <= 0) {
+    // [DIAG] wait 返回 ≤0,事件被消费或异常,提前退出
+    if (!is_fc) diag_.wait_le0_skip.fetch_add(1, std::memory_order_relaxed);
+    logDiagIfDue();
     return;  // 事件被消费/异常,防御返回
   }
 
   // ② poll:收割(TX/RX 独立 JFC,无需 user_ctx 区分)
+  uint64_t cqe_before_rx = diag_.poll_rx_cqe.load(std::memory_order_relaxed);
+  uint64_t cqe_before_tx = diag_.poll_tx_cqe.load(std::memory_order_relaxed);
   if (is_tx) {
     pollAndDispatchTxOnly(jfc, is_fc);
   } else {
@@ -480,7 +519,11 @@ void UrmaTransportContext::pollAndDispatch(bool is_fc, bool is_tx) noexcept {
   urma_ack_jfc(&jfc, &ack_cnt, 1);
 
   // ④ rearm:重新武装下一次事件通知
-  if (urma_rearm_jfc(jfc, false) != URMA_SUCCESS) return;
+  if (urma_rearm_jfc(jfc, false) != URMA_SUCCESS) {
+    if (!is_fc) diag_.rearm_fail.fetch_add(1, std::memory_order_relaxed);
+    logDiagIfDue();
+    return;
+  }
 
   // ⑤ rearm 窗口期补收割(防漏)
   if (is_tx) {
@@ -490,6 +533,18 @@ void UrmaTransportContext::pollAndDispatch(bool is_fc, bool is_tx) noexcept {
   }
   ack_cnt = 1;
   urma_ack_jfc(&jfc, &ack_cnt, 1);
+
+  // [DIAG] 统计本轮收割的 CQE 数
+  if (!is_fc) {
+    if (is_tx) {
+      uint64_t n = diag_.poll_tx_cqe.load(std::memory_order_relaxed) - cqe_before_tx;
+      (void)n;
+    } else {
+      uint64_t n = diag_.poll_rx_cqe.load(std::memory_order_relaxed) - cqe_before_rx;
+      (void)n;
+    }
+  }
+  logDiagIfDue();
 }
 
 void UrmaTransportContext::pollAndDispatchTxOnly(urma_jfc_t* tx_jfc,
@@ -497,6 +552,7 @@ void UrmaTransportContext::pollAndDispatchTxOnly(urma_jfc_t* tx_jfc,
   urma_cr_t cr[POLL_BATCH_MAX];
   int n;
   while ((n = urma_poll_jfc(tx_jfc, POLL_BATCH_MAX, cr)) > 0) {
+    if (!is_fc) diag_.poll_tx_cqe.fetch_add(n, std::memory_order_relaxed);
     for (int i = 0; i < n; ++i) {
       // TX JFC:所有 CQE 都是 TxCompletionCtx*(无 RX CQE 混入)
       auto* tx_ctx = reinterpret_cast<TxCompletionCtx*>(cr[i].user_ctx);
@@ -538,6 +594,7 @@ void UrmaTransportContext::pollAndDispatchRxOnly(urma_jfc_t* rx_jfc,
   urma_cr_t cr[POLL_BATCH_MAX];
   int n;
   while ((n = urma_poll_jfc(rx_jfc, POLL_BATCH_MAX, cr)) > 0) {
+    if (!is_fc) diag_.poll_rx_cqe.fetch_add(n, std::memory_order_relaxed);
     for (int i = 0; i < n; ++i) {
       // RX JFC:所有 CQE 都是 slot index(无 TX CQE 混入)
       handleRecvCqe(is_fc, cr[i]);
@@ -713,6 +770,22 @@ void UrmaTransportContext::wakeup() noexcept {
 
 // ── RepostTimer ──
 void UrmaTransportContext::RepostTimer::timeoutExpired() noexcept {
+  owner_->diag_.repost_timer_tick.fetch_add(1, std::memory_order_relaxed);
+
+  // [DIAG] 每 10 个 tick(100ms)打一次详细日志
+  // 如果 io_rx_ready 不增长但 repost_tick 持续增长,说明 epoll 事件丢失
+  if (owner_->diag_.repost_timer_tick.load(std::memory_order_relaxed) % 10 == 0) {
+    XLOG(INFO) << "[URMA-DIAG] RepostTimer 100ms checkpoint"
+               << " tick=" << owner_->diag_.repost_timer_tick.load()
+               << " io_rx_ready=" << owner_->diag_.handler_ready_io_rx.load()
+               << " io_tx_ready=" << owner_->diag_.handler_ready_io_tx.load()
+               << " wait_le0=" << owner_->diag_.wait_le0_skip.load()
+               << " rx_cqe=" << owner_->diag_.poll_rx_cqe.load()
+               << " tx_cqe=" << owner_->diag_.poll_tx_cqe.load()
+               << " rearm_fail=" << owner_->diag_.rearm_fail.load();
+  }
+
+  owner_->logDiagIfDue();
   owner_->repostRecycled(&owner_->io_jfr_);
   owner_->checkRxAccounting(&owner_->io_jfr_);
   owner_->repostRecycled(&owner_->fc_jfr_);
