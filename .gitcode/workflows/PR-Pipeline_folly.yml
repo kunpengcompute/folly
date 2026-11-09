@@ -23,6 +23,7 @@ concurrency: # 并发控制
 
 permissions:
   repository: read
+  pr: read
 
 env:
   pr_id: ${{ atomgit.event.pull_request.number }}
