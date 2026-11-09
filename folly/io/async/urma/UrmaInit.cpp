@@ -253,6 +253,9 @@ void UrmaInit::init(const UrmaConfig& config) {
   if (const char* e = getenv("URMA_RX_REORDER")) {
     s_config.rx_reorder_enable = (e[0] == '1');
   }
+  if (const char* e = getenv("URMA_POLL_MODE")) {
+    s_config.poll_mode = (e[0] == '1');
+  }
 
   // 1. URMA 库初始化
   urma_init_attr_t init_attr = {};

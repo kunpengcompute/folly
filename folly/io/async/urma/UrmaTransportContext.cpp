@@ -458,10 +458,13 @@ void UrmaTransportContext::checkRxAccounting(EvbJfr* jfr) noexcept {
 }
 
 // ── 统一收割分派器(任务 B,I3) ──
-// wait→poll→ack→rearm→poll→ack 五步(URMA 官方中断模式)
+// 中断模式(默认): wait→poll→ack→rearm→poll→ack 五步(URMA 官方中断模式)
 // LT 模式(libevent 2.x setEdgeTriggered 静默失败)下必须保留 wait/ack,
 // 否则 JFCE fd 恒可读导致 epoll 空轮询 CPU 100%。
 // 第⑤步二轮 poll 防 rearm 窗口期 CQE 漏收割。
+//
+// 轮询模式(env URMA_POLL_MODE=1): poll→rearm→poll 三步,跳过 wait/ack。
+// 适用于 JFCE fd 恒可读(LT)场景,利用 epoll LT 持续触发代替 urma_wait_jfc。
 // is_fc: IO/FC 选择; is_tx: TX/RX JFC 选择
 void UrmaTransportContext::pollAndDispatch(bool is_fc, bool is_tx) noexcept {
   // dormant 后跳过(dormant_.store 在 runInLoop 摘除 CqHandler 之前,
@@ -494,6 +497,30 @@ void UrmaTransportContext::pollAndDispatch(bool is_fc, bool is_tx) noexcept {
     }
   }
   if (!jfc || !jfce) return;
+
+  // ── 轮询模式:poll→rearm→poll,跳过 wait/ack ──
+  if (UrmaInit::getConfig().poll_mode) {
+    // ① poll:收割
+    if (is_tx) {
+      pollAndDispatchTxOnly(jfc, is_fc);
+    } else {
+      pollAndDispatchRxOnly(jfc, is_fc);
+    }
+    // ② rearm:重新武装下一次事件通知(部分驱动 rearm 清 fd 可读状态)
+    if (urma_rearm_jfc(jfc, false) != URMA_SUCCESS) {
+      if (!is_fc) diag_.rearm_fail.fetch_add(1, std::memory_order_relaxed);
+    }
+    // ③ rearm 窗口期补收割(防漏)
+    if (is_tx) {
+      pollAndDispatchTxOnly(jfc, is_fc);
+    } else {
+      pollAndDispatchRxOnly(jfc, is_fc);
+    }
+    logDiagIfDue();
+    return;
+  }
+
+  // ── 中断模式:wait→poll→ack→rearm→poll→ack 五步 ──
 
   // ① wait:消费 JFCE 事件通知(epoll 已触发,非阻塞立即返回)
   urma_jfc_t* ev = nullptr;

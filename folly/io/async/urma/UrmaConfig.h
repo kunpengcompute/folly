@@ -81,6 +81,13 @@ struct UrmaConfig {
   bool rx_reorder_enable = false;
   uint32_t reorder_timeout_ms = 200;  // 空洞等待上限
 
+  // ── 轮询模式(默认关:中断模式 wait→poll→ack→rearm→poll) ──
+  // env URMA_POLL_MODE=1 启用:pollAndDispatch 只调用 poll→rearm→poll,
+  // 跳过 wait/ack。适用于 libevent LT 模式下 JFCE fd 恒可读场景,
+  // 利用 epoll LT 持续触发 handlerReady 代替 urma_wait_jfc 事件消费。
+  // 注意:轮询模式下 rearm 仍保留(部分驱动 rearm 清 fd 可读状态需要)。
+  bool poll_mode = false;
+
   // ── 握手 ──
   uint32_t handshake_timeout_ms = 30000;  // URMA 握手超时(毫秒)
 
