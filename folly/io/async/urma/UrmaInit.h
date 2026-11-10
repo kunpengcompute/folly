@@ -54,10 +54,13 @@ class UrmaInit {
   static void poolFree(void* ptr);
   static size_t poolBufSize(size_t requested_size);
 
-  // SDD-URMA-EVBEXCLUSIVE-001: 进程级远端 import cache(从 UrmaJfrPool 迁移)
-  // 同一远端 JFR/seg 只 import 一次,double-checked locking 共享
+  // 远端 import(per-连接独占,无 cache)
+  // 设计 §10.5.5: import_seg per-连接独占。每次 import 直接调用 urma API,
+  // 连接断开时调用 unimport 释放驱动资源。
   static urma_target_jetty_t* importRemoteJfr(const urma_rjfr_t* rjfr);
+  static void unimportRemoteJfr(urma_target_jetty_t* handle);
   static urma_target_seg_t* importRemoteSeg(const urma_seg_t* seg);
+  static void unimportRemoteSeg(urma_target_seg_t* handle);
 
  private:
   UrmaInit() = delete;

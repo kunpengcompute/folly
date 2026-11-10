@@ -18,9 +18,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <mutex>
-#include <shared_mutex>
 #include <thread>
-#include <unordered_map>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -390,28 +388,18 @@ void UrmaInit::fini() {
   s_inited_ = false;
 }
 
-// ── SDD-URMA-EVBEXCLUSIVE-001: 进程级远端 import cache(从 UrmaJfrPool 迁移) ──
-static std::shared_mutex s_import_mtx;
-static std::unordered_map<uint32_t, urma_target_jetty_t*> s_remote_jfr_cache;
-static std::unordered_map<uint64_t, urma_target_seg_t*> s_remote_seg_cache;
+// ── SDD-URMA-EVBEXCLUSIVE-001: 远端 import(per-连接独占,无 cache) ──
+// 设计 §10.5.5: import_seg per-连接独占,不缓存。
+// 修复:移除按 VA 做 key 的 cache —— client 重连后内核可能复用 MR pool VA,
+// cache HIT 返回旧连接的失效句柄 → READ WR ACK 超时(status=9)。
+// JFR id 每次递增,cache 从不 HIT 只泄漏,一并移除。
+// 每次 import 直接调用 urma API,destroy 时调用 unimport 释放。
 
 urma_target_jetty_t* UrmaInit::importRemoteJfr(const urma_rjfr_t* rjfr) {
   if (!rjfr) return nullptr;
   urma_context_t* ctx = getContext();
   if (!ctx) return nullptr;
 
-  {
-    std::shared_lock<std::shared_mutex> lock(s_import_mtx);
-    auto it = s_remote_jfr_cache.find(rjfr->jfr_id.id);
-    if (it != s_remote_jfr_cache.end()) {
-      return it->second;
-    }
-  }
-  std::unique_lock<std::shared_mutex> lock(s_import_mtx);
-  auto it = s_remote_jfr_cache.find(rjfr->jfr_id.id);
-  if (it != s_remote_jfr_cache.end()) {
-    return it->second;
-  }
   urma_token_t token = {};
   urma_target_jetty_t* handle = urma_import_jfr(ctx,
       const_cast<urma_rjfr_t*>(rjfr), &token);
@@ -419,10 +407,12 @@ urma_target_jetty_t* UrmaInit::importRemoteJfr(const urma_rjfr_t* rjfr) {
     XLOG(ERR) << "[URMA] importRemoteJfr failed: jfr_id=" << rjfr->jfr_id.id;
     return nullptr;
   }
-  s_remote_jfr_cache.emplace(rjfr->jfr_id.id, handle);
-  XLOG(DBG) << "[URMA] importRemoteJfr: jfr_id=" << rjfr->jfr_id.id
-            << " (cached, total=" << s_remote_jfr_cache.size() << ")";
   return handle;
+}
+
+void UrmaInit::unimportRemoteJfr(urma_target_jetty_t* handle) {
+  if (!handle) return;
+  urma_unimport_jfr(handle);
 }
 
 urma_target_seg_t* UrmaInit::importRemoteSeg(const urma_seg_t* seg) {
@@ -430,30 +420,20 @@ urma_target_seg_t* UrmaInit::importRemoteSeg(const urma_seg_t* seg) {
   urma_context_t* ctx = getContext();
   if (!ctx) return nullptr;
 
-  uint64_t key = seg->ubva.va;
-  {
-    std::shared_lock<std::shared_mutex> lock(s_import_mtx);
-    auto it = s_remote_seg_cache.find(key);
-    if (it != s_remote_seg_cache.end()) {
-      return it->second;
-    }
-  }
-  std::unique_lock<std::shared_mutex> lock(s_import_mtx);
-  auto it = s_remote_seg_cache.find(key);
-  if (it != s_remote_seg_cache.end()) {
-    return it->second;
-  }
   urma_token_t token = {};
   urma_import_seg_flag_t flag = {};
   urma_target_seg_t* handle = urma_import_seg(ctx,
       const_cast<urma_seg_t*>(seg), &token, 0, flag);
   if (!handle) {
-    XLOG(ERR) << "[URMA] importRemoteSeg failed: va=" << key;
+    XLOG(ERR) << "[URMA] importRemoteSeg failed: va=0x" << std::hex << seg->ubva.va;
     return nullptr;
   }
-  s_remote_seg_cache.emplace(key, handle);
-  XLOG(DBG) << "[URMA] importRemoteSeg cached: va=" << key;
   return handle;
+}
+
+void UrmaInit::unimportRemoteSeg(urma_target_seg_t* handle) {
+  if (!handle) return;
+  urma_unimport_seg(handle);
 }
 
 } // namespace folly

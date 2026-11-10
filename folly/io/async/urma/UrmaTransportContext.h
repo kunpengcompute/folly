@@ -288,17 +288,27 @@ class UrmaTransportContext {
   uint32_t active_conn_count_{0};        // same-thread(I2)
   std::atomic<bool> dormant_{false};
 
-  // 回收栈重投兜底定时器(10ms 自续)
+  // 回收栈重投兜底定时器(可配置间隔,默认 10ms 自续)
+  // 间隔可通过环境变量 URMA_REPOST_TIMER_MS 覆盖(决定性实验用)
+  static uint32_t repostTimerIntervalMs() {
+    if (kRepostIntervalMs == 0) {
+      const char* env = getenv("URMA_REPOST_TIMER_MS");
+      kRepostIntervalMs = env ? static_cast<uint32_t>(atoi(env)) : 10u;
+      if (kRepostIntervalMs == 0) kRepostIntervalMs = 10u;
+    }
+    return kRepostIntervalMs;
+  }
   class RepostTimer : private AsyncTimeout {
    public:
     explicit RepostTimer(UrmaTransportContext* owner)
         : AsyncTimeout(owner->evb_), owner_(owner) {}
-    void arm() { scheduleTimeout(10); }
+    void arm() { scheduleTimeout(repostTimerIntervalMs()); }
     void disarm() { cancelTimeout(); }
    private:
     void timeoutExpired() noexcept override;
     UrmaTransportContext* owner_;
   };
+  static std::atomic<uint32_t> kRepostIntervalMs;
   std::unique_ptr<RepostTimer> repost_timer_;
 
   // 路由表(进程级,16 分片)
@@ -309,11 +319,14 @@ class UrmaTransportContext {
   static EventBaseLocal<std::unique_ptr<UrmaTransportContext>>& registry();
 
   // ── 诊断打点(CQE 收割事件链路追踪)──
-  // 目的:定位 1K payload P50=100ms 固定延迟根因
+  // 目的:定位中断模式下 1K payload P99~4300us 根因
   struct DiagCounters {
     std::atomic<uint64_t> handler_ready_io_rx{0};   // handlerReady 调用次数(IO RX)
     std::atomic<uint64_t> handler_ready_io_tx{0};   // handlerReady 调用次数(IO TX)
     std::atomic<uint64_t> wait_le0_skip{0};         // wait_jfc<=0 提前退出次数
+    std::atomic<uint64_t> wait_ret_0{0};            // wait_jfc 返回 0(无事件)
+    std::atomic<uint64_t> wait_ret_1{0};            // wait_jfc 返回 1(有事件)
+    std::atomic<uint64_t> wait_ret_neg{0};          // wait_jfc 返回 -1(错误)
     std::atomic<uint64_t> poll_rx_cqe{0};           // RX CQE 收割总数
     std::atomic<uint64_t> poll_tx_cqe{0};           // TX CQE 收割总数
     std::atomic<uint64_t> rearm_fail{0};            // rearm 失败次数
@@ -321,6 +334,32 @@ class UrmaTransportContext {
     std::atomic<uint64_t> last_log_us{0};           // 上次打点日志时间
     uint64_t last_handler_rx{0};                     // 上次打点时 handler_ready_io_rx 快照
     uint64_t last_handler_tx{0};                     // 上次打点时 handler_ready_io_tx 快照
+
+    // ── 精细打点:handlerReady 间隔直方图(IO RX)──
+    // 间隔桶:<100us / 100-500us / 500-1000us / 1-2ms / 2-4ms / 4-5ms / 5-10ms / >10ms
+    std::atomic<uint64_t> rx_interval_lt100{0};
+    std::atomic<uint64_t> rx_interval_100_500{0};
+    std::atomic<uint64_t> rx_interval_500_1k{0};
+    std::atomic<uint64_t> rx_interval_1k_2k{0};
+    std::atomic<uint64_t> rx_interval_2k_4k{0};
+    std::atomic<uint64_t> rx_interval_4k_5k{0};
+    std::atomic<uint64_t> rx_interval_5k_10k{0};
+    std::atomic<uint64_t> rx_interval_gt10k{0};
+    uint64_t last_rx_handler_us{0};  // 上次 IO RX handlerReady 时间戳(us)
+
+    // ── 精细打点:poll CQE 数量分布(每次 poll 返回的 CQE 数)──
+    std::atomic<uint64_t> poll_rx_0{0};  // poll 返回 0 个 CQE
+    std::atomic<uint64_t> poll_rx_1{0};  // poll 返回 1 个 CQE
+    std::atomic<uint64_t> poll_rx_2_4{0};
+    std::atomic<uint64_t> poll_rx_5_10{0};
+    std::atomic<uint64_t> poll_rx_gt10{0};
+
+    // ── 精细打点:pollAndDispatch 单次耗时(IO RX)──
+    std::atomic<uint64_t> pad_rx_lt10{0};     // <10us
+    std::atomic<uint64_t> pad_rx_10_50{0};    // 10-50us
+    std::atomic<uint64_t> pad_rx_50_100{0};   // 50-100us
+    std::atomic<uint64_t> pad_rx_100_500{0};  // 100-500us
+    std::atomic<uint64_t> pad_rx_gt500{0};    // >500us
   };
   DiagCounters diag_{};
   void logDiagIfDue() noexcept;

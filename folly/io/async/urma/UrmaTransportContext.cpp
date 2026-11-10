@@ -27,6 +27,9 @@ namespace folly {
 // 任务 C:回收栈单轮重投批量上限
 static constexpr uint32_t kRepostBatchMax = 64;
 
+// RepostTimer 间隔(环境变量 URMA_REPOST_TIMER_MS 覆盖,默认 10ms)
+std::atomic<uint32_t> UrmaTransportContext::kRepostIntervalMs{0};
+
 // 诊断打点:单调微秒时钟
 static uint64_t diag_now_us() noexcept {
   struct timespec ts;
@@ -48,10 +51,34 @@ void UrmaTransportContext::logDiagIfDue() noexcept {
   XLOG(INFO) << "[URMA-DIAG] io_rx_ready=" << rx_ready << "(+" << d_rx << ")"
              << " io_tx_ready=" << tx_ready << "(+" << d_tx << ")"
              << " wait_le0=" << diag_.wait_le0_skip.load()
+             << " wait_ret[0/1/neg]=" << diag_.wait_ret_0.load()
+             << "/" << diag_.wait_ret_1.load()
+             << "/" << diag_.wait_ret_neg.load()
              << " rx_cqe=" << diag_.poll_rx_cqe.load()
              << " tx_cqe=" << diag_.poll_tx_cqe.load()
              << " rearm_fail=" << diag_.rearm_fail.load()
-             << " repost_tick=" << diag_.repost_timer_tick.load();
+             << " repost_tick=" << diag_.repost_timer_tick.load()
+             << " | rx_interval[<100/100-500/500-1k/1-2k/2-4k/4-5k/5-10k/>10k us]="
+             << diag_.rx_interval_lt100.load() << "/"
+             << diag_.rx_interval_100_500.load() << "/"
+             << diag_.rx_interval_500_1k.load() << "/"
+             << diag_.rx_interval_1k_2k.load() << "/"
+             << diag_.rx_interval_2k_4k.load() << "/"
+             << diag_.rx_interval_4k_5k.load() << "/"
+             << diag_.rx_interval_5k_10k.load() << "/"
+             << diag_.rx_interval_gt10k.load()
+             << " | poll_rx[0/1/2-4/5-10/>10]="
+             << diag_.poll_rx_0.load() << "/"
+             << diag_.poll_rx_1.load() << "/"
+             << diag_.poll_rx_2_4.load() << "/"
+             << diag_.poll_rx_5_10.load() << "/"
+             << diag_.poll_rx_gt10.load()
+             << " | pad_rx[<10/10-50/50-100/100-500/>500 us]="
+             << diag_.pad_rx_lt10.load() << "/"
+             << diag_.pad_rx_10_50.load() << "/"
+             << diag_.pad_rx_50_100.load() << "/"
+             << diag_.pad_rx_100_500.load() << "/"
+             << diag_.pad_rx_gt500.load();
 }
 
 // ── per-EVB registry ──
@@ -471,6 +498,26 @@ void UrmaTransportContext::pollAndDispatch(bool is_fc, bool is_tx) noexcept {
   // 此窗口期 epoll 可能仍有残留触发)
   if (dormant_.load(std::memory_order_acquire)) return;
 
+  // [DIAG] 精细打点:IO RX 路径记录 handlerReady 间隔 + 总耗时
+  uint64_t pad_start_us = 0;
+  bool diag_io_rx = (!is_fc && !is_tx);
+  if (diag_io_rx) {
+    pad_start_us = diag_now_us();
+    uint64_t last_us = diag_.last_rx_handler_us;
+    if (last_us > 0) {
+      uint64_t interval = pad_start_us - last_us;
+      if      (interval < 100)   diag_.rx_interval_lt100.fetch_add(1, std::memory_order_relaxed);
+      else if (interval < 500)   diag_.rx_interval_100_500.fetch_add(1, std::memory_order_relaxed);
+      else if (interval < 1000)  diag_.rx_interval_500_1k.fetch_add(1, std::memory_order_relaxed);
+      else if (interval < 2000)  diag_.rx_interval_1k_2k.fetch_add(1, std::memory_order_relaxed);
+      else if (interval < 4000)  diag_.rx_interval_2k_4k.fetch_add(1, std::memory_order_relaxed);
+      else if (interval < 5000)  diag_.rx_interval_4k_5k.fetch_add(1, std::memory_order_relaxed);
+      else if (interval < 10000) diag_.rx_interval_5k_10k.fetch_add(1, std::memory_order_relaxed);
+      else                       diag_.rx_interval_gt10k.fetch_add(1, std::memory_order_relaxed);
+    }
+    diag_.last_rx_handler_us = pad_start_us;
+  }
+
   // [DIAG] 记录 handlerReady → pollAndDispatch 入口
   if (!is_fc) {
     if (is_tx) diag_.handler_ready_io_tx.fetch_add(1, std::memory_order_relaxed);
@@ -526,11 +573,17 @@ void UrmaTransportContext::pollAndDispatch(bool is_fc, bool is_tx) noexcept {
   urma_jfc_t* ev = nullptr;
   int wait_ret = urma_wait_jfc(jfce, 1, kWaitNoBlock, &ev);
   if (wait_ret <= 0) {
-    // [DIAG] wait 返回 ≤0,事件被消费或异常,提前退出
-    if (!is_fc) diag_.wait_le0_skip.fetch_add(1, std::memory_order_relaxed);
+    // [DIAG] wait 返回值计数
+    if (!is_fc) {
+      if (wait_ret == 0) diag_.wait_ret_0.fetch_add(1, std::memory_order_relaxed);
+      else               diag_.wait_ret_neg.fetch_add(1, std::memory_order_relaxed);
+      diag_.wait_le0_skip.fetch_add(1, std::memory_order_relaxed);
+    }
     logDiagIfDue();
     return;  // 事件被消费/异常,防御返回
   }
+  // [DIAG] wait 返回 1(有事件)
+  if (!is_fc) diag_.wait_ret_1.fetch_add(1, std::memory_order_relaxed);
 
   // ② poll:收割(TX/RX 独立 JFC,无需 user_ctx 区分)
   uint64_t cqe_before_rx = diag_.poll_rx_cqe.load(std::memory_order_relaxed);
@@ -539,6 +592,17 @@ void UrmaTransportContext::pollAndDispatch(bool is_fc, bool is_tx) noexcept {
     pollAndDispatchTxOnly(jfc, is_fc);
   } else {
     pollAndDispatchRxOnly(jfc, is_fc);
+  }
+
+  // [DIAG] IO RX:poll CQE 数量分布
+  if (diag_io_rx) {
+    uint64_t cqe_after = diag_.poll_rx_cqe.load(std::memory_order_relaxed);
+    uint64_t n = cqe_after - cqe_before_rx;
+    if      (n == 0)  diag_.poll_rx_0.fetch_add(1, std::memory_order_relaxed);
+    else if (n == 1)  diag_.poll_rx_1.fetch_add(1, std::memory_order_relaxed);
+    else if (n <= 4)  diag_.poll_rx_2_4.fetch_add(1, std::memory_order_relaxed);
+    else if (n <= 10) diag_.poll_rx_5_10.fetch_add(1, std::memory_order_relaxed);
+    else              diag_.poll_rx_gt10.fetch_add(1, std::memory_order_relaxed);
   }
 
   // ③ ack:确认收割(清通知计数)
@@ -570,6 +634,16 @@ void UrmaTransportContext::pollAndDispatch(bool is_fc, bool is_tx) noexcept {
       uint64_t n = diag_.poll_rx_cqe.load(std::memory_order_relaxed) - cqe_before_rx;
       (void)n;
     }
+  }
+
+  // [DIAG] IO RX:pollAndDispatch 总耗时
+  if (diag_io_rx) {
+    uint64_t elapsed = diag_now_us() - pad_start_us;
+    if      (elapsed < 10)  diag_.pad_rx_lt10.fetch_add(1, std::memory_order_relaxed);
+    else if (elapsed < 50)  diag_.pad_rx_10_50.fetch_add(1, std::memory_order_relaxed);
+    else if (elapsed < 100) diag_.pad_rx_50_100.fetch_add(1, std::memory_order_relaxed);
+    else if (elapsed < 500) diag_.pad_rx_100_500.fetch_add(1, std::memory_order_relaxed);
+    else                    diag_.pad_rx_gt500.fetch_add(1, std::memory_order_relaxed);
   }
   logDiagIfDue();
 }
@@ -817,7 +891,7 @@ void UrmaTransportContext::RepostTimer::timeoutExpired() noexcept {
   owner_->checkRxAccounting(&owner_->io_jfr_);
   owner_->repostRecycled(&owner_->fc_jfr_);
   owner_->checkRxAccounting(&owner_->fc_jfr_);
-  scheduleTimeout(10);
+  scheduleTimeout(repostTimerIntervalMs());
 }
 
 // ── 构造/析构 ──
