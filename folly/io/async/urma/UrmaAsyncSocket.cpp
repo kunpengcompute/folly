@@ -405,6 +405,599 @@ void UrmaAsyncSocket::Impl::finishHandshake() {
   }
   if (!handshakeWrites && receivedAck && ackSent) state = State::Open;
 }
+void UrmaAsyncSocket::Impl::enqueue(WriteCallback* cb, bool& accepted,
+                                    std::unique_ptr<IOBuf> data,
+                                    WriteFlags flags,
+                                    std::vector<size_t> records) {
+  if (!live() || writeShutdown || closeAfterWrites ||
+      flags != WriteFlags::NONE) {
+    if (cb) cb->writeErr(0, closedError);
+    return;
+  }
+  const size_t bytes = data ? data->computeChainDataLength() : 0;
+  if (bytes > config.max_pending_bytes - pendingBytes) {
+    size_t completed = 0;
+    for (const auto& write : writes) completed += write->completed;
+    throw std::runtime_error("URMA write queue budget exceeded: pending=" +
+        std::to_string(pendingBytes) + " incoming=" + std::to_string(bytes) +
+        " completed=" + std::to_string(completed) +
+        " writes=" + std::to_string(writes.size()));
+  }
+  if (!records.empty()) {
+    if (records.size() > config.max_pending_records)
+      throw std::runtime_error("URMA record metadata limit exceeded");
+    size_t left = bytes;
+    for (size_t n : records) {
+      if (n > left) throw std::runtime_error("record lengths exceed input");
+      left -= n;
+    }
+    if (left) throw std::runtime_error("record lengths do not cover input");
+  }
+  if (writes.size() >= config.max_pending_records)
+    throw std::runtime_error("URMA write count limit exceeded");
+  size_t capacity = 0, nodes = 0;
+  if (data) {
+    auto* b = data.get();
+    do {
+      if (b->capacity() >
+              config.max_pending_bytes - queuedCapacity - capacity ||
+          ++nodes > config.max_pending_records)
+        throw std::runtime_error(
+            "URMA retained write capacity/node limit exceeded");
+      capacity += b->capacity();
+      b = b->next();
+    } while (b != data.get());
+  }
+  auto write = std::make_shared<Write>();
+  // Include conservative metadata charges as well as retained input capacity;
+  // the owner charge lives until the last WR/export holder drops the write.
+  write->metadataCharge = nodes * 256 + sizeof(Write);
+  if (connection)
+    write->charge.reserve(connection->pendingBudget(),
+                          capacity + write->metadataCharge);
+  write->callback = cb;
+  write->data = std::move(data);
+  write->bytes = bytes;
+  write->capacity = capacity;
+  writes.push_back(write);
+  accepted = true;
+  pendingBytes += bytes;
+  queuedCapacity += capacity;
+  if (writes.size() == 1) lastProgress = Clock::now();
+  notifyBuffer();
+  progress();
+}
+bool UrmaAsyncSocket::Impl::sendData(const std::shared_ptr<Write>& write,
+                                     const IOBuf* node, size_t offset,
+                                     size_t bytes) {
+  if (!connection->canPost(Operation::Data)) return false;
+  auto work = std::make_unique<TxCompletionCtx>();
+  work->route = shared_from_this();
+  work->completion = write;
+  work->imported = peer->value;
+  work->sequence = nextRecord;
+  work->bytes = bytes;
+  work->writeOffset = write->submitted;
+  const uint8_t* address = node->data() + offset;
+  uint8_t* header = nullptr;
+  size_t sges = 1;
+  const bool inPlace = !node->isChained() && !node->isSharedOne() &&
+                       offset == 0 && bytes == write->bytes &&
+                       node->headroom() >= kHeaderBytes;
+  if (inPlace)
+    work->localPin =
+        UrmaInit::lookupSegment(address - kHeaderBytes, bytes + kHeaderBytes);
+  if (work->localPin) {
+    header = const_cast<uint8_t*>(address) - kHeaderBytes;
+    work->sges[0].addr = reinterpret_cast<uint64_t>(header);
+    work->sges[0].len = bytes + kHeaderBytes;
+    work->sges[0].tseg = work->localPin.segment();
+  } else {
+    // Coalesce registered ranges up to one WR's SGE budget. Leave the rest
+    // for the next record instead of copying an otherwise registered chain.
+    size_t left = bytes, used = 1, at = offset;
+    const IOBuf* part = node;
+    while (left && used < config.max_send_sge) {
+      const size_t n = std::min(left, part->length() - at);
+      if (n) {
+        auto pin = UrmaInit::lookupSegment(part->data() + at, n);
+        if (!pin) break;
+        work->sges[used].addr = reinterpret_cast<uint64_t>(part->data() + at);
+        work->sges[used].len = n;
+        work->sges[used].tseg = pin.segment();
+        if (used == 1)
+          work->localPin = std::move(pin);
+        else
+          work->extraPins[used - 2] = std::move(pin);
+        ++used;
+        left -= n;
+      }
+      part = part->next();
+      at = 0;
+    }
+    if (left && used == config.max_send_sge && used > 1) {
+      bytes -= left;
+      work->bytes = bytes;
+      left = 0;
+    }
+    // Ordinary memory still needs a registered copy. With only one SGE,
+    // the independent header leaves no room for a direct payload either.
+    const bool direct = left == 0;
+    if (!direct) {
+      work->localPin = {};
+      work->extraPins = {};
+    }
+    work->control = UrmaInit::poolAlloc(kHeaderBytes + (direct ? 0 : bytes),
+                                        UrmaMemoryPurpose::Tx);
+    if (!work->control) {
+      sendRetry = Clock::now() + std::chrono::milliseconds(5);
+      return false;
+    }
+    header = static_cast<uint8_t*>(work->control.data());
+    work->headerPin =
+        UrmaInit::lookupSegment(header, kHeaderBytes + (direct ? 0 : bytes));
+    if (!work->headerPin) {
+      sendRetry = Clock::now() + std::chrono::milliseconds(5);
+      return false;
+    }
+    work->sges[0].addr = reinterpret_cast<uint64_t>(header);
+    work->sges[0].len = kHeaderBytes + (direct ? 0 : bytes);
+    work->sges[0].tseg = work->control.segment();
+    if (direct) {
+      sges = used;
+    } else {
+      size_t copied = 0;
+      part = node;
+      at = offset;
+      while (copied < bytes) {
+        const size_t n = std::min(bytes - copied, part->length() - at);
+        if (n)
+          std::memcpy(header + kHeaderBytes + copied, part->data() + at, n);
+        copied += n;
+        part = part->next();
+        at = 0;
+      }
+    }
+  }
+  const bool direct = bool(work->localPin);
+  encodeHeader(header,
+               {Message::Data, peer->value->hello.socketId, nextRecord});
+  work->wr.opcode = URMA_OPC_SEND;
+  work->wr.tjetty = peer->value->io;
+  work->wr.send.src = {work->sges.data(), static_cast<uint32_t>(sges)};
+  ++write->sends;
+  const auto result = submit(work);
+  if (result == PostResult::Full || result == PostResult::Unaccepted) {
+    --write->sends;
+    return false;
+  }
+  write->submitted += bytes;
+  ++nextRecord;
+  if (result == PostResult::Unknown) {
+    failed("DATA submission acceptance unknown");
+    return false;
+  }
+  rawWritten += bytes + kHeaderBytes;
+  ++copyStats.send_wr_submitted;
+  copyStats.send_sges += sges;
+  if (direct)
+    copyStats.direct_send_bytes += bytes;
+  else
+    copyStats.copied_send_bytes += bytes;
+  return true;
+}
+bool UrmaAsyncSocket::Impl::sendPull(const std::shared_ptr<Write>& write,
+                                     const IOBuf* node, size_t offset,
+                                     size_t bytes) {
+  if (!connection->canPost(Operation::Pull)) return false;
+  if (sources.size() >= config.offer_window) return false;
+  auto exported = UrmaInit::holdReadExport(node->data() + offset, bytes);
+  if (!exported || exported.segment() != initial.segment()) return false;
+  auto control = UrmaInit::poolAlloc(kPullBytes, UrmaMemoryPurpose::Control);
+  if (!control) {
+    sendRetry = Clock::now() + std::chrono::milliseconds(5);
+    return false;
+  }
+  auto source = std::make_shared<Source>();
+  source->write = write;
+  source->exported = std::move(exported);
+  source->bytes = bytes;
+  source->writeOffset = write->submitted;
+  auto work = std::make_unique<TxCompletionCtx>();
+  work->kind = Operation::Pull;
+  work->route = shared_from_this();
+  work->completion = source;
+  work->imported = peer->value;
+  work->sequence = nextRecord;
+  work->bytes = bytes;
+  work->control = std::move(control);
+  auto* p = static_cast<uint8_t*>(work->control.data());
+  encodeHeader(p, {Message::Pull, peer->value->hello.socketId, nextRecord});
+  putInteger(p + 24, bytes, 4);
+  putInteger(p + 28, 0, 4);
+  work->localPin = UrmaInit::lookupSegment(p, kPullBytes);
+  if (!work->localPin) {
+    sendRetry = Clock::now() + std::chrono::milliseconds(5);
+    return false;
+  }
+  work->sges[0].addr = reinterpret_cast<uint64_t>(p);
+  work->sges[0].len = kPullBytes;
+  work->sges[0].tseg = work->control.segment();
+  work->wr.opcode = URMA_OPC_SEND_IMM;
+  work->wr.tjetty = peer->value->io;
+  work->wr.send.src = {work->sges.data(), 1};
+  work->wr.send.imm_data = reinterpret_cast<uint64_t>(node->data() + offset);
+  sources.emplace(nextRecord, source);
+  ++write->sends;
+  ++write->frees;
+  const auto result = submit(work);
+  if (result == PostResult::Full || result == PostResult::Unaccepted) {
+    --write->sends;
+    --write->frees;
+    sources.erase(nextRecord);
+    return false;
+  }
+  write->submitted += bytes;
+  ++nextRecord;
+  if (result == PostResult::Unknown) {
+    failed("PULL submission acceptance unknown");
+    return false;
+  }
+  rawWritten += kPullBytes;
+  copyStats.direct_read_source_bytes += bytes;
+  ++copyStats.offers_submitted;
+  copyStats.max_offers_inflight =
+      std::max<uint64_t>(copyStats.max_offers_inflight, sources.size());
+  return true;
+}
+void UrmaAsyncSocket::Impl::sendProgress() {
+  if (Clock::now() < sendRetry) return;
+  size_t submitted = 0;
+  for (const auto& write : writes) {
+    while (write->submitted < write->bytes && submitted < 32 &&
+           state == State::Open) {
+      if (!nextRecord || nextRecord == UINT64_MAX)
+        throw std::runtime_error("URMA record sequence exhausted");
+      size_t skip = write->submitted - write->released;
+      auto* node = write->data.get();
+      while (skip >= node->length()) {
+        skip -= node->length();
+        node = node->next();
+      }
+      size_t bytes = node->length() - skip;
+      const auto& hello = peer->value->hello;
+      const size_t readLimit = std::min<size_t>(
+          {bytes, hello.maxRead, UrmaInit::getMaxReadSize(), UINT32_MAX});
+      const bool read =
+          config.enable_read && hello.read &&
+          readLimit > config.read_threshold && !node->isSharedOne() &&
+          UrmaInit::ownsPoolBuffer(*node) &&
+          contains(initial.segment()->seg,
+                   reinterpret_cast<uint64_t>(node->data() + skip), readLimit);
+      bool ok;
+      if (read)
+        ok = sendPull(write, node, skip, readLimit);
+      else {
+        const size_t limit =
+            std::min(config.buffer_size, hello.bufferSize) - kHeaderBytes;
+        bytes = std::min(bytes, limit);
+        const auto* next = node->next();
+        while (bytes < limit && bytes < write->bytes - write->submitted &&
+               next != write->data.get()) {
+          const auto candidate = std::min<size_t>(
+              {next->length(), hello.maxRead, UrmaInit::getMaxReadSize()});
+          if (config.enable_read && hello.read &&
+              candidate > config.read_threshold && !next->isSharedOne() &&
+              UrmaInit::ownsPoolBuffer(*next) &&
+              contains(initial.segment()->seg,
+                       reinterpret_cast<uint64_t>(next->data()), candidate))
+            break;
+          bytes += std::min(limit - bytes, next->length());
+          next = next->next();
+        }
+        ok = sendData(write, node, skip, bytes);
+      }
+      if (!ok) return;
+      ++submitted;
+    }
+    if (write->submitted != write->bytes) break;
+  }
+  if (submitted == 32) {
+    connection->wait(shared_from_this());
+    connection->wake();
+  }
+}
+void UrmaAsyncSocket::Impl::finishSource(uint64_t sequence) {
+  auto it = sources.find(sequence);
+  if (it == sources.end() || !it->second->freed || !it->second->localDone)
+    return;
+  const auto source = it->second;
+  --source->write->frees;
+  source->write->completed += source->bytes;
+  bytesWritten += source->bytes;
+  sources.erase(it);  // source pin is dropped only after both completions
+  reclaimWrite(source->write);
+  lastProgress = Clock::now();
+}
+void UrmaAsyncSocket::Impl::reclaimWrite(const std::shared_ptr<Write>& write) {
+  if (state != State::Open) return;
+  // Every submitted range still accessed by DMA or a remote READ has an
+  // existing holder. The earliest such range bounds the reclaimable prefix;
+  // later CQEs cannot release data before an earlier RNR or pending FREE.
+  size_t prefix = write->submitted;
+  for (const auto& flight : connection->io().flights)
+    if (flight && flight->kind == Operation::Data &&
+        flight->completion.get() == write.get())
+      prefix = std::min(prefix, flight->writeOffset);
+  for (const auto& item : sources)
+    if (item.second->write == write)
+      prefix = std::min(prefix, item.second->writeOffset);
+  if (prefix <= write->released) return;
+  size_t n = prefix - write->released;
+  pendingBytes -= n;
+  write->released = prefix;
+  while (write->data) {
+    if (write->data->length() > n) {
+      write->data->trimStart(n);
+      break;
+    }
+    n -= write->data->length();
+    const size_t capacity = write->data->capacity();
+    auto old = std::move(write->data);
+    write->data = old->pop();
+    write->capacity -= capacity;
+    queuedCapacity -= capacity;
+    write->charge.release(capacity);
+  }
+  notifyBuffer();
+}
+void UrmaAsyncSocket::Impl::finishWrites() {
+  while (!writes.empty()) {
+    const auto write = writes.front();
+    if (write->sends || write->frees ||
+        (state == State::Open && write->submitted != write->bytes))
+      break;
+    auto* callback = write->callback;
+    const bool call = !write->callbackDone;
+    write->callbackDone = true;
+    write->callback = nullptr;
+    pendingBytes -= write->bytes - write->released;
+    queuedCapacity -= write->capacity;
+    writes.pop_front();
+    notifyBuffer();
+    if (call && callback) callback->writeSuccess();
+    if (!callbacksAllowed()) break;
+  }
+}
+
+void UrmaAsyncSocket::Impl::onRecord(const RecordHeader& h,
+                                     std::unique_ptr<IOBuf> data,
+                                     uint64_t address) {
+  if (h.type == Message::Free) {
+    auto it = sources.find(h.sequence);
+    if (it != sources.end() && !it->second->freed) {
+      it->second->freed = true;
+      finishSource(h.sequence);
+    }
+    rawRead += kHeaderBytes;
+    return;
+  }
+  if (h.sequence < nextReceive || received.count(h.sequence)) {
+    if (h.type == Message::Pull)
+      throw std::runtime_error("duplicate PULL is not a new READ");
+    return;
+  }
+  if (received.size() >= config.max_pending_records)
+    throw std::runtime_error("URMA reorder queue limit exceeded");
+  auto entry = std::make_shared<Received>();
+  entry->charge.reserve(connection->pendingBudget(), sizeof(Received) + 256);
+  entry->sequence = h.sequence;
+  if (h.type == Message::Pull) {
+    const size_t length = getInteger(data->data(), 4);
+    if (!haveHello || !peer)
+      throw std::runtime_error("PULL arrived before peer HELLO");
+    if (!config.enable_read || !peer->value->hello.read)
+      throw std::runtime_error("PULL without negotiated READ support");
+    if (length > UrmaInit::getMaxReadSize() ||
+        length > config.max_pending_bytes ||
+        !contains(peer->value->hello.segment, address, length))
+      throw std::runtime_error(
+          "PULL outside negotiated HELLO segment/READ limit");
+    entry->address = address;
+    entry->length = length;
+    entry->pull = true;
+    rawRead += kPullBytes;
+  } else {
+    entry->length = data->length();
+    bytesRead += data->length();
+    rawRead += data->length() + kHeaderBytes;
+    entry->data = std::move(data);
+  }
+  if (received.empty()) receiveSince = Clock::now();
+  received.emplace(h.sequence, std::move(entry));
+  if (h.type == Message::Pull) {
+    ++receiveOffers;
+    copyStats.max_receive_offers =
+        std::max<uint64_t>(copyStats.max_receive_offers, receiveOffers);
+  }
+}
+void UrmaAsyncSocket::Impl::receiveProgress() {
+  if (Clock::now() < receiveRetry) return;
+  for (size_t count = 0; state == State::Open && count < 32; ++count) {
+    auto it = received.find(nextReceive);
+    if (it == received.end()) return;
+    auto entry = it->second;
+    if (!entry->pull) {
+      reads.append(std::move(entry->data));
+      received.erase(it);
+      ++nextReceive;
+      receiveSince = Clock::now();
+      continue;
+    }
+    if (readActive || !connection->canPost(Operation::Read)) return;
+    // READ progress has independent storage/retained accounting from DATA.
+    const size_t capacity = UrmaInit::poolBufSize(entry->length);
+    const auto connectionHeld =
+        readBudget->retained.load(std::memory_order_acquire);
+    const auto ownerHeld =
+        connection->readBudget()->retained.load(std::memory_order_acquire);
+    if (!capacity || connectionHeld > readBudget->limit ||
+        capacity > readBudget->limit - connectionHeld ||
+        ownerHeld > connection->readBudget()->limit ||
+        capacity > connection->readBudget()->limit - ownerHeld)
+      return;
+    // Throttle failed multi-resource attempts. Releasing a partial reservation
+    // itself emits a pool wake, which must not turn a shortage into a busy
+    // loop.
+    receiveRetry = Clock::now() + std::chrono::milliseconds(5);
+    auto target =
+        UrmaInit::poolAlloc(entry->length, UrmaMemoryPurpose::ReadTarget);
+    if (!target) return;
+    auto control =
+        UrmaInit::poolAlloc(kHeaderBytes, UrmaMemoryPurpose::ReadControl);
+    if (!control) return;
+    auto reply = std::make_shared<FreeReply>();
+    reply->sequence = entry->sequence;
+    reply->storage = std::move(control);
+    encodeHeader(static_cast<uint8_t*>(reply->storage.data()),
+                 {Message::Free, peer->value->hello.socketId, entry->sequence});
+    auto work = std::make_unique<TxCompletionCtx>();
+    work->kind = Operation::Read;
+    work->route = shared_from_this();
+    work->completion = entry;
+    work->imported = peer->value;
+    work->sequence = entry->sequence;
+    work->bytes = entry->length;
+    auto lease = std::make_unique<RxStorageLease>();
+    lease->block = std::move(target);
+    lease->wakeup = connection->signal();
+    lease->dma = UrmaInit::lookupSegment(lease->block.data(), entry->length);
+    if (!lease->dma) return;
+    lease->connectionBudget = readBudget;
+    lease->ownerBudget = connection->readBudget();
+    readBudget->retained.fetch_add(capacity, std::memory_order_acq_rel);
+    connection->readBudget()->retained.fetch_add(capacity,
+                                             std::memory_order_acq_rel);
+    lease->accounted = true;
+    work->destination = std::move(lease);
+    work->sges[0].addr =
+        reinterpret_cast<uint64_t>(work->destination->block.data());
+    work->sges[0].len = entry->length;
+    work->sges[0].tseg = work->destination->block.segment();
+    work->remote.addr = entry->address;
+    work->remote.len = entry->length;
+    work->remote.tseg = peer->value->segment;
+    work->wr.opcode = URMA_OPC_READ;
+    work->wr.tjetty = peer->value->io;
+    work->wr.rw.src = {&work->remote, 1};
+    work->wr.rw.dst = {work->sges.data(), 1};
+    // Reserve FREE state and storage before submitting READ, not on CQE.
+    freeReplies.push_back(reply);
+    entry->reply = reply;
+    readActive = true;
+    const auto result = submit(work);
+    if (result == PostResult::Full || result == PostResult::Unaccepted) {
+      readActive = false;
+      entry->reply.reset();
+      freeReplies.pop_back();
+      return;
+    }
+    if (result == PostResult::Unknown) {
+      failed("READ acceptance unknown");
+      return;
+    }
+    receiveRetry = {};
+    ++copyStats.read_wr_submitted;
+    ++copyStats.read_submit_calls;
+    copyStats.max_read_inflight = 1;
+    return;
+  }
+  if (received.count(nextReceive)) {
+    connection->wait(shared_from_this());
+    connection->wake();
+  }
+}
+void UrmaAsyncSocket::Impl::freeProgress() {
+  for (size_t n = 0; n < 8 && !freeReplies.empty(); ++n) {
+    auto reply = freeReplies.front();
+    if (!reply->ready || !connection->canPost(Operation::Free)) return;
+    auto work = std::make_unique<TxCompletionCtx>();
+    work->kind = Operation::Free;
+    work->route = shared_from_this();
+    work->completion = reply;
+    work->imported = peer->value;
+    work->sequence = reply->sequence;
+    work->control = reply->storage;
+    work->localPin =
+        UrmaInit::lookupSegment(work->control.data(), kHeaderBytes);
+    if (!work->localPin) return;
+    work->sges[0].addr = reinterpret_cast<uint64_t>(work->control.data());
+    work->sges[0].len = kHeaderBytes;
+    work->sges[0].tseg = work->control.segment();
+    work->wr.opcode = URMA_OPC_SEND_IMM;
+    work->wr.tjetty = peer->value->io;
+    work->wr.send.imm_data = 0;
+    work->wr.send.src = {work->sges.data(), 1};
+    const auto result = submit(work);
+    if (result == PostResult::Full || result == PostResult::Unaccepted) return;
+    freeReplies.pop_front();
+    if (result == PostResult::Unknown) {
+      failed("FREE acceptance unknown");
+      return;
+    }
+    rawWritten += kHeaderBytes;
+  }
+}
+void UrmaAsyncSocket::Impl::onTx(TxCompletionCtx& work, bool success) {
+  if (!activeWr) throw std::runtime_error("WR completion count underflow");
+  --activeWr;
+  if (work.kind == Operation::Data) {
+    lastProgress = Clock::now();
+    auto write = std::static_pointer_cast<Write>(work.completion);
+    --write->sends;
+    if (success) {
+      write->completed += work.bytes;
+      bytesWritten += work.bytes;
+      reclaimWrite(write);
+    }
+  } else if (work.kind == Operation::Pull) {
+    auto source = std::static_pointer_cast<Source>(work.completion);
+    --source->write->sends;
+    source->localDone = true;
+    if (!success && work.remoteRejected) {
+      // A definite RNR means the peer never saw this descriptor. No remote
+      // READ can refer to it; cancel the export without counting sent bytes.
+      --source->write->frees;
+      sources.erase(work.sequence);
+    } else {
+      finishSource(work.sequence);
+    }
+  } else if (work.kind == Operation::Read) {
+    auto entry = std::static_pointer_cast<Received>(work.completion);
+    readActive = false;
+    work.destination->dma = {};
+    if (success) {
+      entry->reply->ready =
+          true;  // fixed original sequence before any callback
+      entry->data =
+          RxStorageLease::take(std::move(work.destination), 0, entry->length);
+      entry->pull = false;
+      --receiveOffers;
+      copyStats.transferred_read_target_bytes += entry->length;
+      bytesRead += entry->length;
+      rawRead += entry->length;
+    }
+  }
+  // Ambiguous failures end local access, not a possible remote READ. Those
+  // sources still need FREE; only a definite rejection cancels the export.
+  if (!success) {
+    failed("URMA WR failed; no success FREE is sent");
+    maybeClosed();
+    return;
+  }
+  connection->wait(shared_from_this());
+  connection->wake();
+}
 void UrmaAsyncSocket::Impl::deliver() {
   if (delivering || state != State::Open) return;
   delivering = true;
