@@ -1,4 +1,5 @@
-/* Copyright (c) Huawei Technologies Co., Ltd. 2026. Licensed under Apache-2.0. */
+/* Copyright (c) Huawei Technologies Co., Ltd. 2026. Licensed under Apache-2.0.
+ */
 #pragma once
 #ifdef FOLLY_HAVE_URMA
 #include <chrono>
@@ -24,8 +25,11 @@ struct CleanupTask {
   std::chrono::steady_clock::time_point retryAt{};
 };
 
+// Explicit init warms the worker. Teardown is always queued: the EventBase
+// must not execute even the first (potentially slow) SDK unregister/unimport.
+void warmCleanupExecutor();
 void cleanupOrDefer(std::unique_ptr<CleanupTask> task) noexcept;
 size_t pendingCleanups();
 bool waitForCleanups(std::chrono::milliseconds timeout);
-} // namespace folly::urma_detail
+}  // namespace folly::urma_detail
 #endif
