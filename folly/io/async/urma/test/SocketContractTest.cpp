@@ -21,6 +21,17 @@
 #include <vector>
 
 #include "TestUtil.h"
+namespace folly::urma_detail {
+class UrmaIoContextTestPeer {
+ public:
+  static void completionReady(UrmaIoContext& owner) {
+    // The synthetic CQE has no kernel fd event. Mark real CQ work explicitly;
+    // a resource/progress wake alone must no longer poll an unrelated CQ.
+    owner.cqPending_ = true;
+    owner.wake();
+  }
+};
+}  // namespace folly::urma_detail
 using namespace folly;
 using namespace folly::urma_detail;
 using namespace folly::urma_test;
@@ -173,26 +184,27 @@ struct Endpoint : AsyncTransport::ReadCallback,
     completions.emplace_back(*this, completions.size());
     socket->writeChain(&completions.back(), std::move(b));
   }
-  void sendParts(bool mixed, size_t count = 3, unsigned value = 19) {
+  void sendParts(bool mixed, size_t count = 3, unsigned value = 19,
+                 size_t partBytes = 300) {
     auto chain = IOBuf::create(0);
     for (size_t i = 0; i < count; ++i) {
-      auto p = UrmaInit::createPoolBuffer(300, UrmaMemoryPurpose::ReadSource);
+      auto p = UrmaInit::createPoolBuffer(partBytes, UrmaMemoryPurpose::ReadSource);
       require(bool(p), "chain test source");
       if (mixed && i == 2) {
-        external.resize(300);
+        external.resize(partBytes);
         p = IOBuf::wrapBuffer(external.data(), external.size());
       } else
-        p->append(300);
-      for (size_t n = 0; n < 300; ++n)
+        p->append(partBytes);
+      for (size_t n = 0; n < partBytes; ++n)
         p->writableData()[n] = pattern(sent + n, value);
-      sent += 300;
+      sent += partBytes;
       chain->prependChain(std::move(p));
       chain->prependChain(
           IOBuf::create(0));  // empty nodes consume no SGE/bytes
     }
     completions.emplace_back(*this, completions.size());
     transport().writeChainWithRecords(&completions.back(), std::move(chain),
-                                      std::vector<size_t>(count, 300));
+                                      std::vector<size_t>(count, partBytes));
   }
   void sendReadThenData() {
     auto chain = IOBuf::create(0);
@@ -241,6 +253,186 @@ void pump(EventBase& evb, F predicate, const char* why) {
     std::this_thread::sleep_for(100us);
   } while (std::chrono::steady_clock::now() < end);
   throw std::runtime_error(why);
+}
+void processPeer(bool server, int incoming, int outgoing,
+                 const UrmaConfig& config) {
+  UrmaInit::init(config);
+  {
+    EventBase evb;
+    Listener accepted(evb);
+    std::shared_ptr<AsyncServerSocket> listener;
+    std::unique_ptr<Endpoint> client;
+    uint16_t port = 0;
+    if (server) {
+      listener = AsyncServerSocket::newSocket(&evb);
+      listener->bind(SocketAddress("127.0.0.1", 0));
+      listener->listen(4);
+      accepted.automaticSend = 32768;
+      listener->addAcceptCallback(&accepted, &evb);
+      listener->startAccepting();
+      SocketAddress address;
+      listener->getAddress(&address);
+      port = address.getPort();
+      require(::write(outgoing, &port, sizeof(port)) == sizeof(port),
+              "peer port pipe write");
+    } else {
+      pollfd p{incoming, POLLIN, 0};
+      require(::poll(&p, 1, 10000) == 1 &&
+                  ::read(incoming, &port, sizeof(port)) == sizeof(port),
+              "peer port pipe read");
+      client = std::make_unique<Endpoint>(
+          UrmaAsyncSocket::newSocket(&evb, SocketAddress("127.0.0.1", port)));
+      client->seed = 73;
+      client->closing = true;
+      client->send(16384, 19, true);  // queued before HELLO completes
+    }
+    Endpoint* peer = client.get();
+    pump(
+        evb,
+        [&] {
+          require(!accepted.error, "process accept failed");
+          if (server) {
+            if (accepted.peers.empty()) return false;
+            peer = accepted.peers[0].get();
+          }
+          require(!peer->errors, "cross-process transport failed");
+          return peer->callbacks == 1 &&
+                 peer->received == (server ? 16384 : 32768);
+        },
+        "cross-process registered READ did not finish");
+    const auto stats = peer->transport().getCopyStats();
+    require(stats.read_wr_submitted == 1 &&
+                stats.direct_read_source_bytes == (server ? 32768 : 16384),
+            "separate processes did not use their independently imported "
+            "initial segments");
+    const char done = 1;
+    require(::write(outgoing, &done, 1) == 1, "peer completion pipe write");
+    require(fcntl(incoming, F_SETFL, O_NONBLOCK) == 0, "pipe nonblocking");
+    pump(
+        evb,
+        [&] {
+          char value;
+          return ::read(incoming, &value, 1) == 1;
+        },
+        "peer completion barrier");
+    peer->socket->closeNow();
+    pump(
+        evb, [] { return UrmaIoContext::activeRoutes() == 0; },
+        "cross-process drain");
+    if (server) stopListener(*listener, accepted, evb);
+    client.reset();
+    accepted.peers.clear();
+  }
+  finalize();
+}
+int separateProcesses(const UrmaConfig& config) {
+  // Fork before UrmaInit creates any SDK context or worker. Each child then
+  // has its own registered VA, HELLO segment and process-local route registry.
+  int a[2], b[2];
+  require(pipe(a) == 0 && pipe(b) == 0, "process test pipes");
+  const auto pid = fork();
+  require(pid >= 0, "fork");
+  if (!pid) {
+    close(a[0]);
+    close(b[1]);
+    try {
+      processPeer(true, b[0], a[1], config);
+      close(b[0]);
+      close(a[1]);
+      return 0;
+    } catch (const std::exception& e) {
+      std::cerr << "server: " << e.what() << '\n';
+      std::_Exit(1);
+    }
+  }
+  close(a[1]);
+  close(b[0]);
+  try {
+    processPeer(false, a[0], b[1], config);
+  } catch (...) {
+    kill(pid, SIGTERM);
+    waitpid(pid, nullptr, 0);
+    throw;
+  }
+  int status = 0;
+  require(waitpid(pid, &status, 0) == pid && WIFEXITED(status) &&
+              !WEXITSTATUS(status),
+          "server process failed");
+  close(a[0]);
+  close(b[1]);
+  std::cout << "PASS Socket.process two independent processes: HELLO, "
+               "bidirectional READ, FREE and shutdown\n";
+  return 0;
+}
+void multipleOwners() {
+  std::atomic<uint16_t> port{0};
+  std::atomic<unsigned> clientsReady{0}, failures{0};
+  std::atomic<bool> serverReady{false};
+  auto run = [&](bool server) {
+    try {
+      EventBase evb;
+      Listener accepted(evb);
+      std::shared_ptr<AsyncServerSocket> listener;
+      std::vector<std::unique_ptr<Endpoint>> clients;
+      if (server) {
+        listener = AsyncServerSocket::newSocket(&evb);
+        listener->bind(SocketAddress("127.0.0.1", 0));
+        listener->listen(32);
+        accepted.automaticSend = 16384;
+        listener->addAcceptCallback(&accepted, &evb);
+        listener->startAccepting();
+        SocketAddress address;
+        listener->getAddress(&address);
+        port = address.getPort();
+      } else {
+        await([&] { return port != 0; }, "threaded server port");
+        for (size_t i = 0; i < 4; ++i) {
+          auto c = std::make_unique<Endpoint>(UrmaAsyncSocket::newSocket(
+              &evb, SocketAddress("127.0.0.1", port)));
+          c->seed = 73;
+          c->closing = true;
+          c->send(32768, 19, true);
+          clients.push_back(std::move(c));
+        }
+      }
+      auto& peers = server ? accepted.peers : clients;
+      pump(
+          evb,
+          [&] {
+            if (accepted.error || failures)
+              throw std::runtime_error("threaded peer failed");
+            if (peers.size() != (server ? 12 : 4)) return false;
+            for (auto& p : peers) {
+              require(!p->errors, "threaded transfer error");
+              if (p->callbacks != 1 || p->received != (server ? 32768 : 16384))
+                return false;
+            }
+            return true;
+          },
+          "four-owner READ/routing");
+      if (server)
+        serverReady = true;
+      else
+        ++clientsReady;
+      pump(
+          evb, [&] { return serverReady && clientsReady == 3; },
+          "threaded completion barrier");
+      for (auto& p : peers) p->socket->closeNow();
+      pump(
+          evb, [] { return UrmaIoContext::activeRoutes() == 0; },
+          "threaded DRAINING");
+      if (server) stopListener(*listener, accepted, evb);
+      peers.clear();
+    } catch (const std::exception& e) {
+      ++failures;
+      std::cerr << "owner: " << e.what() << '\n';
+    }
+  };
+  std::vector<std::thread> threads;
+  threads.emplace_back(run, true);
+  for (int i = 0; i < 3; ++i) threads.emplace_back(run, false);
+  for (auto& t : threads) t.join();
+  require(!failures, "multi-owner threads failed");
 }
 }  // namespace
 extern "C" urma_jfs_t* urma_create_jfs(urma_context_t* ctx, urma_jfs_cfg_t* cfg) {
@@ -301,7 +493,7 @@ extern "C" urma_status_t urma_post_jfs_wr(urma_jfs_t* queue, urma_jfs_wr_t* wr,
       // entry explicitly so the fixture models that wakeup as well.
       auto* work = contextOf(wr);
       rnrOwner = work->route->ioOwner->shared_from_this();
-      work->route->ioOwner->wake();
+      UrmaIoContextTestPeer::completionReady(*work->route->ioOwner);
       return URMA_SUCCESS;
     }
   }
@@ -413,7 +605,15 @@ int main(int argc, char** argv) {
       p.classes = {{4096, {}}, {16384, {}}, {65536, {}}};
       p.elastic = true;
     }
+    if (mode == "process") return separateProcesses(config);
     UrmaInit::init(config);
+    if (mode == "threads") {
+      multipleOwners();
+      finalize();
+      std::cout << "PASS Socket.threads four EventBases / 12 connections "
+                   "bidirectional READ and cleanup\n";
+      return 0;
+    }
     {
       EventBase evb;
       Listener accepted(evb);
@@ -705,10 +905,13 @@ int main(int argc, char** argv) {
         } else if (chainMode) {
           clients[i]->sendParts(false);
           clients[i]->sendParts(true);
-          // Coalesced replies can have more registered nodes than one WR
-          // can describe. Preserve the original storage in both directions.
+          // SGE overflow copies into one registered SEND, in both directions.
           clients[i]->sendParts(false, 7);
           accepted.peers[i]->sendParts(false, 7, unsigned(73 + i));
+          // Packet-size fragmentation still applies: 1 KiB needs one WR;
+          // 4 KiB needs two with a 24-byte DATA header in each packet.
+          clients[i]->sendParts(false, 8, unsigned(19 + i), 128);
+          clients[i]->sendParts(false, 16, unsigned(19 + i), 256);
         } else if (mode == "pressure")
           clients[i]->send(65536, unsigned(19 + i), false);
         else {
@@ -761,7 +964,7 @@ int main(int argc, char** argv) {
               done &= client.received == server.sent &&
                       server.received == client.sent &&
                       client.callbacks == (mode == "pressure" ? 2 : mode == "new_region" ? 1
-                                           : chainMode        ? 3
+                                           : chainMode        ? 5
                                                               : 3) &&
                       server.callbacks ==
                           (mode == "pressure" || mode == "new_region" || mode == "read" ? 0 : 1);
@@ -793,16 +996,16 @@ int main(int argc, char** argv) {
           require(a.direct_send_bytes == 13312 && a.copied_send_bytes == 300,
                   "SEND direct/copy selection was not exercised");
         if (mode == "chain") {
-          require(a.send_wr_submitted == 5 && a.send_sges == 15 &&
-                      a.direct_send_bytes == 3000 && a.copied_send_bytes == 900,
-                  "registered chain exceeded SGE limit and copied instead of splitting");
-          require(b.send_wr_submitted == 3 && b.send_sges == 10 &&
-                      b.direct_send_bytes == 2100 && b.copied_send_bytes == 0,
-                  "registered reply chain copied instead of splitting");
+          require(a.send_wr_submitted == 6 && a.send_sges == 10 &&
+                      a.direct_send_bytes == 924 && a.copied_send_bytes == 8096,
+                  "small chains were split at the SGE limit instead of coalesced");
+          require(b.send_wr_submitted == 1 && b.send_sges == 1 &&
+                      b.direct_send_bytes == 0 && b.copied_send_bytes == 2100,
+                  "registered reply chain was not coalesced into one SEND");
         }
         if (mode == "chain_single_sge")
-          require(a.send_wr_submitted == 3 && a.send_sges == 3 &&
-                      a.direct_send_bytes == 0 && a.copied_send_bytes == 3900 &&
+          require(a.send_wr_submitted == 6 && a.send_sges == 6 &&
+                      a.direct_send_bytes == 0 && a.copied_send_bytes == 9020 &&
                       b.send_wr_submitted == 1 && b.send_sges == 1 &&
                       b.direct_send_bytes == 0 && b.copied_send_bytes == 2100,
                   "single-SGE compatibility fallback stalled or lost bytes");

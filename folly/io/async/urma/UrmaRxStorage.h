@@ -9,6 +9,17 @@ struct RxBudget {
   std::atomic<size_t> retained{0};
   size_t limit;
   explicit RxBudget(size_t bytes) : limit(bytes) {}
+  bool available(size_t bytes, UrmaPoolSignal& waiter) const {
+    auto fits = [&] {
+      const auto held = retained.load();
+      return held <= limit && bytes <= limit - held;
+    };
+    if (fits()) return true;
+    waiter.arm();
+    // Sequentially consistent with the return and notification below. A
+    // concurrent return either satisfies this check or observes the waiter.
+    return fits();
+  }
 };
 // Allocation handle retains the original pool/region; budgets and notification
 // are independent of the socket and slot. Last IOBuf reference owns this lease.
@@ -20,12 +31,12 @@ struct RxStorageLease {
   ~RxStorageLease() {
     const auto bytes = block.capacity();
     if (accounted) {
-      connectionBudget->retained.fetch_sub(bytes, std::memory_order_acq_rel);
-      ownerBudget->retained.fetch_sub(bytes, std::memory_order_acq_rel);
+      connectionBudget->retained.fetch_sub(bytes);
+      ownerBudget->retained.fetch_sub(bytes);
     }
     dma = {};
     block = {};  // return physical storage before retrying delivery/refill
-    if (wakeup) wakeup->signal();
+    if (wakeup) wakeup->notify();
   }
   static std::unique_ptr<IOBuf> take(std::unique_ptr<RxStorageLease> lease,
                                      size_t offset, size_t length) {

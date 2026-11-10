@@ -66,19 +66,14 @@ struct MemoryPool::State : std::enable_shared_from_this<State> {
   };
   struct Region {
     uint32_t id{0};
-    size_t bytes{0}, holds{0};
+    size_t bytes{0}, holds{0}, activeBlocks{0};
     void* base{nullptr};
     urma_target_seg_t* segment{nullptr};
     std::map<size_t, Block> blocks;
     bool initial{false}, building{true}, retiring{false};
     int error{0};
     Clock::time_point idle{Clock::now()}, retry{};
-    bool busy() const {
-      if (holds) return true;
-      for (const auto& b : blocks)
-        if (b.second.busy()) return true;
-      return false;
-    }
+    bool busy() const { return holds || activeBlocks; }
   };
   struct Bucket {
     Block* free{nullptr};
@@ -102,9 +97,8 @@ struct MemoryPool::State : std::enable_shared_from_this<State> {
   UrmaPoolStats counters;
   Clock::time_point growthRetry{}, cacheTrim{};
   void notify() noexcept {
-    changed.notify_all();
     for (const auto& weak : signals)
-      if (auto signal = weak.lock()) signal->signal();
+      if (auto signal = weak.lock()) signal->notify();
   }
 
   State(urma_context_t* ctx, const UrmaPoolConfig& c)
@@ -270,6 +264,7 @@ struct MemoryPool::State : std::enable_shared_from_this<State> {
         else {
           --block->refs[kind];
           if (!block->busy()) {
+            --region->activeBlocks;
             state->held[block->purpose] -= block->bytes;
             --state->buckets[block->tier].allocated[block->purpose];
             block->cached = false;
@@ -277,7 +272,11 @@ struct MemoryPool::State : std::enable_shared_from_this<State> {
             returnedBudget = true;
           }
         }
-        if (!region->busy()) region->idle = Clock::now();
+        if (!region->busy()) {
+          region->idle = Clock::now();
+          if (region->retiring || state->stopping)
+            state->changed.notify_all();
+        }
         // Ending one DMA/export pin often leaves the allocation and other
         // pins intact. That creates no allocatable storage: waking every IO
         // owner here just makes them poll and contend for the same pool again.
@@ -285,8 +284,8 @@ struct MemoryPool::State : std::enable_shared_from_this<State> {
         // purpose budget can unblock allocation from another live region.
         if (returnedBudget)
           state->notify();  // physical capacity/accounting returned first
-        else
-          state->changed.notify_all();  // retirement/shutdown may still advance
+        // Normal returns do not wake the maintenance thread. Misses request
+        // growth explicitly; its timed pass still performs idle shrink.
       }
     };
     auto p = std::make_shared<Pin>(shared_from_this(), r, b, kind);
@@ -296,6 +295,7 @@ struct MemoryPool::State : std::enable_shared_from_this<State> {
     p->id = r->id;
     if (b) {
       unlink(*b);
+      if (!b->busy()) ++r->activeBlocks;
       ++b->refs[kind];
     } else
       ++r->holds;
@@ -500,7 +500,8 @@ MemoryPool::MemoryPool(urma_context_t* context, const UrmaPoolConfig& config) {
 MemoryPool::~MemoryPool() {
   if (state_->worker.joinable() || !state_->regions.empty()) std::terminate();
 }
-UrmaPoolBuffer MemoryPool::allocate(size_t bytes, UrmaMemoryPurpose purpose) {
+UrmaPoolBuffer MemoryPool::allocate(size_t bytes, UrmaMemoryPurpose purpose,
+                                    UrmaPoolSignal* waiter) {
   auto& s = *state_;
   std::lock_guard<std::mutex> lock(s.mutex);
   const size_t p = size_t(purpose);
@@ -539,6 +540,9 @@ UrmaPoolBuffer MemoryPool::allocate(size_t bytes, UrmaMemoryPurpose purpose) {
     break;  // Do not silently skip a configured 12 KiB tier for 16 KiB.
   }
   ++s.counters.allocation_failures;
+  // Serialize the failed attempt and subscription with physical returns and
+  // growth publication: capacity cannot arrive in an unobserved gap.
+  if (waiter) waiter->arm();
   return {};
 }
 UrmaPoolBuffer MemoryPool::lookup(const void* address, size_t length,
@@ -636,10 +640,13 @@ void MemoryPool::subscribe(const std::shared_ptr<UrmaPoolSignal>& signal) {
 void MemoryPool::setCached(const UrmaPoolBuffer& buffer, bool cached) {
   std::lock_guard<std::mutex> lock(state_->mutex);
   for (auto& r : state_->regions)
-    if (r->id == buffer.regionId())
-      for (auto& item : r->blocks)
-        if (static_cast<char*>(r->base) + item.second.offset == buffer.data())
-          item.second.cached = cached;
+    if (r->id == buffer.regionId() && r->segment == buffer.segment()) {
+      const auto offset = static_cast<const char*>(buffer.data()) -
+                          static_cast<const char*>(r->base);
+      auto it = r->blocks.find(offset);
+      if (it != r->blocks.end()) it->second.cached = cached;
+      return;
+    }
 }
 bool MemoryPool::reusable(const UrmaPoolBuffer& buffer, bool recycle) const {
   std::lock_guard<std::mutex> lock(state_->mutex);

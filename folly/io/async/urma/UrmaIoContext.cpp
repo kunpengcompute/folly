@@ -260,7 +260,7 @@ bool UrmaIoContext::refill(ConnectionQueue& g, size_t index) {
   if (g.broken || stopping_) return false;
   if (!slot.storage) {
     auto block = UrmaInit::poolAlloc(
-        config_.buffer_size, UrmaMemoryPurpose::Rx);
+        config_.buffer_size, UrmaMemoryPurpose::Rx, signal_.get());
     if (!block) {
       ++g.replacementFailures;
       g.refillPending = true;
@@ -391,9 +391,8 @@ void UrmaIoContext::receive(ConnectionQueue& g, const urma_cr_t& c) {
   } else if (data) {
     auto connectionBudget = route->receiveBudget();
     const auto capacity = slot.storage->block.capacity();
-    const auto held = connectionBudget->retained.load();
-    if ((!retrying && g.deferredCount) || held > connectionBudget->limit ||
-        capacity > connectionBudget->limit - held) {
+    if ((!retrying && g.deferredCount) ||
+        !connectionBudget->available(capacity, *signal_)) {
       // Keep the completed slot intact until an upper-layer buffer is returned.
       // This is local bounded storage; no credit packet is exchanged.
       slot.completion = c;
@@ -424,6 +423,7 @@ void UrmaIoContext::receive(ConnectionQueue& g, const urma_cr_t& c) {
 }
 void UrmaIoContext::poll(ConnectionQueue& g) {
   if (polling_ || stopping_) return;
+  cqPending_ = false;
   polling_ = true;
   auto finish = makeGuard([&] {
     polling_ = false;
@@ -458,7 +458,12 @@ void UrmaIoContext::poll(ConnectionQueue& g) {
       require(n >= 0 && n <= kCompletionBatch, "poll connection JFC failed");
       for (int i = 0; i < n; ++i) complete(g, completions[i]);
       if (stopping_) return;
-      if (n == kCompletionBatch) evb_->runInLoop(this);
+      // The second pass already continues a full first batch. Only a full
+      // final batch needs another CQ turn, independently of route progress.
+      if (pass == 1 && n == kCompletionBatch) {
+        cqPending_ = true;
+        evb_->runInLoop(this);
+      }
       require(urma_rearm_jfc(g.cq, false) == URMA_SUCCESS,
               "connection CQ rearm failed");
     }
@@ -533,6 +538,15 @@ void UrmaIoContext::complete(ConnectionQueue& g, const urma_cr_t& c) noexcept {
   }
 }
 void UrmaIoContext::retryRnr(ConnectionQueue& g) {
+  if (!g.retrying) return;
+  // Timer retries also run without a CQ event. Keep queue cleanup deferred
+  // across callbacks just as when this function is called from poll().
+  const bool wasPolling = polling_;
+  polling_ = true;
+  auto finish = makeGuard([&] {
+    polling_ = wasPolling;
+    if (!polling_ && stopping_) stopOwner();
+  });
   bool waiting = false;
   bool posted = false;
   size_t selected = g.flights.size();
@@ -622,7 +636,10 @@ void UrmaIoContext::runLoopCallback() noexcept {
   if (stopping_) { stopOwner(); return; }
   try {
     if (prepared_.load(std::memory_order_acquire) && preparedOK_) {
-      poll(io_);
+      if (cqPending_)
+        poll(io_);
+      else
+        retryRnr(io_);
       if (stopping_) return;
       if (io_.broken && !failed_) fail("URMA queue acceptance unknown");
       if (io_.refillPending) {

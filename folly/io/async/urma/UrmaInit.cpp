@@ -221,13 +221,14 @@ void UrmaInit::releaseContext() {
   std::lock_guard<std::mutex> lock(mutex);
   --owners;
 }
-UrmaPoolBuffer UrmaInit::poolAlloc(size_t size, UrmaMemoryPurpose purpose) {
+UrmaPoolBuffer UrmaInit::poolAlloc(size_t size, UrmaMemoryPurpose purpose,
+                                  UrmaPoolSignal* waiter) {
   auto pool = std::atomic_load(&*publishedPool);
   if (!pool) return {};
   auto buffer = pool->allocate(size, purpose);
   if (!buffer) {
     IoBufPool::reclaim(pool->identity(), false);
-    buffer = pool->allocate(size, purpose);
+    buffer = pool->allocate(size, purpose, waiter);
   }
   return buffer;
 }

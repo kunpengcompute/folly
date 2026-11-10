@@ -113,6 +113,86 @@ void largeBodiesStayRegistered() {
   std::cout << "PASS ten concurrent 8 MiB bodies, purpose cap, control reserve, "
                "clone/DMA/export lifetime and single registration\n";
 }
+void resourceNotifications() {
+  using namespace urma_detail;
+  auto c = config();
+  c.budgets[size_t(UrmaMemoryPurpose::Tx)] = 4096;
+  auto p = std::make_shared<MemoryPool>(nullptr, c);
+  auto signal = std::make_shared<UrmaPoolSignal>();
+  p->subscribe(signal);
+  pollfd event{signal->fd(), POLLIN, 0};
+  auto block = p->allocate(4096, UrmaMemoryPurpose::Tx, signal.get());
+  check(bool(block), "notification allocation setup");
+  block = {};
+  check(::poll(&event, 1, 0) == 0, "normal block return woke an idle owner");
+  block = p->allocate(4096, UrmaMemoryPurpose::Tx);
+  check(!p->allocate(4096, UrmaMemoryPurpose::Tx, signal.get()),
+        "notification budget shortage setup");
+  std::thread returner([b = std::move(block)]() mutable { b = {}; });
+  returner.join();
+  check(::poll(&event, 1, 0) == 1, "failed allocation missed cross-thread return");
+  signal->consume();
+  block = p->allocate(4096, UrmaMemoryPurpose::Tx, signal.get());
+  block = {};
+  check(::poll(&event, 1, 0) == 0, "satisfied allocation kept waking owner");
+
+  auto budget = std::make_shared<RxBudget>(4096);
+  auto lease = std::make_unique<RxStorageLease>();
+  lease->block = p->allocate(4096, UrmaMemoryPurpose::Rx);
+  lease->connectionBudget = budget;
+  lease->ownerBudget = std::make_shared<RxBudget>(4096);
+  lease->connectionBudget->retained = lease->ownerBudget->retained = 4096;
+  lease->accounted = true;
+  lease->wakeup = signal;
+  auto data = RxStorageLease::take(std::move(lease), 24, 1024);
+  auto clone = data->cloneOne();
+  auto retainedDma = p->lookup(data->data(), data->length(), false);
+  check(bool(retainedDma), "retained-budget DMA hold setup");
+  check(!budget->available(4096, *signal), "retained budget shortage setup");
+  data.reset();
+  check(::poll(&event, 1, 0) == 0, "live receive clone returned budget early");
+  std::thread release([b = std::move(clone)]() mutable { b.reset(); });
+  release.join();
+  check(::poll(&event, 1, 0) == 1 && budget->available(4096, *signal),
+        "last receive clone did not wake retained-budget waiter");
+  signal->consume();
+  // Budget can return before the backing block: its DMA pin must neither
+  // suppress that notification nor produce another one for an idle owner.
+  retainedDma = {};
+  lease = std::make_unique<RxStorageLease>();
+  lease->block = p->allocate(4096, UrmaMemoryPurpose::Rx);
+  lease->wakeup = signal;
+  lease.reset();
+  check(::poll(&event, 1, 0) == 0, "idle receive returns still woke owner");
+
+  // Race the first availability check, arming and recheck against a return.
+  // Either the caller can proceed immediately or an event must be pending.
+  std::atomic<unsigned> requested{0}, finished{0};
+  std::thread concurrent([&] {
+    for (unsigned i = 1; i <= 1000; ++i) {
+      while (requested.load() < i) std::this_thread::yield();
+      budget->retained.fetch_sub(4096);
+      signal->notify();
+      finished.store(i);
+    }
+  });
+  for (unsigned i = 1; i <= 1000; ++i) {
+    budget->retained = 4096;
+    requested.store(i);
+    const bool available = budget->available(4096, *signal);
+    while (finished.load() < i) std::this_thread::yield();
+    check(available || ::poll(&event, 1, 0) == 1,
+          "concurrent retained-budget return lost its wakeup");
+    signal->consume();
+  }
+  concurrent.join();
+  signal->signal();
+  check(::poll(&event, 1, 0) == 1, "control notification incorrectly gated");
+  signal->consume();
+  check(p->shutdown(0ms) && registered == 0, "notification cleanup");
+  std::cout << "PASS quiet resource returns, allocation/clone waiters and "
+               "1000 concurrent budget-return races\n";
+}
 }  // namespace
 extern "C" urma_target_seg_t* urma_register_seg(urma_context_t*,
                                                 urma_seg_cfg_t* c) {
@@ -134,6 +214,7 @@ extern "C" urma_status_t urma_unregister_seg(urma_target_seg_t* s) {
 int main(int argc, char** argv) {
   try {
     largeBodiesStayRegistered();
+    resourceNotifications();
     check(argc == 2, "shipped config fixture argument missing");
     UrmaConfig base;
     base.dev_name = "device-supplied-by-caller";
@@ -244,6 +325,7 @@ int main(int argc, char** argv) {
     auto exported = p->lookup(tx.data(), 12000, true);
     auto wakeup = std::make_shared<UrmaPoolSignal>();
     p->subscribe(wakeup);
+    wakeup->arm();
     pollfd wakeEvent{wakeup->fd(), POLLIN, 0};
     tx = {};
     check(p->stats().held_by_purpose[size_t(UrmaMemoryPurpose::Tx)] == 12288,
@@ -370,6 +452,7 @@ int main(int argc, char** argv) {
           "retirement released DMA-held storage or deducted R early");
     auto retiredWake = std::make_shared<UrmaPoolSignal>();
     p->subscribe(retiredWake);
+    retiredWake->arm();
     retiringDma = {};
     pollfd retiredEvent{retiredWake->fd(), POLLIN, 0};
     check(::poll(&retiredEvent, 1, 0) == 1,

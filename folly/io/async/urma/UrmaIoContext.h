@@ -127,6 +127,7 @@ class UrmaIoContext : public EventBase::LoopCallback,
   std::atomic<bool> stopping_{false}, prepared_{false};
   bool detached_{true}, polling_{false}, failed_{false};
   bool preparedOK_{false}, pendingProgress_{false}, readyProgress_{false};
+  bool cqPending_{false};
   bool ownsContext_{false}, counted_{false};
 };
 }  // namespace folly::urma_detail

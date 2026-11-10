@@ -23,8 +23,13 @@ class UrmaIoContextTestPeer {
   }
   static void poll(UrmaIoContext& owner) { owner.poll(owner.io_); }
   static void loop(UrmaIoContext& owner) {
+    owner.cancelLoopCallback();
     owner.prepared_ = owner.preparedOK_ = true;
     owner.runLoopCallback();
+  }
+  static void timer(UrmaIoContext& owner) {
+    owner.cancelTimeout();
+    owner.timeoutExpired();
   }
   static bool cleanup(UrmaIoContext& owner) { return owner.cleanup(owner.io_); }
 };
@@ -42,8 +47,11 @@ struct Device {
   unsigned pendingEvents{0}, retrieved{0}, acknowledged{0}, pollCalls{0};
   unsigned failPoll{0}, injectBeforeRearm{0}, injectAfterRearm{0}, deleted{0};
   unsigned rearmCalls{0}, failRearm{0}, injectAtRearm{1};
+  unsigned progressCalls{0}, retryPosts{0};
+  decltype(urma_cr_t{}.status) completionStatus{URMA_CR_SUCCESS};
   bool armed{false}, failWait{false}, badOrder{false}, cleanup{false};
   bool closeOnFirst{false};
+  bool notifyProgress{false};
   UrmaIoContext* owner{nullptr};
   std::shared_ptr<UrmaRoute> route;
   void post(uint64_t id) {
@@ -69,10 +77,14 @@ struct Route : UrmaRoute {
   void onTx(TxCompletionCtx& work, bool ok) override {
     check(ok, "unexpected failed completion");
     device.delivered.push_back(work.sequence);
+    if (device.notifyProgress) {
+      device.owner->wait(device.route);
+      device.owner->wake();
+    }
     if (device.closeOnFirst && device.delivered.size() == 1)
       device.owner->stopOwner();
   }
-  void progress() noexcept override {}
+  void progress() noexcept override { ++device.progressCalls; }
   void failed(const char*) noexcept override {}
 };
 struct Fixture {
@@ -82,10 +94,11 @@ struct Fixture {
     device = Device{};
     device.owner = owner.get();
     device.route = std::make_shared<Route>();
+    owner->add(device.route);
     owner->io().event = &event;
     owner->io().cq = &cq;
   }
-  ~Fixture() { owner->stopOwner(); }
+  ~Fixture() { owner->remove(device.route->socketId, device.route.get()); }
   struct Result {
     bool error, again;
   };
@@ -124,10 +137,59 @@ void normalAndIdle() {
   check(!r.error && !r.again && device.calls == "WAPRPR", "stale event");
   device.calls.clear();
   device.post(8);
+  check(!f.cycle().error, "event delivery failed");
+  device.calls.clear();
   UrmaIoContextTestPeer::loop(*f.owner);
-  check(device.calls == "WAPRPR" && device.delivered.back() == 8 &&
+  check(device.calls.empty() && device.delivered.back() == 8 &&
             !f.owner->isLoopCallbackScheduled(),
-        "software continuation must use the same bounded event path");
+        "software progress redundantly polled a drained CQ");
+}
+void softwareProgressAndRetry() {
+  {
+    Fixture f;
+    device.notifyProgress = true;
+    device.post(1);
+    check(f.cycle().again, "completion did not schedule route progress");
+    device.calls.clear();
+    UrmaIoContextTestPeer::loop(*f.owner);
+    check(device.progressCalls == 1 && device.calls.empty(),
+          "route delivery performed another CQ cycle");
+    f.owner->wait(device.route);
+    f.owner->wake();  // resource/control wake without a CQ event
+    UrmaIoContextTestPeer::loop(*f.owner);
+    check(device.progressCalls == 2 && device.calls.empty(),
+          "resource wake polled the CQ or lost route progress");
+  }
+  {
+    Fixture f;
+    for (unsigned i = 0; i < 97; ++i) device.post(i);
+    check(f.cycle().again && device.delivered.size() == 64,
+          "full final batch did not request continuation");
+    device.calls.clear();
+    UrmaIoContextTestPeer::loop(*f.owner);
+    check(device.calls == "WPRPR" && device.delivered.size() == 97 &&
+              !f.owner->isLoopCallbackScheduled(),
+          "CQ continuation lost the bounded interrupt sequence");
+  }
+  {
+    Fixture f;
+    device.completionStatus = URMA_CR_RNR_RETRY_CNT_EXC_ERR;
+    device.post(1);
+    check(!f.cycle().error && f.owner->io().retrying == 1 &&
+              device.delivered.empty(), "RNR retry setup");
+    auto& flight = f.owner->io().flights[0];
+    flight->retryAt = std::chrono::steady_clock::now();
+    device.calls.clear();
+    UrmaIoContextTestPeer::timer(*f.owner);
+    UrmaIoContextTestPeer::loop(*f.owner);
+    check(device.retryPosts == 1 && !flight->retryPending &&
+              device.calls.empty(), "timer retry requires an unrelated CQ event");
+    device.completionStatus = URMA_CR_SUCCESS;
+    device.ready.push_back(0);
+    device.pendingEvents = 1;
+    check(!f.cycle().error && device.delivered.size() == 1 &&
+              !f.owner->io().retrying, "RNR retry did not settle exactly once");
+  }
 }
 void rearmRaces() {
   for (unsigned arm : {1, 2}) {
@@ -166,7 +228,7 @@ void batches() {
     auto r = f.cycle();
     check(!r.error && ++turns < 10, "bounded continuation failed");
     check(device.delivered.size() - delivered <= 64, "unbounded active poll");
-    check(device.delivered.size() - delivered < 32 || r.again,
+    check(device.delivered.size() - delivered < 64 || r.again,
           "full CQ batch did not arrange software continuation");
     if (!r.again && !device.pendingEvents) break;
   }
@@ -287,7 +349,7 @@ extern "C" int urma_poll_jfc(urma_jfc_t*, int n, urma_cr_t* out) {
   n = std::min<size_t>(n, device.ready.size());
   for (int i = 0; i < n; ++i) {
     out[i] = {};
-    out[i].status = URMA_CR_SUCCESS;
+    out[i].status = device.completionStatus;
     out[i].user_ctx = device.ready.front();
     device.ready.pop_front();
   }
@@ -325,6 +387,12 @@ extern "C" urma_status_t urma_delete_jfc(urma_jfc_t*) {
   ++device.deleted;
   return URMA_SUCCESS;
 }
+extern "C" urma_status_t urma_post_jfs_wr(urma_jfs_t*, urma_jfs_wr_t*,
+                                          urma_jfs_wr_t** bad) {
+  ++device.retryPosts;
+  *bad = nullptr;
+  return URMA_SUCCESS;
+}
 extern "C" urma_status_t urma_delete_jfce(urma_jfce_t*) {
   ++device.deleted;
   return URMA_SUCCESS;
@@ -332,6 +400,7 @@ extern "C" urma_status_t urma_delete_jfce(urma_jfce_t*) {
 int main() {
   try {
     normalAndIdle();
+    softwareProgressAndRetry();
     rearmRaces();
     batches();
     errorsAndRetry();

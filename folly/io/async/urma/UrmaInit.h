@@ -29,7 +29,8 @@ class UrmaInit {
   static uint32_t getMaxReadSize();
   static void releaseContext();
   // A miss returns empty; background growth is requested only in elastic mode.
-  static UrmaPoolBuffer poolAlloc(size_t size, UrmaMemoryPurpose purpose);
+  static UrmaPoolBuffer poolAlloc(size_t size, UrmaMemoryPurpose purpose,
+                                  UrmaPoolSignal* waiter = nullptr);
   static UrmaPoolBuffer lookupSegment(const void* addr, size_t length);
   static UrmaPoolBuffer holdReadExport(const void* addr, size_t length);
   static UrmaPoolBuffer initialSegment();

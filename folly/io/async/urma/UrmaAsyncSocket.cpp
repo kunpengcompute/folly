@@ -493,8 +493,8 @@ bool UrmaAsyncSocket::Impl::sendData(const std::shared_ptr<Write>& write,
     work->sges[0].len = bytes + kHeaderBytes;
     work->sges[0].tseg = work->localPin.segment();
   } else {
-    // Coalesce registered ranges up to one WR's SGE budget. Leave the rest
-    // for the next record instead of copying an otherwise registered chain.
+    // Use registered ranges directly when the whole planned DATA fits one
+    // WR. Otherwise copy-coalesce it instead of splitting at the SGE limit.
     size_t left = bytes, used = 1, at = offset;
     const IOBuf* part = node;
     while (left && used < config.max_send_sge) {
@@ -515,20 +515,16 @@ bool UrmaAsyncSocket::Impl::sendData(const std::shared_ptr<Write>& write,
       part = part->next();
       at = 0;
     }
-    if (left && used == config.max_send_sge && used > 1) {
-      bytes -= left;
-      work->bytes = bytes;
-      left = 0;
-    }
-    // Ordinary memory still needs a registered copy. With only one SGE,
-    // the independent header leaves no room for a direct payload either.
+    // Ordinary memory or an exhausted SGE budget needs a registered copy.
+    // With one SGE, the independent header leaves no direct payload slot.
     const bool direct = left == 0;
     if (!direct) {
       work->localPin = {};
       work->extraPins = {};
     }
     work->control = UrmaInit::poolAlloc(kHeaderBytes + (direct ? 0 : bytes),
-                                        UrmaMemoryPurpose::Tx);
+                                        UrmaMemoryPurpose::Tx,
+                                        connection->signal().get());
     if (!work->control) {
       sendRetry = Clock::now() + std::chrono::milliseconds(5);
       return false;
@@ -593,7 +589,8 @@ bool UrmaAsyncSocket::Impl::sendPull(const std::shared_ptr<Write>& write,
   if (sources.size() >= config.offer_window) return false;
   auto exported = UrmaInit::holdReadExport(node->data() + offset, bytes);
   if (!exported || exported.segment() != initial.segment()) return false;
-  auto control = UrmaInit::poolAlloc(kPullBytes, UrmaMemoryPurpose::Control);
+  auto control = UrmaInit::poolAlloc(kPullBytes, UrmaMemoryPurpose::Control,
+                                    connection->signal().get());
   if (!control) {
     sendRetry = Clock::now() + std::chrono::milliseconds(5);
     return false;
@@ -837,24 +834,21 @@ void UrmaAsyncSocket::Impl::receiveProgress() {
     if (readActive || !connection->canPost(Operation::Read)) return;
     // READ progress has independent storage/retained accounting from DATA.
     const size_t capacity = UrmaInit::poolBufSize(entry->length);
-    const auto connectionHeld =
-        readBudget->retained.load(std::memory_order_acquire);
-    const auto ownerHeld =
-        connection->readBudget()->retained.load(std::memory_order_acquire);
-    if (!capacity || connectionHeld > readBudget->limit ||
-        capacity > readBudget->limit - connectionHeld ||
-        ownerHeld > connection->readBudget()->limit ||
-        capacity > connection->readBudget()->limit - ownerHeld)
+    if (!capacity ||
+        !readBudget->available(capacity, *connection->signal()) ||
+        !connection->readBudget()->available(capacity, *connection->signal()))
       return;
     // Throttle failed multi-resource attempts. Releasing a partial reservation
     // itself emits a pool wake, which must not turn a shortage into a busy
     // loop.
     receiveRetry = Clock::now() + std::chrono::milliseconds(5);
     auto target =
-        UrmaInit::poolAlloc(entry->length, UrmaMemoryPurpose::ReadTarget);
+        UrmaInit::poolAlloc(entry->length, UrmaMemoryPurpose::ReadTarget,
+                            connection->signal().get());
     if (!target) return;
     auto control =
-        UrmaInit::poolAlloc(kHeaderBytes, UrmaMemoryPurpose::ReadControl);
+        UrmaInit::poolAlloc(kHeaderBytes, UrmaMemoryPurpose::ReadControl,
+                            connection->signal().get());
     if (!control) return;
     auto reply = std::make_shared<FreeReply>();
     reply->sequence = entry->sequence;

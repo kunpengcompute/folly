@@ -99,6 +99,12 @@ class UrmaPoolSignal {
   UrmaPoolSignal();
   ~UrmaPoolSignal();
   int fd() const noexcept { return fd_; }
+  // Arm before checking a resource again, or while holding its pool lock.
+  // Resource returns wake one pending attempt; control events use signal().
+  void arm() noexcept { waiting_.store(true); }
+  void notify() noexcept {
+    if (waiting_.load() && waiting_.exchange(false)) signal();
+  }
   void signal() noexcept;
   void consume() noexcept;
   void stop() noexcept { enabled_.store(false, std::memory_order_release); }
@@ -106,6 +112,7 @@ class UrmaPoolSignal {
  private:
   const int fd_;
   std::atomic<bool> enabled_{true}, pending_{false};
+  std::atomic<bool> waiting_{false};
 };
 // Copying a handle preserves its original allocator and registration lifetime.
 // A DMA/export pin remains valid after the allocation handle is released.
@@ -131,7 +138,8 @@ class MemoryPool {
   static void validate(const UrmaPoolConfig& config);
   MemoryPool(urma_context_t* context, const UrmaPoolConfig& config);
   ~MemoryPool();
-  UrmaPoolBuffer allocate(size_t bytes, UrmaMemoryPurpose purpose);
+  UrmaPoolBuffer allocate(size_t bytes, UrmaMemoryPurpose purpose,
+                          UrmaPoolSignal* waiter = nullptr);
   UrmaPoolBuffer lookup(const void* address, size_t length, bool exported);
   // Connection hold for the only segment advertised in HELLO.
   UrmaPoolBuffer initialSegment();
