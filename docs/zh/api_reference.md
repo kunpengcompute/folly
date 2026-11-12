@@ -1,8 +1,10 @@
 # API参考
 
-## Folly v1.1.0：IOBuf TLS内存池接口说明
+本文档介绍API参考，适用于需要调用Folly接口的用户。
 
-本文档介绍Folly v1.1.0新增的IOBuf TLS内存池接口和生命周期规则。该能力默认不改变原有分配行为，调用enableMemoryPool()后才会进入池化路径。
+## Folly V1.1.0：IOBuf TLS内存池接口说明
+
+本文档介绍Folly V1.1.0新增的IOBuf TLS内存池接口和生命周期规则。该能力默认不改变原有分配行为，调用enableMemoryPool()后才会进入池化路径。
 
 ### 接口概览
 
@@ -48,9 +50,9 @@ static void folly::IOBuf::setBlockSize(std::size_t size);
 
 #### IOBuf::setBlockSize函数参数说明
 
-|参数名|说明|输入/输出|
-|--|--|--|
-|size|新建池块的总字节数|输入|
+|参数名|说明|输入/输出|类型|必填性|取值范围|
+|--|--|--|--|--|--|
+|size|新建池块的总字节数|输入|std::size_t|必选|需大于块头元数据，建议为8KB整数倍）、默认值（8KB）|
 
 该配置影响后续新建数据块，不应在请求处理中频繁修改。建议在调用enableMemoryPool()前完成设置，并结合请求大小分布评估内存占用。
 
@@ -137,7 +139,7 @@ IoBufBlock
 
 ### 池化标记与生命周期
 
-#### `flagsAndSharedInfo_`复用
+#### flagsAndSharedInfo_复用
 
 内存池不为IOBuf增加新的数据成员，而是复用flagsAndSharedInfo_。
 
@@ -173,11 +175,12 @@ IoBufBlock
 - setBlockSize()建议只在启动阶段调用一次。
 - 块大小和每线程缓存上限需要结合请求分布、工作线程数及总体内存预算调优。
 
-## Folly v1.0.0：io_uring混合读写接口说明
+## Folly V1.1.0：io_uring混合读写接口说明
 
-> ![表示说明的图片](./public_sys-resources/icon-note.gif)**说明**：本节保留Folly v1.0.0提供的io_uring混合读写接口，与Folly v1.1.0的IOBuf TLS内存池分开说明。
+>![表示说明的图片](./public_sys-resources/icon-note.gif) **说明**
+>本节保留Folly V1.1.0提供的io_uring混合读写接口，与Folly V1.1.0的IOBuf TLS内存池分开说明。
 
-### Folly v1.0.0：io_uring混合读写接口概览
+### Folly V1.1.0：io_uring混合读写接口概览
 
 |名称|说明|
 |--|--|
@@ -214,4 +217,4 @@ void AsyncIoUringSocket::writeChain(
 
 |文档版本|发布日期|修改说明|
 |:---|:---|:---|
-|01|2026-9-30|第一次正式发布。|
+|01|2026-09-30|第一次正式发布。|
