@@ -2,16 +2,18 @@
 
 简体中文|[English](./README_en.md)
 
+本文档介绍Folly性能优化补丁，面向Folly网络I/O和缓冲区分配路径进行性能优化，涵盖IOBuf TLS内存池与io_uring混合模式优化，适用于使用Folly组件库的开发者。
+
 ## 最新消息
 
-- [2026.09.30]：发布Folly v1.1.0版本补丁，新增IOBuf TLS内存池，通过线程本地数据块复用和连续slice切分减少高QPS场景下的`malloc/free`。
-- [2026.06.30]：发布Folly v1.0.0版本补丁仓，针对Folly异步网络io框架进行io_uring优化，提升网络io的稳定性与基线io性能。
+- [2026-09-30]：发布Folly V1.1.0版本补丁，新增IOBuf TLS内存池，通过线程本地数据块复用和连续slice切分减少高QPS场景下的`malloc/free`。
+- [2026-06-30]：发布Folly V1.1.0版本补丁仓，针对Folly异步网络I/O框架进行io_uring优化，提升网络I/O的稳定性与基线io性能。
 
 ## 项目介绍
 
 Folly是Meta开源的一套高性能C++11/14/17组件库，直接针对大规模、高并发、低延迟的服务器端应用场景而设计。
 
-本项目面向Folly网络I/O和缓冲区分配路径进行性能优化。Folly v1.1.0新增IOBuf TLS内存池，仅池化数据块，不池化IOBuf对象本身。Folly v1.0.0采用io_uring混合模式：读操作使用multishot减少系统调用，写操作使用`send`系统调用保证连续写的顺序和延迟稳定性。
+本项目面向Folly网络I/O和缓冲区分配路径进行性能优化。Folly V1.1.0新增IOBuf TLS内存池，仅池化数据块，不池化IOBuf对象本身。Folly V1.1.0采用io_uring混合模式：读操作使用multishot减少系统调用，写操作使用`send`系统调用保证连续写的顺序和延迟稳定性。
 
 IOBuf TLS内存池的核心设计如下。
 
@@ -24,7 +26,7 @@ IOBuf TLS内存池的核心设计如下。
 ## 目录结构
 
 ```text
-fbthrift/
+folly/
 ├── docs/                           # 文档目录
 │   ├── en/                         # English documents
 │   │   ├── api_reference.md        # API reference sheet
@@ -39,7 +41,7 @@ fbthrift/
 │   │   └── release_notes.md        # 版本说明书
 │   └── LICENSE
 ├── LICENSE
-├── iouring.patch                   # Folly v1.1.0优化补丁文件
+├── iouring.patch                   # Folly V1.1.0优化补丁文件
 ├──README.md                        # 项目介绍
 └──README_en.md                     # 项目介绍（英文）
 ```
@@ -56,9 +58,9 @@ fbthrift/
 
 | 学习文档名称 | 内容简介 |
 | --------- | --------- |
-| [《快速入门》](docs/zh/quick_start.md) | 提供io_uring与IOBuf TLS内存池的编译、启用和验证指导。 |
-| [《版本说明书》](docs/zh/release_notes.md) | 提供Folly v1.1.0版本信息、兼容性约束和特性更新。 |
-| [《API参考》](docs/zh/api_reference.md) | 按版本提供TLS内存池和io_uring相关接口说明。 |
+| 《[快速入门](docs/zh/quick_start.md)》 | 提供io_uring与IOBuf TLS内存池的编译、启用和验证指导。 |
+| 《[版本说明书](docs/zh/release_notes.md)》 | 提供Folly V1.1.0版本信息、兼容性约束和特性更新。 |
+| 《[API参考](docs/zh/api_reference.md)》 | 按版本提供TLS内存池和io_uring相关接口说明。 |
 
 ## 免责声明
 
@@ -76,4 +78,4 @@ Folly遵循Apache-2.0许可证，具体请参见[LICENSE文件](LICENSE)。
 
 ## 致谢
 
-感谢来自社区的每一个PR，欢迎贡献Folly补丁仓！
+感谢来自社区的每一个PR，欢迎贡献Folly！

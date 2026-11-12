@@ -2,15 +2,15 @@
 
 本文指导用户编译Folly优化版本、启用IOBuf TLS内存池，并验证原有io_uring混合读写路径。
 
-> ![表示说明的图片](./public_sys-resources/icon-note.gif) **说明**：本文档适用版本：Folly v1.1.0。
-
 ## 环境准备
 
 ### 环境要求
 
-- Linux系统，推荐Debian 12或openEuler。
-- Clang 16或更高版本，所有依赖使用同一工具链。
-- 安装CMake、Boost、fmt、glog、libevent、liburing及压缩库开发包。
+|环境|要求|
+|---|--|
+|操作系统|Linux系统，推荐Debian 12或openEuler|
+|编译器|Clang 16及以上版本，所有依赖使用同一工具链|
+|软件|CMake、Boost、fmt、glog、libevent、liburing及压缩库开发包|
 
 Debian或Ubuntu执行以下命令。
 
@@ -27,7 +27,7 @@ sudo apt-get install -y \
 
 ### 获取优化源码
 
- 本项目提供两种获取优化源码的方式：按方式一直接获取优化源码；或按方式二依次按获取基线源码、校验并应用补丁，完成后，进入下一章[编译与安装](#编译与安装)。
+ 本项目提供两种获取优化源码的方式：按方式一直接获取优化源码；或按方式二依次获取基线源码、校验并应用补丁，完成后，进入下一章[编译与安装](#编译与安装)。
 
 #### 方式一：直接获取dev_iouring分支的优化源码
 
@@ -45,7 +45,7 @@ sudo apt-get install -y \
 
    **获取基线源码、补丁和校验文件**
 
-   基线源码保存在folly目录，补丁和校验文件保存在同级的folly-patches目录。在选定的工作目录下执行以下命令。
+   基线源码保存在Folly目录，补丁和校验文件保存在同级的folly-patches目录。在选定的工作目录下执行以下命令。
 
    ```bash 
    git clone --recurse-submodules --branch v2022.11.14.00 --single-branch \ 
@@ -92,8 +92,8 @@ sudo apt-get install -y \
 
    | 校验结果 | 判定及处理 |
    | --- | --- |
-   | 显示`OK`或“成功”，且无错误提示 | 补丁与校验文件中的摘要一致，完整性校验通过，可继续应用补丁 |
-   | 显示`FAILED`或“失败” | 补丁内容与预期不一致，停止使用并重新获取 |
+   | 显示OK或成功，且无错误提示 | 补丁与校验文件中的摘要一致，完整性校验通过，可继续应用补丁 |
+   | 显示FAILED或失败 | 补丁内容与预期不一致，停止使用并重新获取 |
    | 提示文件不存在或无法读取 | 检查当前目录、文件名及文件是否下载完整 |
    | 提示校验文件格式错误 | 重新获取发布方提供的校验文件 |
 
@@ -116,6 +116,8 @@ sudo apt-get install -y \
    补丁只需应用一次。完成后，在当前folly源码目录继续执行编译与安装步骤。
 
 ## 编译与安装
+
+在Folly源码根目录、已完成环境依赖安装后执行以下命令。
 
 ```bash
 export CC=/usr/bin/clang-16
@@ -151,6 +153,8 @@ fmt或其他依赖安装在自定义位置时，通过CMAKE_PREFIX_PATH或fmt_DI
    }
    ```
 
+   此处8KB为默认值，生产环境建议改为256KB。
+
 2. 启用后的IOBuf::create()路由如下。
 
    ```text
@@ -163,7 +167,7 @@ fmt或其他依赖安装在自定义位置时，通过CMAKE_PREFIX_PATH或fmt_DI
 
 ### 配置建议
 
-- 默认每线程最多缓存8个空闲块，默认块大小为8KB,建议将块大小设置为256KB。
+- 默认每线程最多缓存8个空闲块，默认块大小为8KB，建议将块大小设置为256KB。
 - setBlockSize()只在启动阶段调用，不要在请求处理中动态修改。
 - 小请求占比较高时可提高块复用率；请求经常超过块容量时仍会走原有路径。
 - 线程数较多时，需要按“线程数 × 每线程缓存上限 × 块大小”评估内存上界。
@@ -216,20 +220,25 @@ v1.0.0采用混合模式：读操作使用io_uring multishot，写操作使用�
    ```
 
 3. 根据实际安装路径修改Benchmark Makefile中的Folly和fmt目录，然后分别编译服务端及客户端。
+   - 服务端（A机）执行以下命令。
 
-   ```bash
-   cd benchmark/server
-   make
-   numactl -N 0 ./net-server3-iouring
+      ```bash
+      cd benchmark/server
+      make
+      numactl -N 0 ./net-server3-iouring
+      ```
 
-   cd ../client/iouring
-   make
-   ./net-client \
-   --conn_per_thread 1 \
-   --qps_per_conn 10000 \
-   --batch_size 1 \
-   --total_requests 100000
-   ```
+   - 客户端（B机）执行以下命令。客户端需在服务端就绪后发起压测。
+
+      ```bash
+      cd ../client/iouring
+      make
+      ./net-client \
+      --conn_per_thread 1 \
+      --qps_per_conn 10000 \
+      --batch_size 1 \
+      --total_requests 100000
+      ```
 
 ### A/B测试原则
 
@@ -247,4 +256,4 @@ v1.0.0采用混合模式：读操作使用io_uring multishot，写操作使用�
 
 |文档版本|发布日期|修改说明|
 |:---|:---|:---|
-|01|2026-9-30|第一次正式发布。|
+|01|2026-09-30|第一次正式发布。|
