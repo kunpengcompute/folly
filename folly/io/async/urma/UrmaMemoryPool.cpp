@@ -218,7 +218,7 @@ struct MemoryPool::State : std::enable_shared_from_this<State> {
     urma_seg_cfg_t cfg{};
     cfg.va = reinterpret_cast<uint64_t>(r.base);
     cfg.len = r.bytes;
-    cfg.flag.bs.access = r.initial ? URMA_ACCESS_READ : URMA_ACCESS_LOCAL_ONLY;
+    cfg.flag.bs.access = URMA_ACCESS_READ;
     r.segment = urma_register_seg(context, &cfg);
     if (!r.segment) {
       munmap(r.base, r.bytes);
@@ -235,8 +235,11 @@ struct MemoryPool::State : std::enable_shared_from_this<State> {
     notify();
   }
   void markRetiring(Region& r) noexcept {
+    if (r.retiring) return;
     r.retiring = true;
     for (auto& b : r.blocks) unlink(b.second);
+    for (const auto& weak : signals)
+      if (auto signal = weak.lock()) signal->signal();
   }
   void remove(const std::shared_ptr<Region>& r) noexcept {
     if (r->building)
@@ -272,10 +275,13 @@ struct MemoryPool::State : std::enable_shared_from_this<State> {
             returnedBudget = true;
           }
         }
-        if (!region->busy()) {
+        if (!region->activeBlocks) {
           region->idle = Clock::now();
           if (region->retiring || state->stopping)
             state->changed.notify_all();
+          if (returnedBudget && region->retiring)
+            for (const auto& weak : state->signals)
+              if (auto signal = weak.lock()) signal->signal();
         }
         // Ending one DMA/export pin often leaves the allocation and other
         // pins intact. That creates no allocatable storage: waking every IO
@@ -377,12 +383,17 @@ struct MemoryPool::State : std::enable_shared_from_this<State> {
                 Clock::now() + std::chrono::milliseconds(config.idle_ms);
             if (stopping) continue;
           }
+          size_t retained = registered;
+          for (const auto& r : regions)
+            if (r->retiring && !r->building) retained -= r->bytes;
           for (auto& r : regions)
-            if (!r->initial && !r->building && !r->retiring && !r->busy() &&
-                registered - r->bytes >= config.pool_size &&
+            if (!r->initial && !r->building && !r->retiring && !r->activeBlocks &&
+                retained >= config.pool_size + r->bytes &&
                 now - r->idle >= std::chrono::milliseconds(config.idle_ms) &&
-                prepareShrink(*r))
+                prepareShrink(*r)) {
               markRetiring(*r);
+              retained -= r->bytes;
+            }
           bool demand = false;
           for (const auto& b : buckets)
             for (bool v : b.requested) demand |= v;
@@ -552,7 +563,7 @@ UrmaPoolBuffer MemoryPool::lookup(const void* address, size_t length,
   const auto start = reinterpret_cast<uintptr_t>(address);
   if (s.stopping || !start || !length) return {};
   for (auto& r : s.regions) {
-    if (r->building || r->retiring || (exported && !r->initial)) continue;
+    if (r->building || r->retiring) continue;
     const auto base = reinterpret_cast<uintptr_t>(r->base);
     if (start < base || start - base >= r->bytes ||
         length > r->bytes - (start - base))
@@ -577,6 +588,23 @@ UrmaPoolBuffer MemoryPool::initialSegment() {
     for (auto& r : s.regions)
       if (r->initial && !r->retiring) return s.pin(r, nullptr, 0);
   return {};
+}
+UrmaPoolBuffer MemoryPool::holdSegment(uint64_t id) {
+  auto& s = *state_;
+  std::lock_guard<std::mutex> lock(s.mutex);
+  if (!s.stopping)
+    for (auto& r : s.regions)
+      if (r->id == id && !r->building && !r->retiring)
+        return s.pin(r, nullptr, 0);
+  return {};
+}
+std::vector<uint64_t> MemoryPool::revocableSegments() const {
+  std::lock_guard<std::mutex> lock(state_->mutex);
+  std::vector<uint64_t> ids;
+  for (const auto& r : state_->regions)
+    if (!r->initial && r->retiring && !r->building && !r->activeBlocks)
+      ids.push_back(r->id);
+  return ids;
 }
 void MemoryPool::retire(const UrmaPoolBuffer& buffer) {
   {

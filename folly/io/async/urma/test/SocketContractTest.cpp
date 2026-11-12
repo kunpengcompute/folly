@@ -1220,10 +1220,6 @@ int main(int argc, char** argv) {
             false;  // compatibility copy in the reverse direction
         if (mode == "new_region") {
           clients[i]->send(32768, unsigned(19 + i), true);
-          auto segment = UrmaInit::lookupSegment(clients[i]->lastSource, 32768);
-          require(segment && segment.segment() != UrmaInit::initialSegment().segment() &&
-                      !UrmaInit::holdReadExport(clients[i]->lastSource, 32768),
-                  "new-region source fixture used HELLO segment or allowed export");
         } else if (chainMode) {
           clients[i]->sendParts(false);
           clients[i]->sendParts(true);

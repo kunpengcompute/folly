@@ -495,15 +495,19 @@ int main(int argc, char** argv) {
     }
     check(bool(extra), "elastic growth did not publish");
     check(extra.segment() != initial.segment() &&
-              !p->lookup(extra.data(), 1, true),
-          "new region was exported without HELLO publication");
+              bool(p->lookup(extra.data(), 1, true)),
+          "new region supports READ pins; transport gates publication");
     check(p->stats().registered_bytes + p->stats().registering_bytes <=
               c.pool_max_size,
           "R+E exceeded hard");
+    auto advertised = p->holdSegment(extra.regionId());
+    check(bool(advertised), "announced region lease");
     auto retiringDma = p->lookup(extra.data(), extra.capacity(), false);
     const auto retiringId = extra.regionId();
     check(bool(retiringDma), "retirement DMA hold setup");
     p->retire(extra);
+    check(p->revocableSegments().empty(), "live block was revocable");
+    check(!p->holdSegment(retiringId), "retiring region accepted a new lease");
     check(!p->lookup(extra.data(), 1, false),
           "retiring region accepted a new DMA hold");
     extra = {};
@@ -522,9 +526,15 @@ int main(int argc, char** argv) {
     p->subscribe(retiredWake);
     retiredWake->arm();
     retiringDma = {};
+    check(p->revocableSegments() == std::vector<uint64_t>{retiringId},
+          "idle published segment did not become revocable");
     pollfd retiredEvent{retiredWake->fd(), POLLIN, 0};
     check(::poll(&retiredEvent, 1, 0) == 1,
           "retired block returned purpose budget without waking waiters");
+    std::this_thread::sleep_for(30ms);
+    check(p->stats().registered_bytes == c.pool_max_size,
+          "announced segment unregistered before peer lease ended");
+    advertised = {};
     end = std::chrono::steady_clock::now() + 2s;
     while (p->stats().registered_bytes != c.pool_size &&
            std::chrono::steady_clock::now() < end)
@@ -535,7 +545,7 @@ int main(int argc, char** argv) {
     initial = {};
     check(p->shutdown(2s) && registered == 0, "elastic cleanup");
     std::cout << "PASS optional growth/shrink, DMA-held retirement, R+E, "
-                 "HELLO segment hold and new-region READ exclusion\n";
+                 "HELLO and announced-region leases\n";
     // Reserve is physically free but unavailable to TX: it must not suppress
     // growth. This uses a tier exactly matching the protected block.
     c.pool_size = 32768;

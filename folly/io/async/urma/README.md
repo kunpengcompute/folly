@@ -15,6 +15,8 @@ UrmaInit 管理进程级注册 region 和分档公共空闲块，块在分配时
 
 默认大块分档包含 `8 MiB + 64 KiB`，让 8 MiB 正文附带序列化和 TLS 管理信息时无需占用 16 MiB 档；这 64 KiB 是分配容量余量，不改变线上报文、READ 阈值或注册总量。默认 READ 源预算仍为 102 MiB，按实际块容量计费。自定义 `classes` 会替换整个默认列表，需为实际序列化容量保留合适档位；仅提高 `pool_size` 不会自动提高各用途 `budgets`。池外输入仍合法，资源不足或不满足直接 READ 条件时可能使用 SEND，不能把开启 READ 等同于所有大包必然 READ。
 
+增长段通过 `holdSegment()` 保留租约，`revocableSegments()` 列出已排空的撤销候选；全部租约释放后才注销。`SegmentState` 管理段通告、导入和撤销状态。
+
 ## 收发与回收
 
 每条连接独占 JFS、JFR、JFC 和接收 jetty。同一 EventBase 上的不同连接也分别创建硬件队列，仅注册内存池在进程内共享。SDK 的 `share_jfr` 标志用于把该连接自己的 JFR 绑定到自己的接收 jetty，不将它交给其他连接。队列创建、导入和销毁通过后台任务执行。

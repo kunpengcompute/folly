@@ -236,6 +236,14 @@ UrmaPoolBuffer UrmaInit::initialSegment() {
   auto pool = std::atomic_load(&*publishedPool);
   return pool ? pool->initialSegment() : UrmaPoolBuffer{};
 }
+UrmaPoolBuffer UrmaInit::holdSegment(uint64_t id) {
+  auto pool = std::atomic_load(&*publishedPool);
+  return pool ? pool->holdSegment(id) : UrmaPoolBuffer{};
+}
+std::vector<uint64_t> UrmaInit::revocableSegments() {
+  auto pool = std::atomic_load(&*publishedPool);
+  return pool ? pool->revocableSegments() : std::vector<uint64_t>{};
+}
 size_t UrmaInit::poolBufSize(size_t requested) {
   auto pool = std::atomic_load(&*publishedPool);
   return pool ? pool->bufferSize(requested) : 0;

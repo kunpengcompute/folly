@@ -34,6 +34,8 @@ class UrmaInit {
   static UrmaPoolBuffer lookupSegment(const void* addr, size_t length);
   static UrmaPoolBuffer holdReadExport(const void* addr, size_t length);
   static UrmaPoolBuffer initialSegment();
+  static UrmaPoolBuffer holdSegment(uint64_t regionId);
+  static std::vector<uint64_t> revocableSegments();
   static size_t poolBufSize(size_t requested);
   static void poolFree(UrmaPoolBuffer& block) noexcept { block = {}; }
   static void subscribePool(const std::shared_ptr<UrmaPoolSignal>& signal);

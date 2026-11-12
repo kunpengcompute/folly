@@ -141,8 +141,11 @@ class MemoryPool {
   UrmaPoolBuffer allocate(size_t bytes, UrmaMemoryPurpose purpose,
                           UrmaPoolSignal* waiter = nullptr);
   UrmaPoolBuffer lookup(const void* address, size_t length, bool exported);
-  // Connection hold for the only segment advertised in HELLO.
+  // Region leases prevent unregister while a peer can still reference a segment.
   UrmaPoolBuffer initialSegment();
+  UrmaPoolBuffer holdSegment(uint64_t regionId);
+  // Cold-path snapshot: no new allocation/export, and all block users drained.
+  std::vector<uint64_t> revocableSegments() const;
   size_t bufferSize(size_t requested) const noexcept;
   void setCached(const UrmaPoolBuffer&, bool cached);
   bool reusable(const UrmaPoolBuffer&, bool recycle = false) const;

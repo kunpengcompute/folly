@@ -30,3 +30,8 @@ foreach(mode send read pressure multi retry cancel prepare_fail queue_fail proce
   set_tests_properties(URMA.Socket.${mode} PROPERTIES TIMEOUT 45
     SKIP_RETURN_CODE 77 LABELS "URMA;device" RESOURCE_LOCK urma_device)
 endforeach()
+add_executable(UrmaSegmentStateTest SegmentStateTest.cpp)
+target_link_libraries(UrmaSegmentStateTest PRIVATE folly ${CMAKE_DL_LIBS})
+apply_folly_compile_options_to_target(UrmaSegmentStateTest)
+add_test(NAME URMA.SegmentState COMMAND UrmaSegmentStateTest)
+set_tests_properties(URMA.SegmentState PROPERTIES TIMEOUT 60 LABELS "URMA")
