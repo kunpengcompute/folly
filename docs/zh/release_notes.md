@@ -15,7 +15,7 @@
 
 |操作系统|编译器|CPU类型|
 |--|--|--|
-|Debian 12、openEuler|Clang 16|鲲鹏950处理器|
+|Linux系统，推荐Debian 12或openEuler|Clang 16|鲲鹏950处理器|
 
 ### 病毒扫描结果
 

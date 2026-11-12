@@ -8,7 +8,7 @@
 
 |环境|要求|
 |---|--|
-|操作系统|Debian 12或openEuler|
+|操作系统|Linux系统，推荐Debian 12或openEuler|
 |编译器|Clang 16及以上版本，所有依赖使用同一工具链|
 |软件|CMake、Boost、fmt、glog、libevent、liburing及压缩库开发包|
 
@@ -45,7 +45,7 @@ sudo apt-get install -y \
 
    **获取基线源码、补丁和校验文件**
 
-   基线源码保存在folly目录，补丁和校验文件保存在同级的folly-patches目录。在选定的工作目录下执行以下命令。
+   基线源码保存在Folly目录，补丁和校验文件保存在同级的folly-patches目录。在选定的工作目录下执行以下命令。
 
    ```bash 
    git clone --recurse-submodules --branch v2022.11.14.00 --single-branch \ 
@@ -117,7 +117,7 @@ sudo apt-get install -y \
 
 ## 编译与安装
 
-在folly源码根目录、已完成环境依赖安装后执行以下命令。
+在Folly源码根目录、已完成环境依赖安装后执行以下命令。
 
 ```bash
 export CC=/usr/bin/clang-16
