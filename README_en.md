@@ -1,6 +1,8 @@
 # Folly Performance Optimization Patches
 
-English|[简体中文](./README.md)
+<!-- md-trans-meta sourceCommit=6fc6532f1f14841cdb1f0c0137b40ec605234666 translatedAt=2026-10-13T03:52:47.658Z pushedAt=2026-10-13T06:33:54.110Z -->
+
+[简体中文](./README.md) | English
 
 ## What's New
 
