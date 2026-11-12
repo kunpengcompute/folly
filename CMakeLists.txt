@@ -1104,9 +1104,12 @@ endif()
 
 add_subdirectory(folly)
 
-option(FOLLY_BUILD_URMA_COALESCING_TESTS "Build the dual-host URMA coalescing test" OFF)
-option(FOLLY_BUILD_URMA_READ_TESTS "Build the dual-host URMA READ tests" OFF)
-if(FOLLY_BUILD_URMA_COALESCING_TESTS OR FOLLY_BUILD_URMA_READ_TESTS)
+option(FOLLY_BUILD_URMA_TESTS "Build URMA memory/transport contract tests" OFF)
+# Keep existing build scripts usable while using one maintained test suite.
+option(FOLLY_BUILD_URMA_COALESCING_TESTS "Legacy alias for FOLLY_BUILD_URMA_TESTS" OFF)
+option(FOLLY_BUILD_URMA_READ_TESTS "Legacy alias for FOLLY_BUILD_URMA_TESTS" OFF)
+if(FOLLY_BUILD_URMA_TESTS OR FOLLY_BUILD_URMA_COALESCING_TESTS OR FOLLY_BUILD_URMA_READ_TESTS)
+  enable_testing()
   if(NOT FOLLY_USE_URMA OR NOT BUILD_SHARED_LIBS)
     message(FATAL_ERROR "URMA hardware tests require FOLLY_USE_URMA=ON and BUILD_SHARED_LIBS=ON")
   endif()

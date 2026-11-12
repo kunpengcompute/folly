@@ -2,51 +2,55 @@
  */
 #pragma once
 #ifdef FOLLY_HAVE_URMA
+#include <folly/SocketAddress.h>
+#include <folly/io/async/AsyncSocket.h>
+#include <folly/io/async/AsyncTransport.h>
+#include <folly/io/async/urma/UrmaRecordWriter.h>
+#include <folly/io/async/urma/UrmaResourceExecutor.h>
+
 #include <memory>
 #include <vector>
-#include <folly/SocketAddress.h>
-#include <folly/io/async/AsyncTransport.h>
-#include <folly/io/async/AsyncSocket.h>
-#include <folly/io/async/urma/UrmaRecordWriter.h>
 namespace folly {
 class UrmaAsyncSocket : public AsyncTransport, public UrmaRecordWriter {
  public:
+  struct CopyStats {
+    uint64_t direct_send_bytes{0}, copied_send_bytes{0};
+    uint64_t send_wr_submitted{0}, send_sges{0};
+    uint64_t direct_read_source_bytes{0}, copied_read_source_bytes{0};
+    uint64_t transferred_read_target_bytes{0}, copied_read_target_bytes{0};
+    uint64_t read_wr_submitted{0}, read_submit_calls{0}, max_read_inflight{0};
+    // Accepted PULL records; SDK-internal retries are not additional records.
+    uint64_t offers_submitted{0}, max_offers_inflight{0}, max_receive_offers{0};
+  };
+  // Read on the owning EventBase; byte counters describe transport copies,
+  // not serialization or an application's subsequent use of received data.
+  CopyStats getCopyStats() const;
   UrmaAsyncSocket(EventBase* evb, const SocketAddress& address);
   UrmaAsyncSocket(EventBase* evb, int acceptedFd);
   explicit UrmaAsyncSocket(AsyncSocket::UniquePtr acceptedSocket);
-  // Keep the legacy factory usable in a conditional with AsyncSocket::newSocket.
-  // Both branches can convert to the AsyncTransport owning pointer.
-  static AsyncTransport::UniquePtr newSocket(
-      EventBase* evb, const SocketAddress& address) {
+  // Keep the legacy factory usable in a conditional with
+  // AsyncSocket::newSocket. Both branches can convert to the AsyncTransport
+  // owning pointer.
+  static AsyncTransport::UniquePtr newSocket(EventBase* evb,
+                                             const SocketAddress& address) {
     return AsyncTransport::UniquePtr(new UrmaAsyncSocket(evb, address));
   }
   ~UrmaAsyncSocket() override;
   void setReadCB(ReadCallback*) noexcept override;
   ReadCallback* getReadCallback() const noexcept override;
-  void write(
-      WriteCallback*,
-      const void*,
-      size_t,
-      WriteFlags = WriteFlags::NONE) noexcept override;
-  void writev(
-      WriteCallback*,
-      const iovec*,
-      size_t,
-      WriteFlags = WriteFlags::NONE) noexcept override;
-  void writeChain(
-      WriteCallback*,
-      std::unique_ptr<IOBuf>&&,
-      WriteFlags = WriteFlags::NONE) noexcept override;
-  // recordLengths describe complete serialized records BEFORE upper-layer
-  // batching, not IOBuf nodes. Their sum must equal the chain length. Adjacent
-  // small records can share SENDs; large records use READ independently. One
-  // callback still covers the entire write. Empty metadata means one record.
+  void write(WriteCallback*, const void*, size_t,
+             WriteFlags = WriteFlags::NONE) noexcept override;
+  void writev(WriteCallback*, const iovec*, size_t,
+              WriteFlags = WriteFlags::NONE) noexcept override;
+  void writeChain(WriteCallback*, std::unique_ptr<IOBuf>&&,
+                  WriteFlags = WriteFlags::NONE) noexcept override;
+  // Compatibility entry point: validates the upper-layer record lengths, then
+  // preserves their concatenated byte stream. Each PULL describes only one
+  // actual continuous registered range. One callback covers the entire write.
   bool supportsUrmaRecords() const override { return true; }
-  void writeChainWithRecords(
-      WriteCallback*,
-      std::unique_ptr<IOBuf>&&,
-      std::vector<size_t> recordLengths,
-      WriteFlags = WriteFlags::NONE) noexcept override;
+  void writeChainWithRecords(WriteCallback*, std::unique_ptr<IOBuf>&&,
+                             std::vector<size_t> recordLengths,
+                             WriteFlags = WriteFlags::NONE) noexcept override;
   EventBase* getEventBase() const override;
   void close() override;
   void closeNow() override;
@@ -80,8 +84,11 @@ class UrmaAsyncSocket : public AsyncTransport, public UrmaRecordWriter {
   bool isUrmaReady() const;
 
  private:
+  friend void urma_detail::warmResourceExecutor();
   struct Impl;
-  std::unique_ptr<Impl> impl_;
+  // Route/WR holders may outlive the public socket while DRAINING. Their
+  // callbacks are detached before the public socket is destroyed.
+  std::shared_ptr<Impl> impl_;
 };
-} // namespace folly
+}  // namespace folly
 #endif

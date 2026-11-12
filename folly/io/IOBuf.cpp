@@ -33,6 +33,9 @@
 #include <folly/ScopeGuard.h>
 #include <folly/hash/SpookyHashV2.h>
 #include <folly/io/Cursor.h>
+#ifdef FOLLY_HAVE_URMA
+#include <folly/io/async/urma/UrmaInit.h>
+#endif
 #include <folly/lang/Align.h>
 #include <folly/lang/CheckedMath.h>
 #include <folly/lang/Exception.h>
@@ -324,6 +327,11 @@ unique_ptr<IOBuf> IOBuf::create(std::size_t capacity) {
   if (capacity > kMaxIOBufSize) {
     throw_exception<std::bad_alloc>();
   }
+#ifdef FOLLY_HAVE_URMA
+  if (auto pooled = UrmaInit::tryCreateIOBuf(capacity)) {
+    return pooled;
+  }
+#endif
 
   // For smaller-sized buffers, allocate the IOBuf, SharedInfo, and the buffer
   // all with a single allocation.
