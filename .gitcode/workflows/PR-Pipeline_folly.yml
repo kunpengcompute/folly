@@ -114,13 +114,13 @@ stages: #阶段，不超过16个阶段，不超过256个job
             with:
               project-name: "boostkit"
 
-      malicious-scan: # 恶意代码扫描
-        name: malicious-scan
+      antipoison-scan: # 恶意代码扫描
+        name: antipoison-scan
         runs-on: ["ubuntu-latest", "x64", "slim"]
         permissions:
           id-token: write     # 仅本作业需要 OIDC 令牌
         steps:
-          - name: malicious-scan
+          - name: antipoison-scan
             uses: openlibing/malicious-code-scan-action/malicious-code-pr-scan-action@v1.0.0
             with:
               project-name: "boostkit"
@@ -130,7 +130,7 @@ stages: #阶段，不超过16个阶段，不超过256个job
       build:
         name: build
         if: ${{ jobs.Detect_file_changes.outputs.need_build == 'yes' }}
-        needs: [ Detect_file_changes, sca-pr, malicious-scan ]
+        needs: [ Detect_file_changes, sca-pr, antipoison-scan ]
         uses: .gitcode/workflows/build_job.yml
         with:
           runs_on_flavor: "flavor=large"
@@ -142,7 +142,7 @@ stages: #阶段，不超过16个阶段，不超过256个job
       ut:
         name: ut
         if: ${{ jobs.Detect_file_changes.outputs.need_build == 'yes' }}
-        needs: [ Detect_file_changes, sca-pr, malicious-scan ]
+        needs: [ Detect_file_changes, sca-pr, antipoison-scan ]
         uses: .gitcode/workflows/ut_job.yml
         with:
           runs_on_flavor: "flavor=large"
