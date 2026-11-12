@@ -8,6 +8,7 @@
 #include <exception>
 #include <mutex>
 #include <thread>
+#include <folly/logging/xlog.h>
 
 namespace folly::urma_detail {
 namespace {
@@ -36,16 +37,15 @@ class CleanupQueue {
   void add(CleanupTask* task) noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
     task->id = ++nextId_;
-    task->attempts = 0;
-    task->retryAt = Clock::now();
+    task->attempts = 1; // The immediate teardown already failed.
+    task->retryAt = Clock::now() + std::chrono::milliseconds(10);
     append(task);
     ++pending_;
+    XLOG(ERR) << "URMA cleanup deferred id=" << task->id
+              << " stage=" << task->stage << " status=" << task->status
+              << " pending=" << pending_;
     startWorker();
     changed_.notify_all();
-  }
-  void warm() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (!worker_.joinable()) worker_ = std::thread([this] { run(); });
   }
   size_t pending() {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -70,8 +70,7 @@ class CleanupQueue {
     } catch (const std::exception& e) {
       // Tasks remain tracked and retain their context references. A subsequent
       // enqueue/fini can retry; never discard ownership on thread exhaustion.
-      std::fprintf(stderr, "URMA cleanup worker could not start: %s\n",
-                   e.what());
+      XLOG(ERR) << "URMA cleanup worker could not start: " << e.what();
     }
   }
   void run() noexcept {
@@ -95,21 +94,16 @@ class CleanupQueue {
       ++task->attempts;
       const bool done = task->tryCleanup();
       if (done) {
-        if (task->attempts > 1)
-          std::fprintf(stderr, "URMA cleanup recovered id=%llu attempts=%llu\n",
-                       static_cast<unsigned long long>(task->id),
-                       static_cast<unsigned long long>(task->attempts));
+        XLOG(INFO) << "URMA cleanup recovered id=" << task->id
+                   << " attempts=" << task->attempts;
         delete task;
       } else {
         // Log powers of two, and back off to at most one attempt per second.
         // A permanently failing resource must not spin or flood the log.
         if (!(task->attempts & (task->attempts - 1)))
-          std::fprintf(stderr,
-                       "URMA cleanup still pending id=%llu stage=%s status=%d "
-                       "attempts=%llu\n",
-                       static_cast<unsigned long long>(task->id), task->stage,
-                       task->status,
-                       static_cast<unsigned long long>(task->attempts));
+          XLOG(ERR) << "URMA cleanup still pending id=" << task->id
+                    << " stage=" << task->stage << " status=" << task->status
+                    << " attempts=" << task->attempts;
         const auto delay = std::min<uint64_t>(
             1000, uint64_t(10) << std::min<uint64_t>(task->attempts - 1, 7));
         task->retryAt = Clock::now() + std::chrono::milliseconds(delay);
@@ -137,9 +131,9 @@ CleanupQueue& queue() {
 }  // namespace
 
 void cleanupOrDefer(std::unique_ptr<CleanupTask> task) noexcept {
-  if (task) queue().add(task.release());
+  if (task && !task->tryCleanup())
+    queue().add(task.release());
 }
-void warmCleanupExecutor() { queue().warm(); }
 size_t pendingCleanups() { return queue().pending(); }
 bool waitForCleanups(std::chrono::milliseconds timeout) {
   return queue().wait(timeout);

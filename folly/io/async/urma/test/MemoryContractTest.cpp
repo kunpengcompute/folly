@@ -1,6 +1,6 @@
 /* Copyright (c) Huawei Technologies Co., Ltd. 2026. Licensed under Apache-2.0.
  */
-#include <folly/io/async/urma/UrmaIoContext.h>
+#include <folly/io/async/urma/UrmaConfig.h>
 #include <folly/io/async/urma/UrmaMemoryPool.h>
 #include <folly/memory/IoBufPool.h>
 #include <folly/ScopeGuard.h>
@@ -60,6 +60,31 @@ UrmaPoolConfig config() {
   c.retry_ms = 2;
   c.idle_ms = 10;
   return c;
+}
+void rxUsesPoolHardLimit() {
+  auto c = config();
+  c.elastic = true;
+  c.budgets[size_t(UrmaMemoryPurpose::Rx)] = 0;
+  auto p = std::make_shared<urma_detail::MemoryPool>(nullptr, c);
+  check(p->warm(0ms), "RX hard-limit pool warm");
+  std::vector<UrmaPoolBuffer> buffers;
+  // One 4 KiB READ-control reserve remains unavailable to RX.
+  const size_t target = c.pool_max_size / 4096 - 1;
+  const auto deadline = std::chrono::steady_clock::now() + 2s;
+  while (buffers.size() < target && std::chrono::steady_clock::now() < deadline) {
+    if (auto b = p->allocate(4096, UrmaMemoryPurpose::Rx))
+      buffers.push_back(std::move(b));
+    else
+      std::this_thread::sleep_for(2ms);
+  }
+  check(buffers.size() == target && buffers.size() * 4096 > c.pool_size,
+        "RX zero budget did not follow the expanded pool capacity");
+  check(!p->allocate(4096, UrmaMemoryPurpose::Rx) &&
+            p->stats().registered_bytes <= c.pool_max_size,
+        "RX bypassed hard capacity or consumed the control reserve");
+  buffers.clear();
+  check(p->shutdown(2s) && registered == 0, "RX hard-limit pool cleanup");
+  std::cout << "PASS RX uses expanded hard capacity and preserves control reserve\n";
 }
 void alignedTlsSlices() {
   auto c = config();
@@ -187,53 +212,25 @@ void resourceNotifications() {
   block = {};
   check(::poll(&event, 1, 0) == 0, "satisfied allocation kept waking owner");
 
-  auto budget = std::make_shared<RxBudget>(4096);
-  auto lease = std::make_unique<RxStorageLease>();
-  lease->block = p->allocate(4096, UrmaMemoryPurpose::Rx);
-  lease->connectionBudget = budget;
-  lease->ownerBudget = std::make_shared<RxBudget>(4096);
-  lease->connectionBudget->retained = lease->ownerBudget->retained = 4096;
-  lease->accounted = true;
-  lease->wakeup = signal;
-  auto data = RxStorageLease::take(std::move(lease), 24, 1024);
-  auto clone = data->cloneOne();
-  auto retainedDma = p->lookup(data->data(), data->length(), false);
-  check(bool(retainedDma), "retained-budget DMA hold setup");
-  check(!budget->available(4096, *signal), "retained budget shortage setup");
-  data.reset();
-  check(::poll(&event, 1, 0) == 0, "live receive clone returned budget early");
-  std::thread release([b = std::move(clone)]() mutable { b.reset(); });
-  release.join();
-  check(::poll(&event, 1, 0) == 1 && budget->available(4096, *signal),
-        "last receive clone did not wake retained-budget waiter");
-  signal->consume();
-  // Budget can return before the backing block: its DMA pin must neither
-  // suppress that notification nor produce another one for an idle owner.
-  retainedDma = {};
-  lease = std::make_unique<RxStorageLease>();
-  lease->block = p->allocate(4096, UrmaMemoryPurpose::Rx);
-  lease->wakeup = signal;
-  lease.reset();
-  check(::poll(&event, 1, 0) == 0, "idle receive returns still woke owner");
-
-  // Race the first availability check, arming and recheck against a return.
-  // Either the caller can proceed immediately or an event must be pending.
+  // Exercise the shared pool's actual allocation/wakeup race, rather than
+  // the removed per-connection RX budget. The worker is the last block owner.
+  UrmaPoolBuffer held;
   std::atomic<unsigned> requested{0}, finished{0};
   std::thread concurrent([&] {
     for (unsigned i = 1; i <= 1000; ++i) {
       while (requested.load() < i) std::this_thread::yield();
-      budget->retained.fetch_sub(4096);
-      signal->notify();
+      held = {};
       finished.store(i);
     }
   });
   for (unsigned i = 1; i <= 1000; ++i) {
-    budget->retained = 4096;
+    held = p->allocate(4096, UrmaMemoryPurpose::Tx);
+    check(bool(held), "concurrent return fixture allocation");
     requested.store(i);
-    const bool available = budget->available(4096, *signal);
+    auto available = p->allocate(4096, UrmaMemoryPurpose::Tx, signal.get());
     while (finished.load() < i) std::this_thread::yield();
     check(available || ::poll(&event, 1, 0) == 1,
-          "concurrent retained-budget return lost its wakeup");
+          "concurrent physical-block return lost its wakeup");
     signal->consume();
   }
   concurrent.join();
@@ -264,6 +261,7 @@ extern "C" urma_status_t urma_unregister_seg(urma_target_seg_t* s) {
 }
 int main(int argc, char** argv) {
   try {
+    rxUsesPoolHardLimit();
     alignedTlsSlices();
     largeBodiesStayRegistered();
     resourceNotifications();
@@ -278,8 +276,7 @@ int main(int argc, char** argv) {
               example.registered_pool == base.registered_pool &&
               example.registered_pool.pool_max_size >
                   example.registered_pool.pool_size &&
-              urma_detail::UrmaIoContext::validateCapacity(example) >
-                  example.read_threshold,
+              example.rx_target == base.rx_target,
           "shipped config overlay / startup reserves");
     char path[] = "/tmp/urma-config-test-XXXXXX";
     int fd = ::mkstemp(path);
@@ -300,50 +297,6 @@ int main(int argc, char** argv) {
       check(rejected, "removed shared/credit configuration was accepted");
     }
     using namespace urma_detail;
-    Hello hello;
-    hello.bufferSize = 4096;
-    hello.receiveCount = 24;
-    hello.ioJetty = 7;
-    hello.socketId = 0x123456789abcdefULL;
-    hello.read = true;
-    hello.maxRead = 65536;
-    hello.segment.ubva.va = 0x123456000;
-    hello.segment.len = 65536;
-    auto wire = encodeHello(hello);
-    Hello decoded;
-    check(wire.size() == 98 &&
-              decodeHello(wire.data(), wire.size(), decoded) &&
-              decoded.ioJetty == hello.ioJetty &&
-              decoded.maxRead == hello.maxRead &&
-              decoded.socketId == hello.socketId &&
-              decoded.segment.ubva.va == hello.segment.ubva.va,
-          "HELLO98 byte order / independent endpoint / initial segment");
-    putInteger(wire.data() + 6, 3, 2);
-    check(!decodeHello(wire.data(), wire.size(), decoded),
-          "shared-queue protocol version accepted");
-    putInteger(wire.data() + 6, 4, 2);
-    check(!decodeHello(wire.data(), wire.size(), decoded),
-          "peer without EOF stream boundary accepted");
-    uint64_t endSequence = 0;
-    auto endFrame = encodeEnd(0x123456789abcdefULL);
-    check(decodeEnd(endFrame.data(), endFrame.size(), endSequence) &&
-              endSequence == 0x123456789abcdefULL &&
-              !decodeEnd(endFrame.data(), endFrame.size() - 1, endSequence),
-          "stream boundary byte order / truncated frame");
-    endFrame = encodeEnd(0);
-    check(!decodeEnd(endFrame.data(), endFrame.size(), endSequence),
-          "zero stream boundary accepted");
-    wire = encodeHello(hello);
-    wire[44] = 1;
-    check(!decodeHello(wire.data(), wire.size(), decoded),
-          "HELLO accepted reserved bits");
-    uint8_t header[24];
-    RecordHeader h{};
-    encodeHeader(header, {Message::Data, 9, 3});
-    check(decodeHeader(header, 24, h) && h.destination == 9 && h.sequence == 3,
-          "H24 round trip");
-    header[4] = 1;
-    check(!decodeHeader(header, 24, h), "old H24 version accepted");
     auto c = config();
     auto bad = c;
     bad.pool_size = 4096;
@@ -443,14 +396,16 @@ int main(int argc, char** argv) {
     dma = p->lookup(pinnedAddress, 15000, false);
     exported = p->lookup(pinnedAddress, 15000, true);
     pinned.reset();
+    dma = {};
+    check(!p->stats().dma_bytes && p->stats().exported_bytes,
+          "export-only source lifetime setup");
     auto different = IoBufPool::createFromPoolShared(p, 15000);
     check(different && different->data() != pinnedAddress,
           "TLS recycled a DMA/export pinned slice");
     std::memset(different->writableData(), 0x11, 15000);
     check(pinnedAddress[14999] == 0x7c,
-          "DMA source was overwritten after IOBuf release");
+          "exported source was overwritten after IOBuf and DMA release");
     different.reset();
-    dma = {};
     exported = {};
     p->trim();
     auto original = IoBufPool::createFromPoolShared(p, 100);

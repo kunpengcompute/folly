@@ -2,765 +2,1002 @@
  */
 #include <folly/io/async/urma/UrmaIoContext.h>
 #ifdef FOLLY_HAVE_URMA
-#include <folly/Indestructible.h>
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
+#include <cstring>
+#include <deque>
+#include <iterator>
+#include <list>
+#include <mutex>
+#include <stdexcept>
+#include <unordered_map>
+#include <vector>
 #include <folly/ScopeGuard.h>
-#include <folly/io/async/urma/UrmaCleanup.h>
-#include <folly/io/async/urma/UrmaResourceExecutor.h>
+#include <folly/io/async/AsyncTimeout.h>
 #include <folly/io/async/EventBaseLocal.h>
+#include <folly/io/async/EventHandler.h>
+#include <folly/io/async/urma/UrmaCleanup.h>
 #include <folly/io/async/urma/UrmaInit.h>
 
-#include <cstdio>
-#include <algorithm>
-namespace folly::urma_detail {
+namespace folly {
 namespace {
-constexpr uint64_t kRxSlot = uint64_t(1) << 63;
-constexpr int kCompletionBatch = 32;
-constexpr int kDrainBatches = 32;
-constexpr auto kRnrRetryDelay = std::chrono::milliseconds(1);
-constexpr auto kRnrTimeout = std::chrono::seconds(5);
-std::atomic<size_t> liveConnections{0}, liveRoutes{0};
-struct OwnerLifetime {
-  std::vector<std::weak_ptr<UrmaIoContext>> values;
-  ~OwnerLifetime() {
-    for (const auto& weak : values)
-      if (auto value = weak.lock()) value->stopOwner();
+constexpr uint64_t kRx = uint64_t(1) << 63;
+std::atomic<uint64_t> nextSocket{1}, attempts{0}, created{0}, destroyed{0},
+    live{0}, peak{0};
+EventBaseLocal<std::unique_ptr<UrmaIoContext>> contexts;
+uint64_t allocateSocket() {
+  auto n = nextSocket.load(std::memory_order_relaxed);
+  while (n && n != UINT64_MAX) {
+    if (nextSocket.compare_exchange_weak(n, n + 1, std::memory_order_relaxed))
+      return n;
   }
-};
-EventBaseLocal<OwnerLifetime>& owners() {
-  static Indestructible<EventBaseLocal<OwnerLifetime>> value;
-  return *value;
+  throw std::overflow_error("URMA socket IDs exhausted");
 }
-void require(bool ok, const char* why) {
-  if (!ok) throw std::runtime_error(why);
-}
-}  // namespace
-struct UrmaIoContext::Handler final : EventHandler {
-  UrmaIoContext* owner;
-  ConnectionQueue* group;
-  Handler(UrmaIoContext* o, int fd, ConnectionQueue* g)
-      : EventHandler(o->evb_, NetworkSocket(fd)), owner(o), group(g) {
-    require(registerHandler(READ | PERSIST),
-            "URMA owner event registration failed");
-  }
-  void handlerReady(uint16_t) noexcept override {
-    auto keep = owner->shared_from_this();
-    if (owner->stopping_) {
-      owner->stopOwner();
-      return;
-    }
-    try {
-      if (group)
-        owner->poll(*group);
-      else
-        owner->signal_->consume();
-      owner->wake();
-    } catch (...) {
-      owner->fail("URMA completion processing failed");
-    }
-  }
-};
-UrmaIoContext::UrmaIoContext(urma_context_t* ctx, const UrmaConfig& c)
-    : AsyncTimeout(static_cast<EventBase*>(nullptr)),
-      context_(ctx),
-      config_(c),
-      signal_(std::make_shared<UrmaPoolSignal>()),
-      budget_(std::make_shared<RxBudget>(
-          c.registered_pool.budgets[size_t(UrmaMemoryPurpose::Rx)])),
-      readBudget_(std::make_shared<RxBudget>(
-          c.registered_pool.budgets[size_t(UrmaMemoryPurpose::ReadTarget)])),
-      pendingBudget_(std::make_shared<RxBudget>(c.max_retained_bytes)) {}
-struct UrmaIoContext::RetiredConnection final : CleanupTask {
-  std::shared_ptr<UrmaIoContext> value;
+} // namespace
+
+struct UrmaIoContext::Peer : urma_detail::CleanupTask {
+  urma_context_t* context{nullptr};
+  urma_target_jetty_t* target{nullptr};
+  std::shared_ptr<std::atomic<bool>> released{new std::atomic<bool>(false)};
   bool tryCleanup() noexcept override {
-    if (!value->prepared_.load(std::memory_order_acquire))
-      return failed("wait-connection-preparation", 0);
-    if (value->route_)
-      return failed("wait-unresolved-connection-operations", 0);
-    if (!value->cleanup(value->io_))
-      return failed("delete-connection-queues", 0);
-    if (value->counted_) {
-      --liveConnections;
-      value->counted_ = false;
+    if (target) {
+      const auto st = urma_unimport_jfr(target);
+      if (st != URMA_SUCCESS)
+        return failed("unimport_jfr", st);
+      target = nullptr;
     }
-    if (value->ownsContext_) {
-      value->ownsContext_ = false;
-      value->context_ = nullptr;
+    if (context) {
+      context = nullptr;
       UrmaInit::releaseContext();
     }
+    released->store(true, std::memory_order_release);
     return true;
   }
 };
-UrmaIoContext::~UrmaIoContext() = default;
-uint32_t UrmaIoContext::validateCapacity(UrmaConfig& c) {
-  require(c.max_connections && c.max_pending_records &&
-              c.max_pending_records <= 65536 &&
-              c.max_retained_bytes >= c.max_pending_bytes,
-          "invalid connection or pending record limit");
-  require(!c.enable_read ||
-              (c.io_free_sq_reserve && c.io_free_sq_reserve < c.tx_depth),
-          "READ has no local completion SEND reserve");
-  if (!c.enable_read) c.io_free_sq_reserve = 0;
-  // Protect the minimum resources for one connection. Further connections
-  // are admitted only when their independent RX buffers can be allocated.
-  auto reserve = [&](size_t bytes, size_t count, UrmaMemoryPurpose purpose) {
-    for (auto& tier : c.registered_pool.classes)
-      if (tier.bytes >= bytes) {
-        tier.reserve[size_t(purpose)] =
-            std::max(tier.reserve[size_t(purpose)], count);
-        return;
-      }
-    throw std::invalid_argument("connection storage has no pool class");
+
+struct UrmaIoContext::Impl : EventHandler, AsyncTimeout {
+  struct ReadBudget {
+    static constexpr size_t capacity = 128 * 1024 * 1024;
+    std::atomic<size_t> pending{0}, pendingBytes{0};
   };
-  reserve(c.buffer_size, c.rx_depth + 1, UrmaMemoryPurpose::Rx);
-  reserve(c.buffer_size, 1, UrmaMemoryPurpose::Tx);
-  reserve(kPullBytes, c.offer_window, UrmaMemoryPurpose::Control);
-  uint32_t readLimit = 0;
-  if (c.enable_read) {
-    const auto available = std::min<size_t>(
-        c.max_pending_bytes,
-        c.registered_pool.budgets[size_t(UrmaMemoryPurpose::ReadTarget)]);
-    for (const auto& tier : c.registered_pool.classes)
-      if (tier.bytes <= available) readLimit = tier.bytes;
-    require(readLimit > c.read_threshold,
-            "READ budget cannot reserve one target");
-    reserve(readLimit, 1, UrmaMemoryPurpose::ReadTarget);
-    reserve(24, c.tx_depth, UrmaMemoryPurpose::ReadControl);
-  }
-  MemoryPool::validate(c.registered_pool);
-  return readLimit;
-}
-void UrmaIoContext::prepare(ConnectionQueue& g) {
-  g.depth = config_.rx_depth;
-  g.target = config_.rx_depth;
-  g.sendDepth = config_.tx_depth;
-  g.slots.resize(g.target);
-  g.deferredOrder.resize(g.target);
-  g.flights.resize(g.sendDepth);
-  g.event = urma_create_jfce(context_);
-  require(g.event, "create connection JFCE failed");
-  urma_jfc_cfg_t cq{};
-  cq.depth = g.depth + g.sendDepth + 1;
-  cq.jfce = g.event;
-  g.cq = urma_create_jfc(context_, &cq);
-  require(g.cq, "create connection CQ failed");
-  urma_jfs_cfg_t tx{};
-  tx.depth = g.sendDepth;
-  tx.max_sge = config_.max_send_sge;
-  tx.max_rsge = 1;
-  tx.jfc = g.cq;
-  tx.trans_mode = URMA_TM_RM;
-  tx.flag.bs.order_type = URMA_OI;
-  // SEND uses ordered execution/remote completion below. The SDK forbids
-  // those WR flags when outorder_comp is enabled.
-  tx.flag.bs.outorder_comp = 0;
-  tx.rnr_retry = URMA_TYPICAL_RNR_RETRY;
-  tx.err_timeout = URMA_TYPICAL_ERR_TIMEOUT;
-  g.tx = urma_create_jfs(context_, &tx);
-  require(g.tx, "create connection JFS failed");
-  urma_jfr_cfg_t rx{};
-  rx.depth = g.depth;
-  rx.max_sge = 1;
-  rx.jfc = g.cq;
-  rx.trans_mode = URMA_TM_RM;
-  rx.flag.bs.order_type = URMA_OI;
-  rx.min_rnr_timer = 12;
-  g.rx = urma_create_jfr(context_, &rx);
-  require(g.rx, "create connection JFR failed");
-  urma_jetty_cfg_t jetty{};
-  jetty.flag.bs.share_jfr = 1;
-  jetty.shared.jfr = g.rx;
-  jetty.shared.jfc = g.cq;
-  jetty.jfs_cfg = tx;
-  jetty.jfs_cfg.depth = 1;
-  g.endpoint = urma_create_jetty(context_, &jetty);
-  require(g.endpoint, "create connection receive endpoint failed");
-  for (size_t i = 0; i < g.slots.size(); ++i)
-    require(refill(g, i), "initial soft RX target could not be posted");
-  // The owner arms and checks the CQ after installing its event handlers.
-}
-std::shared_ptr<UrmaIoContext> UrmaIoContext::get(EventBase* evb) {
-  auto* ctx = UrmaInit::acquireContext();
-  require(ctx, "URMA context unavailable");
-  auto release = makeGuard([&] { UrmaInit::releaseContext(); });
-  auto chosen = std::shared_ptr<UrmaIoContext>(
-      new UrmaIoContext(ctx, UrmaInit::getConfig()));
-  chosen->cleanupTask_ = std::make_unique<RetiredConnection>();
-  chosen->ownsContext_ = true;
-  release.dismiss();
-  // The cleanup node exists before the first SDK resource is created.
-  try {
-    auto count = liveConnections.load();
-    do {
-      require(count < chosen->config_.max_connections,
-              "URMA connection limit exceeded");
-    } while (!liveConnections.compare_exchange_weak(count, count + 1));
-    chosen->counted_ = true;
-    chosen->evb_ = evb;
-    chosen->attachEventBase(evb);
-    chosen->detached_ = false;
-    chosen->poolHandler_ = std::make_unique<Handler>(
-        chosen.get(), chosen->signal_->fd(), nullptr);
-    auto* lifetime = owners().get(*evb);
-    if (!lifetime) lifetime = &owners().emplace(*evb);
-    auto& entries = lifetime->values;
-    entries.erase(std::remove_if(entries.begin(), entries.end(),
-                                 [](const auto& w) { return w.expired(); }),
-                  entries.end());
-    entries.push_back(chosen);
-    UrmaInit::subscribePool(chosen->signal_);
-    const bool queued = submitPreparation([chosen] {
-      try {
-        if (!chosen->stopping_.load()) {
-          chosen->prepare(chosen->io_);
-          chosen->preparedOK_ = true;
-        }
-      } catch (...) {
-        // The cleanup worker owns all partially acquired resources.
+  struct TxCompletionCtx {
+    uint64_t socket{0}, user{0};
+    uint32_t index{0};
+    Listener* listener{nullptr};
+    bool read{false};
+    bool* readObserved{nullptr};
+    urma_jfs_wr_t work{};
+    std::array<urma_sge_t, 4> source{};
+    urma_sge_t destination{};
+    std::shared_ptr<void> hold;
+  };
+  struct Slot {
+    // Fixed owner storage: user_ctx points here until the terminal CQE.
+    TxCompletionCtx completion;
+    bool reserved{false};
+    bool submitted{false};
+  };
+  struct Hardware : urma_detail::CleanupTask {
+    urma_context_t* ctx{nullptr};
+    urma_jfce_t* event{nullptr};
+    urma_jfc_t* cq{nullptr};
+    urma_jfs_t* tx{nullptr};
+    urma_jfr_t* rx{nullptr};
+    UrmaInit::Buffer storage;
+    std::vector<UrmaInit::Buffer> receiveBuffers;
+    std::vector<Slot> slots;
+    bool counted{false};
+    bool ack() {
+      if (!event) return true;
+      urma_jfc_t* queues[1];
+      while (true) {
+        const int n = urma_wait_jfc(event, 1, 0, queues);
+        if (n < 0) return failed("wait_jfc", n);
+        if (!n) return true;
+        uint32_t count[1] = {1};
+        urma_ack_jfc(queues, count, 1);
       }
-      chosen->prepared_.store(true, std::memory_order_release);
-      chosen->signal_->signal();
-    });
-    require(queued, "URMA connection preparation queue full");
-  } catch (...) {
-    chosen->prepared_.store(true, std::memory_order_release);
-    chosen->stopOwner();
-    throw;
-  }
-  return chosen;
-}
-bool UrmaIoContext::ready() {
-  if (!prepared_.load(std::memory_order_acquire)) return false;
-  require(preparedOK_ && !stopping_, "URMA connection preparation failed");
-  if (!ioHandler_) {
-    ioHandler_ = std::make_unique<Handler>(this, io_.event->fd, &io_);
-    poll(io_);
-  }
-  return true;
-}
-void UrmaIoContext::add(const std::shared_ptr<UrmaRoute>& route) {
-  require(!route_ && !stopping_, "connection already has a socket");
-  route_ = route;
-  route->ioOwner = this;
-  ++liveRoutes;
-}
-void UrmaIoContext::remove(uint64_t id, const UrmaRoute* expected) {
-  if (!route_ || route_->socketId != id || route_.get() != expected) return;
-  route_->ioOwner = nullptr;
-  route_.reset();
-  --liveRoutes;
-  stopOwner();
-}
-size_t UrmaIoContext::activeRoutes() { return liveRoutes.load(); }
-urma_jetty_id_t UrmaIoContext::endpoint() const {
-  return io_.endpoint->jetty_id;
-}
-bool UrmaIoContext::refill(ConnectionQueue& g, size_t index) {
-  auto& slot = g.slots[index];
-  if (slot.state == RxSlotState::Posted) return true;
-  if (g.broken || stopping_) return false;
-  if (!slot.storage) {
-    auto block = UrmaInit::poolAlloc(
-        config_.buffer_size, UrmaMemoryPurpose::Rx, signal_.get());
-    if (!block) {
-      ++g.replacementFailures;
-      g.refillPending = true;
-      return false;
     }
-    auto lease = std::make_unique<RxStorageLease>();
-    lease->block = std::move(block);
-    lease->wakeup = signal_;
-    slot.storage = std::move(lease);
-    slot.state = RxSlotState::Ready;
+    bool tryCleanup() noexcept override {
+      if (!ack()) return false;
+      urma_status_t st;
+      if (tx) {
+        st = urma_delete_jfs(tx);
+        if (st != URMA_SUCCESS)
+          return failed("delete_jfs", st);
+        tx = nullptr;
+      }
+      // Successful JFS destruction is the local WR teardown barrier. In
+      // particular, do not release READ destinations on a socket timeout.
+      slots.clear();
+      if (rx) {
+        st = urma_delete_jfr(rx);
+        if (st != URMA_SUCCESS)
+          return failed("delete_jfr", st);
+        rx = nullptr;
+      }
+      receiveBuffers.clear();
+      if (cq) {
+        if (!ack()) return false;
+        urma_cr_t cr[32];
+        int n;
+        do { n = urma_poll_jfc(cq, 32, cr); } while (n > 0);
+        if (n < 0) return failed("poll_jfc", n);
+        st = urma_delete_jfc(cq);
+        if (st != URMA_SUCCESS)
+          return failed("delete_jfc", st);
+        cq = nullptr;
+      }
+      if (event) {
+        st = urma_delete_jfce(event);
+        if (st != URMA_SUCCESS)
+          return failed("delete_jfce", st);
+        event = nullptr;
+      }
+      storage = {}; // Queues are gone; return the slice without unregistering.
+      if (ctx) {
+        ctx = nullptr;
+        UrmaInit::releaseContext();
+      }
+      if (counted) {
+        counted = false;
+        ++destroyed;
+        --live;
+      }
+      return true;
+    }
+  };
+  struct Connection {
+    Listener* listener;
+    bool waiting{false}, read{false}, data{false}, freeWaiting{false};
+    size_t deferred{0};
+    std::list<uint64_t>::iterator waiter;
+  };
+  EventBase* evb;
+  UrmaConfig config;
+  uint32_t rxTarget;
+  std::unique_ptr<Hardware> hw{new Hardware};
+  std::unordered_map<uint64_t, Connection> sockets;
+  std::unordered_map<uint64_t, std::shared_ptr<Retired>> retired;
+  std::unordered_map<std::string, std::weak_ptr<Peer>> imports;
+  std::list<uint64_t> waiters, freeWaiters;
+  std::vector<uint32_t> freeSlots;
+  std::vector<uint32_t> pendingRx;
+  struct DeferredReceive {
+    urma_detail::PacketHeader header;
+    urma_cr_t completion{};
+    std::chrono::steady_clock::time_point since;
+    std::unique_ptr<IOBuf> data;
+  };
+  std::list<DeferredReceive> deferredRx;
+  uint32_t initialRx{0};
+  bool initialized{false};
+  std::shared_ptr<UrmaPoolSignal> poolSignal{new UrmaPoolSignal};
+  struct PoolHandler : EventHandler {
+    Impl& owner;
+    PoolHandler(Impl& o) : EventHandler(o.evb, NetworkSocket(o.poolSignal->fd())), owner(o) {}
+    void handlerReady(uint16_t) noexcept override {
+      owner.poolSignal->consume();
+      const auto ids = UrmaInit::revocableSegments();
+      if (!ids.empty()) {
+        owner.notifyingFailure = true; // prohibit owner teardown in callbacks
+        auto reset = makeGuard([&] { owner.notifyingFailure = false; });
+        std::vector<uint64_t> sockets;
+        for (const auto& entry : owner.sockets) sockets.push_back(entry.first);
+        for (auto id : sockets) {
+          auto it = owner.sockets.find(id);
+          if (it != owner.sockets.end()) it->second.listener->revokeSegments(ids);
+        }
+      }
+      owner.timeoutExpired();
+    }
+  };
+  std::unique_ptr<PoolHandler> poolHandler;
+  // Each entry owns one SQ slot and one READ context, including while a
+  // known-unaccepted suffix waits for retry. Never wait to fill a batch.
+  std::deque<uint32_t> pendingReads;
+  std::shared_ptr<ReadBudget> readBudget{new ReadBudget};
+  struct SegmentEntry {
+    std::weak_ptr<ImportedSegment> segment;
+    std::shared_ptr<std::atomic<bool>> released;
+  };
+  std::unordered_map<std::string, SegmentEntry> readImports;
+  uint64_t sends{0}, receives{0}, reads{0}, completions{0};
+  uint64_t readConnections{0}, dataConnections{0};
+  bool polling{false}, waking{false}, notifyingFailure{false}, broken{false};
+
+  explicit Impl(EventBase* e)
+      : EventHandler(e),
+        AsyncTimeout(e),
+        evb(e),
+        config(UrmaInit::getConfig()),
+        rxTarget(config.rx_target ? config.rx_target : config.rx_depth) {}
+  ~Impl() override {
+    cancelTimeout();
+    unregisterHandler();
+    poolSignal->stop();
+    poolHandler.reset();
+    urma_detail::cleanupOrDefer(std::move(hw));
   }
-  if (slot.state == RxSlotState::Completed) slot.state = RxSlotState::Ready;
-  require(slot.state == RxSlotState::Ready, "RX slot state cannot be reposted");
-  auto& lease = *slot.storage;
-  lease.dma =
-      UrmaInit::lookupSegment(lease.block.data(), lease.block.capacity());
-  require(bool(lease.dma), "RX replacement is not registered");
-  slot.sge = {};
-  slot.sge.addr = reinterpret_cast<uint64_t>(lease.block.data());
-  slot.sge.len = config_.buffer_size;
-  slot.sge.tseg = lease.block.segment();
-  slot.wr = {};
-  slot.wr.src.sge = &slot.sge;
-  slot.wr.src.num_sge = 1;
-  slot.wr.user_ctx = kRxSlot | index;
-  slot.wr.next = nullptr;
-  urma_jfr_wr_t* bad = nullptr;
-  const auto result = urma_post_jfr_wr(g.rx, &slot.wr, &bad);
-  if (result == URMA_SUCCESS) {
-    slot.state = RxSlotState::Posted;
-    ++g.posted;
+  void checkThread() const {
+    if (!evb->isInEventBaseThread())
+      throw std::logic_error("URMA owner thread mismatch");
+  }
+  bool init() {
+    checkThread();
+    if (broken) throw std::runtime_error("URMA shared owner failed");
+    if (initialized) return true;
+    if (!hw->ctx) {
+      ++attempts;
+      hw->ctx = UrmaInit::acquireContext();
+      if (!hw->ctx) throw std::runtime_error("URMA context unavailable");
+      hw->slots.resize(config.tx_depth);
+      for (uint32_t i = config.tx_depth; i; --i) freeSlots.push_back(i - 1);
+      hw->receiveBuffers.resize(rxTarget);
+      if (!poolHandler) {
+        poolHandler.reset(new PoolHandler(*this));
+        if (!poolHandler->registerHandler(READ | PERSIST))
+          throw std::runtime_error("URMA pool event registration failed");
+        UrmaInit::subscribePool(poolSignal);
+      }
+    }
+    if (!hw->storage.memory) {
+      hw->storage = UrmaInit::allocateBuffer(
+          size_t(config.tx_depth) * config.buffer_size,
+          UrmaMemoryPurpose::Rx, poolSignal.get());
+      if (!hw->storage.memory) return false;
+    }
+    if (!hw->event) {
+      hw->event = urma_create_jfce(hw->ctx);
+      if (!hw->event) throw std::runtime_error("URMA shared event creation failed");
+    }
+    if (!hw->cq) {
+      urma_jfc_cfg_t cq{};
+      cq.depth = config.rx_depth + config.tx_depth + 1;
+      cq.jfce = hw->event;
+      hw->cq = urma_create_jfc(hw->ctx, &cq);
+      if (!hw->cq) throw std::runtime_error("URMA shared CQ creation failed");
+    }
+    if (!hw->rx) {
+      urma_jfr_cfg_t rx{};
+      rx.depth = config.rx_depth;
+      rx.max_sge = 1;
+      rx.jfc = hw->cq;
+      rx.trans_mode = URMA_TM_RM;
+      rx.flag.bs.order_type = URMA_OI;
+      rx.min_rnr_timer = 12;
+      hw->rx = urma_create_jfr(hw->ctx, &rx);
+      if (!hw->rx) throw std::runtime_error("URMA shared JFR creation failed");
+    }
+    if (!hw->tx) {
+      urma_jfs_cfg_t tx{};
+      tx.depth = config.tx_depth;
+      tx.max_sge = config.max_send_sge;
+      tx.jfc = hw->cq;
+      tx.trans_mode = URMA_TM_RM;
+      tx.flag.bs.order_type = URMA_OI;
+      tx.rnr_retry = URMA_TYPICAL_RNR_RETRY;
+      tx.err_timeout = URMA_TYPICAL_ERR_TIMEOUT;
+      hw->tx = urma_create_jfs(hw->ctx, &tx);
+      if (!hw->tx) throw std::runtime_error("URMA shared JFS creation failed");
+    }
+    while (initialRx < rxTarget) {
+      auto st = postRx(initialRx);
+      if (st == URMA_EAGAIN) return false;
+      if (st != URMA_SUCCESS)
+        throw std::runtime_error("URMA initial receive post failed");
+      ++initialRx;
+    }
+    changeHandlerFD(NetworkSocket(hw->event->fd));
+    if (!registerHandler(READ | PERSIST) ||
+        urma_rearm_jfc(hw->cq, false) != URMA_SUCCESS)
+      throw std::runtime_error("URMA shared CQ registration failed");
+    initialized = hw->counted = true;
+    ++created;
+    auto count = ++live;
+    auto old = peak.load();
+    while (count > old && !peak.compare_exchange_weak(old, count)) {}
     return true;
   }
-  g.refillPending = true;
-  if (bad != &slot.wr) {
-    // An unknown acceptance is potentially posted. Keep its DMA pin and allow
-    // a later CQE to settle it, but admit no new traffic on this group.
-    slot.state = RxSlotState::Posted;
-    ++g.posted;
-    g.broken = true;
-    if (prepared_.load(std::memory_order_acquire))
-      fail("ambiguous RX post acceptance");
-  } else
-    lease.dma = {};  // definitely unaccepted, keep READY and its block
-  retryLater();
-  return false;
-}
-PostResult UrmaIoContext::post(std::unique_ptr<TxCompletionCtx>& work) {
-  auto& g = io_;
-  if (g.broken || stopping_) return PostResult::Unaccepted;  // no SDK call
-  // RNR of our outgoing SEND must not block an incoming PULL's READ/FREE.
-  // READ consumes no remote receive slot. Its CQE returns this local slot
-  // before the corresponding FREE needs it.
-  const bool progress = work->kind == Operation::Read || work->kind == Operation::Free;
-  if (g.retrying && !progress) return PostResult::Full;
-  const auto reserve = progress ? 0 : config_.io_free_sq_reserve;
-  if (g.inflight >= g.sendDepth - reserve) return PostResult::Full;
-  size_t i = 0;
-  while (i < g.flights.size() && g.flights[i]) ++i;
-  require(i < g.flights.size(), "connection SQ accounting mismatch");
-  work->wr.next = nullptr;
-  work->wr.user_ctx = i;
-  work->wr.flag.bs.complete_enable = 1;
-  work->wr.flag.bs.solicited_enable = 1;
-  if (work->kind != Operation::Read) {
-    // Preserve the original per-connection SEND ordering for DATA/PULL/FREE.
-    // Software sequences still handle retries and whole-write callbacks.
-    work->wr.flag.bs.place_order = URMA_STRONG_ORDER;
-    work->wr.flag.bs.comp_order = 1;
+  void cancelPreparation() {
+    if (initialized || !sockets.empty()) return;
+    unregisterHandler();
+    cancelTimeout();
+    urma_detail::cleanupOrDefer(std::move(hw));
+    hw.reset(new Hardware);
+    freeSlots.clear();
+    deferredRx.clear();
+    initialRx = 0;
   }
-  auto* wr = &work->wr;
-  g.flights[i] = std::move(work);
-  ++g.inflight;
-  urma_jfs_wr_t* bad = nullptr;
-  const auto result = urma_post_jfs_wr(g.tx, wr, &bad);
-  if (result == URMA_SUCCESS) return PostResult::Accepted;
-  if (bad == wr) {
-    work = std::move(g.flights[i]);
-    --g.inflight;
-    retryLater();
-    return PostResult::Unaccepted;
+  urma_status_t postRx(uint32_t i) {
+    auto& buffer = hw->receiveBuffers[i];
+    if (!buffer.memory)
+      buffer =
+          UrmaInit::allocateBuffer(config.buffer_size, UrmaMemoryPurpose::Rx, poolSignal.get());
+    if (!buffer.memory)
+      return URMA_EAGAIN;
+    urma_sge_t sg{};
+    sg.addr = reinterpret_cast<uint64_t>(buffer.memory);
+    sg.len = config.buffer_size;
+    sg.tseg = buffer.segment;
+    urma_jfr_wr_t wr{};
+    wr.src.sge = &sg;
+    wr.src.num_sge = 1;
+    wr.user_ctx = kRx | i;
+    urma_jfr_wr_t* bad = nullptr;
+    auto st = urma_post_jfr_wr(hw->rx, &wr, &bad);
+    // Only an explicitly unaccepted WR can be retried.
+    if (st == URMA_EAGAIN && bad != &wr)
+      return URMA_EINVAL;
+    return st;
   }
-  g.broken = true;
-  return PostResult::Unknown;  // ctx stays pinned, never retry this record
-}
-bool UrmaIoContext::canPost(Operation kind) const {
-  if (!prepared_.load(std::memory_order_acquire) || !preparedOK_) return false;
-  const auto& g = io_;
-  const bool progress = kind == Operation::Read || kind == Operation::Free;
-  const auto reserve = progress ? 0 : config_.io_free_sq_reserve;
-  return !g.broken && !stopping_ &&
-         (!g.retrying || progress) &&
-         g.inflight < g.sendDepth - reserve;
-}
-void UrmaIoContext::receive(ConnectionQueue& g, const urma_cr_t& c) {
-  const size_t index = c.user_ctx & ~kRxSlot;
-  require(index < g.slots.size(), "RX CQE slot outside configured soft target");
-  auto& slot = g.slots[index];
-  require((slot.state == RxSlotState::Posted || slot.deferred) && slot.storage,
-          "invalid RX completion or slot lifetime");
-  const bool retrying = slot.deferred;
-  if (retrying) --g.deferredCount;
-  if (slot.state == RxSlotState::Posted) --g.posted;
-  slot.deferred = false;
-  slot.state = RxSlotState::Completed;
-  slot.storage->dma = {};
-  if (c.status != URMA_CR_SUCCESS || c.completion_len > slot.sge.len) {
-    g.broken = true;
-    fail("failed or oversized RX completion");
-    return;
-  }
-  auto* p = static_cast<const uint8_t*>(slot.storage->block.data());
-  RecordHeader h{};
-  require(decodeHeader(p, c.completion_len, h), "invalid H24");
-  const bool data = h.type == Message::Data;
-  require(data ? (c.opcode == URMA_CR_OPC_SEND && c.completion_len > 24)
-               : (c.opcode == URMA_CR_OPC_SEND_WITH_IMM &&
-                  (h.type == Message::Pull
-                       ? c.completion_len == 32 && getInteger(p + 24, 4) &&
-                             !getInteger(p + 28, 4)
-                       : c.completion_len == 24 && c.imm_data == 0)),
-          "invalid DATA/PULL/FREE record");
-  auto route = route_;
-  require(route && route->socketId == h.destination,
-          "record destination does not match connection");
-  if (h.type == Message::Free) {
-    route->onRecord(h, nullptr, 0);
-  } else if (data) {
-    auto connectionBudget = route->receiveBudget();
-    const auto capacity = slot.storage->block.capacity();
-    if ((!retrying && g.deferredCount) ||
-        !connectionBudget->available(capacity, *signal_)) {
-      // Keep the completed slot intact until an upper-layer buffer is returned.
-      // This is local bounded storage; no credit packet is exchanged.
-      slot.completion = c;
-      slot.deferred = true;
-      ++g.deferredCount;
-      g.refillPending = true;
+  void fail(const char* why) {
+    if (broken)
       return;
+    broken = true;
+    notifyingFailure = true;
+    unregisterHandler();
+    cancelTimeout();
+    std::vector<uint64_t> ids;
+    for (const auto& item : sockets)
+      ids.push_back(item.first);
+    for (auto id : ids) {
+      auto found = sockets.find(id);
+      if (found != sockets.end())
+        found->second.listener->failed(why);
     }
-    auto lease = std::move(slot.storage);
-    slot.state = RxSlotState::Empty;
-    lease->connectionBudget = std::move(connectionBudget);
-    lease->ownerBudget = budget_;
-    lease->connectionBudget->retained.fetch_add(capacity);
-    lease->ownerBudget->retained.fetch_add(capacity);
-    lease->accounted = true;
-    auto buffer = RxStorageLease::take(std::move(lease), 24,
-                                        c.completion_len - 24);
-    route->onRecord(h, std::move(buffer), 0);
-  } else {
-    auto description = IOBuf::copyBuffer(p + 24, 8);
-    route->onRecord(h, std::move(description), c.imm_data);
+    notifyingFailure = false;
   }
-  wait(route);
-  // A continuation poll also schedules delivery; no credit timer is needed.
-  wake();
-  if (slot.storage) slot.state = RxSlotState::Ready;
-  (void)refill(g, index);
-}
-void UrmaIoContext::poll(ConnectionQueue& g) {
-  if (polling_ || stopping_) return;
-  cqPending_ = false;
-  polling_ = true;
-  auto finish = makeGuard([&] {
-    polling_ = false;
-    // A callback can close the owner. Settle the entire removed batch first.
-    if (stopping_) stopOwner();
-  });
-  try {
-    // A notification is not a CQE. Acknowledge exactly the retrieved events;
-    // completions remain in the CQ until poll removes them.
-    if (!g.eventCount) {
-      const int n =
-          urma_wait_jfc(g.event, ConnectionQueue::kEventBatch, 0, g.events.data());
-      require(n >= 0, "wait connection JFC failed");
-      g.eventCount = n;
+  void wait(uint64_t id, bool freeNotification = false) {
+    auto found = sockets.find(id);
+    if (found == sockets.end())
+      return;
+    auto& c = found->second;
+    if (c.waiting) {
+      if (!freeNotification || c.freeWaiting)
+        return;
+      waiters.erase(c.waiter);
     }
-    require(g.eventCount <= ConnectionQueue::kEventBatch, "invalid JFC event count");
-    for (int i = 0; i < g.eventCount; ++i)
-      require(g.events[i] == g.cq, "unexpected JFC event");
-    if (g.eventCount) {
-      std::array<uint32_t, ConnectionQueue::kEventBatch> counts;
-      counts.fill(1);
-      urma_ack_jfc(g.events.data(), counts.data(), g.eventCount);
-      g.eventCount = 0;
+    auto& queue = freeNotification ? freeWaiters : waiters;
+    queue.push_back(id);
+    c.waiter = std::prev(queue.end());
+    c.waiting = true;
+    c.freeWaiting = freeNotification;
+  }
+  void wake() {
+    if (waking || broken)
+      return;
+    waking = true;
+    size_t budget = std::min<size_t>(64, waiters.size() + freeWaiters.size());
+    while (budget-- && !freeSlots.empty() &&
+           (!freeWaiters.empty() || !waiters.empty()) && !broken) {
+      auto& queue = freeWaiters.empty() ? waiters : freeWaiters;
+      auto id = queue.front();
+      queue.pop_front();
+      auto found = sockets.find(id);
+      if (found == sockets.end())
+        continue;
+      found->second.waiting = false;
+      found->second.freeWaiting = false;
+      found->second.listener->writable();
     }
-
-    // Two bounded poll/rearm passes: the second poll catches the first arm's
-    // race window. Full batches continue in the loop; later notifications are
-    // handled by the persistent event handler. Both entries use this path.
-    for (int pass = 0; pass < 2; ++pass) {
-      urma_cr_t completions[kCompletionBatch]{};
-      const int n = urma_poll_jfc(g.cq, kCompletionBatch, completions);
-      require(n >= 0 && n <= kCompletionBatch, "poll connection JFC failed");
-      for (int i = 0; i < n; ++i) complete(g, completions[i]);
-      if (stopping_) return;
-      // The second pass already continues a full first batch. Only a full
-      // final batch needs another CQ turn, independently of route progress.
-      if (pass == 1 && n == kCompletionBatch) {
-        cqPending_ = true;
-        evb_->runInLoop(this);
+    waking = false;
+  }
+  void flushReads() {
+    while (!pendingReads.empty() && !broken) {
+      std::array<uint32_t, 32> batch;
+      const size_t count = std::min(batch.size(), pendingReads.size());
+      for (size_t i = 0; i < count; ++i) {
+        batch[i] = pendingReads.front();
+        pendingReads.pop_front();
+        auto& slot = hw->slots[batch[i]];
+        slot.submitted = true;
+        slot.completion.work.next = nullptr;
+        if (i)
+          hw->slots[batch[i - 1]].completion.work.next = &slot.completion.work;
       }
-      require(urma_rearm_jfc(g.cq, false) == URMA_SUCCESS,
-              "connection CQ rearm failed");
-    }
-
-    // Still inside the callback lifetime guard: a terminal retry may close the
-    // socket. stopOwner() must not start queue deletion until this turn ends.
-    retryRnr(g);
-
-  } catch (...) {
-    g.broken = true;
-    throw;
-  }
-}
-void UrmaIoContext::complete(ConnectionQueue& g, const urma_cr_t& c) noexcept {
-  try {
-    if (c.status == URMA_CR_WR_SUSPEND_DONE ||
-        c.status == URMA_CR_WR_FLUSH_ERR_DONE) {
-      // SDK synthetic notifications explicitly have no valid user_ctx.
-      // They cannot settle whichever flight happens to occupy that index.
-      g.broken = true;
-      fail("URMA synthetic queue-state completion");
-      return;
-    }
-    if (c.user_ctx & kRxSlot)
-      receive(g, c);
-    else {
-      require(c.user_ctx < g.flights.size() && g.flights[c.user_ctx],
-              "unknown TX completion");
-      auto& flight = g.flights[c.user_ctx];
-      require(!flight->retryPending, "completion for an unposted RNR retry");
-      flight->remoteRejected = flight->kind != Operation::Read &&
-          c.status == URMA_CR_RNR_RETRY_CNT_EXC_ERR;
-      if (!g.broken && !stopping_ && flight->kind != Operation::Read &&
-          c.status == URMA_CR_RNR_RETRY_CNT_EXC_ERR) {
-        const auto now = std::chrono::steady_clock::now();
-        if (flight->rnrSince == std::chrono::steady_clock::time_point{}) {
-          flight->rnrSince = now;
-          ++g.retrying;
-        }
-        flight->retryPending = true;
-        flight->retryAt = now + kRnrRetryDelay;
-        // No completion callback or new sequence: the peer did not receive
-        // this SEND. ACK timeout and other ambiguous errors never come here.
+      urma_jfs_wr_t* bad = nullptr;
+      auto status =
+          urma_post_jfs_wr(hw->tx, &hw->slots[batch[0]].completion.work, &bad);
+      size_t accepted = count;
+      if (status != URMA_SUCCESS) {
+        for (size_t i = 0; i < count; ++i)
+          if (bad == &hw->slots[batch[i]].completion.work) {
+            accepted = i;
+            break;
+          }
+      }
+      // The SDK consumes the descriptor chain during post. CQEs still refer
+      // to individual stable slots; later slot reuse must not retain links.
+      for (size_t i = 0; i < count; ++i)
+        hw->slots[batch[i]].completion.work.next = nullptr;
+      if (status != URMA_SUCCESS && accepted == count) {
+        // No trustworthy failed-WR boundary. Any entry may be in DMA: retain
+        // every hold until its CQE or successful hardware teardown.
+        fail("URMA READ batch acceptance unknown");
         return;
       }
-      auto work = std::move(g.flights[c.user_ctx]);
-      --g.inflight;
-      if (work->rnrSince != std::chrono::steady_clock::time_point{}) --g.retrying;
-      const bool ok = c.status == URMA_CR_SUCCESS;
-      if (!ok)
-        std::fprintf(stderr,
-                     "URMA CQ failure: status=%u kind=%u queue=%s "
-                     "local=%u tpn=%u sequence=%llu\n",
-                     unsigned(c.status), unsigned(work->kind),
-                     "IO", c.local_id, c.tpn,
-                     static_cast<unsigned long long>(work->sequence));
-      work->route->onTx(*work, ok);
-      if (!ok) {
-        g.broken = true;
-        fail("URMA work completion failed");
+      reads += accepted;
+      for (size_t i = count; i > accepted; --i) {
+        hw->slots[batch[i - 1]].submitted = false;
+        pendingReads.push_front(batch[i - 1]);
+      }
+      if (status == URMA_EAGAIN)
+        return; // Keep the suffix; CQ progress or the existing timer retries.
+      if (status != URMA_SUCCESS) {
+        fail(("URMA READ batch submit failed: " + std::to_string(status))
+                 .c_str());
+        return;
       }
     }
-  } catch (const std::exception& e) {
-    // CQEs already removed from the device must all be settled, even if
-    // one record is malformed or its software bookkeeping allocation
-    // fails.
-    g.broken = true;
-    fail(e.what());
-  } catch (...) {
-    g.broken = true;
-    fail("URMA completion processing failed with unknown exception");
   }
-}
-void UrmaIoContext::retryRnr(ConnectionQueue& g) {
-  if (!g.retrying) return;
-  // Timer retries also run without a CQ event. Keep queue cleanup deferred
-  // across callbacks just as when this function is called from poll().
-  const bool wasPolling = polling_;
-  polling_ = true;
-  auto finish = makeGuard([&] {
-    polling_ = wasPolling;
-    if (!polling_ && stopping_) stopOwner();
-  });
-  bool waiting = false;
-  bool posted = false;
-  size_t selected = g.flights.size();
-  const auto now = std::chrono::steady_clock::now();
-  for (size_t i = 0; i < g.flights.size(); ++i) {
-    auto& flight = g.flights[i];
-    if (!flight || flight->rnrSince == std::chrono::steady_clock::time_point{})
-      continue;
-    if (!flight->retryPending) {
-      posted = true;
-      continue;
+  void receive(const urma_cr_t& c) {
+    const auto slot = uint32_t(c.user_ctx & ~kRx);
+    auto& buffer = hw->receiveBuffers[slot];
+    auto* bytes = static_cast<uint8_t*>(buffer.memory);
+    urma_detail::PacketHeader header{};
+    if (!urma_detail::decodeHeader(bytes, c.completion_len, header)) {
+      fail("invalid URMA shared packet header"); return;
     }
-    if (g.broken || stopping_ || now - flight->rnrSince >= kRnrTimeout) {
-      // This WR has a definite RNR completion, not an in-flight DMA. Other
-      // accepted WRs remain pinned until their own completions are observed.
-      g.broken = true;
-      std::fprintf(stderr,
-                   "URMA RNR retry ended: kind=%u sequence=%llu elapsed_ms=%lld\n",
-                   unsigned(flight->kind),
-                   static_cast<unsigned long long>(flight->sequence),
-                   static_cast<long long>(std::chrono::duration_cast<
-                       std::chrono::milliseconds>(now - flight->rnrSince).count()));
-      finishRejected(g, i);
-      fail("URMA receive-not-ready retry ended");
-      continue;
+    auto data = UrmaInit::takeBuffer(std::move(buffer), c.completion_len);
+    buffer = {};
+    data->trimStart(urma_detail::kHeaderSize);
+    auto st = postRx(slot);
+    if (st == URMA_EAGAIN) pendingRx.push_back(slot);
+    else if (st != URMA_SUCCESS) {
+      fail("URMA shared receive repost failed"); return;
     }
-    waiting = true;
-    if (now < flight->retryAt) continue;
-    // Recover one rejected SEND at a time. Replaying an entire rejected burst
-    // immediately recreates the receiver shortage. FREE has priority; DATA
-    // and PULL retry in stream order, independent of recycled flight indices.
-    if (selected == g.flights.size() ||
-        (flight->kind == Operation::Free &&
-         g.flights[selected]->kind != Operation::Free) ||
-        ((flight->kind == Operation::Free) ==
-             (g.flights[selected]->kind == Operation::Free) &&
-         flight->sequence < g.flights[selected]->sequence))
-      selected = i;
+    auto found = sockets.find(header.destination);
+    if (found != sockets.end() &&
+        !found->second.listener->receiveReady(header, c, data->data(), data->length())) {
+      // Keep the completed buffer, not its JFR slot. Otherwise later records
+      // can occupy every slot while an earlier RNR retry needs one to arrive.
+      // These leases remain charged to the registered pool's hard limit;
+      // postRx() waits for memory if no replacement buffer is available.
+      deferredRx.push_back({header, c, std::chrono::steady_clock::now(), std::move(data)});
+      ++found->second.deferred;
+      return;
+    }
+    dispatchReceive(header, c, std::move(data),
+                    found == sockets.end() ? nullptr : &found->second);
   }
-  if (!g.broken && !stopping_ && !posted && selected != g.flights.size()) {
-    auto& flight = g.flights[selected];
-    urma_jfs_wr_t* bad = nullptr;
-    auto* wr = &flight->wr;
-    const auto rc = urma_post_jfs_wr(g.tx, wr, &bad);
-    if (rc == URMA_SUCCESS) {
-      flight->retryPending = false;
-      flight->remoteRejected = false;
-    } else if (bad == wr) {
-      flight->retryAt = now + kRnrRetryDelay;
+  void dispatchReceive(const urma_detail::PacketHeader& header,
+                       const urma_cr_t& c, std::unique_ptr<IOBuf> data,
+                       Connection* connection) {
+    ++receives;
+    if (connection) {
+      if (header.kind == urma_detail::PacketKind::Data && !connection->data) {
+        connection->data = true;
+        ++dataConnections;
+      }
+      connection->listener->receive(header, c, std::move(data));
     } else {
-      flight->retryPending = false;  // possibly posted: never submit it again
-      flight->remoteRejected = false;
-      g.broken = true;
-      fail("URMA RNR retry acceptance unknown");
+      auto old = retired.find(header.destination);
+      if (old != retired.end()) old->second->receive(header, c, std::move(data));
     }
   }
-  if (waiting && !stopping_ && !scheduleTimeout(1))
-    throw std::runtime_error("URMA RNR retry timer failed");
-}
-void UrmaIoContext::finishRejected(ConnectionQueue& g, size_t index) noexcept {
-  auto work = std::move(g.flights[index]);
-  --g.inflight;
-  --g.retrying;
-  try {
-    work->route->onTx(*work, false);
-  } catch (...) {
-    fail("URMA rejected SEND completion callback failed");
+  void retryReceives() {
+    // One bounded pass; a later sequence can become ready on the next CQ/timer
+    // turn. Keep its original deadline even while other records make progress.
+    for (auto it = deferredRx.begin(); it != deferredRx.end() && !broken;) {
+      auto& d = *it;
+      auto found = sockets.find(d.header.destination);
+      if (found != sockets.end()) {
+        if (std::chrono::steady_clock::now() - d.since >= std::chrono::seconds(30)) {
+          found->second.listener->failed("URMA receive pressure timeout");
+          found = sockets.find(d.header.destination);
+        } else if (!found->second.listener->receiveReady(
+                       d.header, d.completion, d.data->data(), d.data->length())) {
+          ++it;
+          continue;
+        }
+      }
+      if (found != sockets.end()) --found->second.deferred;
+      auto ready = std::move(d);
+      it = deferredRx.erase(it);
+      dispatchReceive(ready.header, ready.completion, std::move(ready.data),
+                      found == sockets.end() ? nullptr : &found->second);
+    }
   }
-}
-void UrmaIoContext::wait(const std::shared_ptr<UrmaRoute>& route) {
-  if (route_ == route && !stopping_) pendingProgress_ = true;
-}
-void UrmaIoContext::wake() noexcept {
-  if (!evb_ || detached_ || stopping_) return;
-  readyProgress_ |= pendingProgress_;
-  evb_->runInLoop(this);
-}
-void UrmaIoContext::retryLater() noexcept {
-  if (!prepared_.load(std::memory_order_acquire)) return;
-  if (evb_ && !stopping_ && !isScheduled() && !scheduleTimeout(5)) {
-    io_.broken = true;
-    wake();
-  }
-}
-void UrmaIoContext::runLoopCallback() noexcept {
-  auto keep = shared_from_this();
-  if (stopping_) { stopOwner(); return; }
-  try {
-    if (prepared_.load(std::memory_order_acquire) && preparedOK_) {
-      if (cqPending_)
-        poll(io_);
-      else
-        retryRnr(io_);
-      if (stopping_) return;
-      if (io_.broken && !failed_) fail("URMA queue acceptance unknown");
-      if (io_.refillPending) {
-        io_.refillPending = false;
-        bool retry = false;
-        size_t count = 0;
-        for (size_t i = 0; i < io_.slots.size(); ++i) {
-          if (io_.slots[i].deferred) {
-            io_.deferredOrder[count++] = i;
-          } else if (io_.slots[i].state != RxSlotState::Posted) {
-            retry |= !refill(io_, i);
+  void poll() {
+    checkThread();
+    if (polling || broken || !initialized)
+      return;
+    polling = true;
+    progressRetired();
+    retryReceives();
+    while (!broken) {
+      // READs admitted by the previous CQ batch are posted together. A
+      // successful admission need not wait for an older READ's completion.
+      flushReads();
+      if (broken)
+        break;
+      urma_cr_t cr[32]{};
+      int n = urma_poll_jfc(hw->cq, 32, cr);
+      if (n < 0) {
+        fail("URMA shared CQ polling failed");
+        break;
+      }
+      if (!n)
+        break;
+      for (int i = 0; i < n && !broken; ++i) {
+        auto c = cr[i];
+        ++completions;
+        if (c.flag.bs.s_r) {
+          auto slot = c.user_ctx & ~kRx;
+          if (c.status != URMA_CR_SUCCESS || !(c.user_ctx & kRx) ||
+              slot >= rxTarget || c.completion_len > config.buffer_size ||
+              (c.opcode != URMA_CR_OPC_SEND &&
+               c.opcode != URMA_CR_OPC_SEND_WITH_IMM)) {
+            fail("invalid URMA shared receive completion");
+            break;
           }
+          receive(c);
+        } else {
+          // Validate the fixed storage address before dereferencing user_ctx.
+          const auto base =
+              reinterpret_cast<uintptr_t>(&hw->slots.front().completion);
+          const auto offset = c.user_ctx - base;
+          if (c.user_ctx < base || offset % sizeof(Slot) ||
+              offset / sizeof(Slot) >= hw->slots.size()) {
+            fail("invalid URMA shared send completion");
+            break;
+          }
+          auto& slot = hw->slots[offset / sizeof(Slot)];
+          if (!slot.reserved || !slot.submitted) {
+            fail("inactive URMA shared send completion");
+            break;
+          }
+          auto* ctx = &slot.completion;
+          // Callbacks may close the socket or reuse this slot immediately.
+          auto hold = std::move(ctx->hold);
+          auto* listener = ctx->listener;
+          const bool read = ctx->read;
+          slot.reserved = slot.submitted = false;
+          freeSlots.push_back(ctx->index);
+          c.user_ctx = ctx->user;
+          if (listener) {
+            // Detach transfers or clears this pointer. Completion routing
+            // does not consult the RX socket map or decode bits from user_ctx.
+            if (ctx->readObserved && ctx->read && c.status == URMA_CR_SUCCESS &&
+                !*ctx->readObserved) {
+              *ctx->readObserved = true;
+              ++readConnections;
+            }
+            listener->completed(c, read);
+          }
+          // hold survives callbacks, including close/destroy and slot reuse.
         }
-        // Slot indices wrap independently of stream order. Admit the oldest
-        // deferred record first so later data cannot consume its freed budget.
-        auto sequence = [&](size_t i) {
-          const auto* p = static_cast<const uint8_t*>(io_.slots[i].storage->block.data());
-          return getInteger(p + 16, 8);
-        };
-        std::sort(io_.deferredOrder.begin(), io_.deferredOrder.begin() + count,
-                  [&](size_t a, size_t b) { return sequence(a) < sequence(b); });
-        for (size_t n = 0; n < count && !stopping_; ++n) {
-          auto& slot = io_.slots[io_.deferredOrder[n]];
-          const auto completion = slot.completion;
-          receive(io_, completion);
-          if (slot.deferred) break;
-        }
-        io_.refillPending |= io_.deferredCount != 0;
-        if (retry && !io_.broken) retryLater();
+      }
+      wake();
+      retryReceives();
+    }
+    progressRetired();
+    polling = false;
+    wake();
+    if (!broken) {
+      if (!deferredRx.empty() || !pendingReads.empty() || !pendingRx.empty() || !waiters.empty() ||
+          !freeWaiters.empty())
+        scheduleTimeout(1);
+      else if (freeSlots.size() != hw->slots.size() || !retired.empty())
+        scheduleTimeout(10);
+      else
+        cancelTimeout();
+    }
+  }
+  void progressRetired() {
+    if (retired.empty() || broken) return;
+    std::vector<uint64_t> ids;
+    for (const auto& entry : retired) ids.push_back(entry.first);
+    for (auto id : ids) {
+      auto it = retired.find(id);
+      if (it == retired.end()) continue;
+      auto hold = it->second;
+      if (hold->progress()) retired.erase(id);
+    }
+  }
+  void handlerReady(uint16_t) noexcept override {
+    if (!hw->ack()) {
+      fail("URMA shared CQ event wait failed");
+      return;
+    }
+    poll();
+    if (!broken) {
+      if (urma_rearm_jfc(hw->cq, false) != URMA_SUCCESS) {
+        fail("URMA shared CQ rearm failed");
+        return;
+      }
+      poll();
+    }
+  }
+  void timeoutExpired() noexcept override {
+    if (!initialized || broken) return;
+    auto pending = std::move(pendingRx);
+    pendingRx.clear();
+    for (auto i : pending) {
+      auto st = postRx(i);
+      if (st == URMA_EAGAIN)
+        pendingRx.push_back(i);
+      else if (st != URMA_SUCCESS) {
+        fail("URMA shared receive retry failed");
+        return;
       }
     }
-    if (readyProgress_ && route_) {
-      readyProgress_ = pendingProgress_ = false;
-      auto route = route_;
-      route->progress();
+    poll();
+  }
+};
+
+UrmaIoContext::UrmaIoContext(EventBase* evb) : impl_(new Impl(evb)) {
+  impl_->init();
+}
+UrmaIoContext::~UrmaIoContext() = default;
+bool UrmaIoContext::prepare() {
+  try { return impl_->init(); }
+  catch (...) { impl_->fail("URMA shared owner preparation failed"); throw; }
+}
+UrmaIoContext& UrmaIoContext::get(EventBase* evb) {
+  if (!evb->isInEventBaseThread())
+    throw std::logic_error("URMA owner thread mismatch");
+  return *contexts.try_emplace_with(*evb, [&] {
+    if (UrmaInit::pendingCleanupCount() >= 256)
+      throw std::runtime_error("URMA failed-resource retention limit reached");
+    return std::unique_ptr<UrmaIoContext>(new UrmaIoContext(evb));
+  });
+}
+void UrmaIoContext::release(EventBase* evb) {
+  if (!evb->isInEventBaseThread())
+    throw std::logic_error("URMA owner thread mismatch");
+  auto* ctx = contexts.get(*evb);
+  if (ctx && !(*ctx)->impl_->sockets.empty())
+    throw std::logic_error("URMA owner still has sockets");
+  if (ctx &&
+      ((*ctx)->impl_->polling || (*ctx)->impl_->waking ||
+       (*ctx)->impl_->notifyingFailure))
+    throw std::logic_error("URMA owner is dispatching callbacks");
+  contexts.erase(*evb);
+}
+UrmaIoContext::Counters UrmaIoContext::counters() {
+  return {
+      attempts.load(),
+      created.load(),
+      destroyed.load(),
+      live.load(),
+      peak.load()};
+}
+uint64_t UrmaIoContext::allocateSocketId() {
+  return allocateSocket();
+}
+uint64_t UrmaIoContext::attach(Listener* listener, uint64_t id) {
+  impl_->checkThread();
+  if (impl_->broken)
+    throw std::runtime_error("URMA owner failed");
+  if (UrmaInit::pendingCleanupCount() >= 256 || impl_->retired.size() >= 1024)
+    throw std::runtime_error("URMA failed-resource retention limit reached");
+  if (!id)
+    id = allocateSocket();
+  if (!impl_->sockets.emplace(id, Impl::Connection{listener}).second)
+    throw std::logic_error("duplicate URMA socket ID");
+  return id;
+}
+void UrmaIoContext::detach(uint64_t id) {
+  impl_->checkThread();
+  auto found = impl_->sockets.find(id);
+  if (found == impl_->sockets.end())
+    return;
+  auto retired = impl_->retired.find(id);
+  auto* receiver = retired == impl_->retired.end() ? nullptr : retired->second.get();
+  if (receiver)
+    for (const auto& packet : impl_->deferredRx)
+      if (packet.header.destination == id)
+        receiver->discardReceive(packet.header);
+  if (found->second.waiting)
+    (found->second.freeWaiting ? impl_->freeWaiters : impl_->waiters)
+        .erase(found->second.waiter);
+  for (auto it = impl_->pendingReads.begin();
+       it != impl_->pendingReads.end();) {
+    auto& slot = impl_->hw->slots[*it];
+    if (slot.completion.socket != id) {
+      ++it;
+      continue;
     }
-  } catch (...) { fail("URMA connection progress failed"); }
-}
-void UrmaIoContext::fail(const char* message) noexcept {
-  failed_ = true;
-  if (auto route = route_) {
-    if (stopping_) route->ownerStopped();
-    else route->failed(message);
+    auto index = *it;
+    it = impl_->pendingReads.erase(it);
+    if (receiver)
+      receiver->adopt(slot.completion.user, true, false);
+    cancel(index); // Not accepted by the SDK: no DMA can reference this hold.
   }
-}
-void UrmaIoContext::stopOwner() noexcept {
-  stopping_ = true;
-  if (polling_) return;
-  // Definitively rejected SENDs have no device access outstanding. Settle
-  // them on the owner thread, under the same reentrancy guard as CQ callbacks.
-  // Accepted/ambiguous WRs retain their pins; shutdown cannot invent a CQE.
-  polling_ = true;
-  if (prepared_.load(std::memory_order_acquire))
-    for (size_t i = 0; i < io_.flights.size(); ++i)
-      if (io_.flights[i] && io_.flights[i]->retryPending)
-        finishRejected(io_, i);
-  polling_ = false;
-  if (!detached_) {
-    cancelLoopCallback();
-    cancelTimeout();
-    if (ioHandler_) ioHandler_->unregisterHandler();
-    if (poolHandler_) poolHandler_->unregisterHandler();
-    signal_->stop();
-    detachEventBase();
-    detached_ = true;
-    fail("URMA EventBase stopped");
-  }
-  if (cleanupTask_) {
-    cleanupTask_->value = shared_from_this();
-    cleanupOrDefer(std::move(cleanupTask_));
-  }
-}
-bool UrmaIoContext::cleanup(ConnectionQueue& g) noexcept {
-  if (g.tx) {
-    if (urma_delete_jfs(g.tx) != URMA_SUCCESS) return false;
-    g.tx = nullptr;
-  }
-  if (g.endpoint) {
-    if (urma_delete_jetty(g.endpoint) != URMA_SUCCESS) return false;
-    g.endpoint = nullptr;
-  }
-  if (g.rx) {
-    if (urma_delete_jfr(g.rx) != URMA_SUCCESS) return false;
-    g.rx = nullptr;
-  }
-  g.slots.clear();
-  g.flights.clear();
-  if (g.cq) {
-    // Producers are stopped. Drain wait -> poll -> ACK without rearming.
-    // Failed attempts retain fetched notifications and both handles for retry.
-    for (int pass = 0; pass < kDrainBatches; ++pass) {
-      if (!g.eventCount) {
-        const int n =
-            urma_wait_jfc(g.event, ConnectionQueue::kEventBatch, 0, g.events.data());
-        if (n < 0) return false;
-        g.eventCount = n;
-      }
-      if (g.eventCount > ConnectionQueue::kEventBatch) return false;
-      for (int i = 0; i < g.eventCount; ++i)
-        if (g.events[i] != g.cq) return false;
-      const int events = g.eventCount;
-      urma_cr_t completions[kCompletionBatch];
-      const int n = urma_poll_jfc(g.cq, kCompletionBatch, completions);
-      if (n < 0 || n > kCompletionBatch) return false;
-      if (g.eventCount) {
-        std::array<uint32_t, ConnectionQueue::kEventBatch> counts;
-        counts.fill(1);
-        urma_ack_jfc(g.events.data(), counts.data(), g.eventCount);
-        g.eventCount = 0;
-      }
-      if (!events && !n) break;
-      if (pass + 1 == kDrainBatches) return false;
+  for (auto& slot : impl_->hw->slots)
+    if (slot.submitted && slot.completion.socket == id) {
+      auto& c = slot.completion;
+      c.listener = receiver && receiver->adopt(c.user, c.read, true)
+          ? receiver : nullptr;
+      c.readObserved = nullptr;
     }
-    if (urma_delete_jfc(g.cq) != URMA_SUCCESS) return false;
-    g.cq = nullptr;
-  }
-  if (g.event) {
-    if (urma_delete_jfce(g.event) != URMA_SUCCESS) return false;
-    g.event = nullptr;
-  }
-  return true;
+  impl_->sockets.erase(found);
+  impl_->cancelPreparation();
+  if (!impl_->deferredRx.empty() && !impl_->broken) impl_->scheduleTimeout(1);
 }
-}  // namespace folly::urma_detail
+void UrmaIoContext::retire(
+    uint64_t id, std::shared_ptr<Retired> callback) {
+  impl_->checkThread();
+  impl_->retired.emplace(id, std::move(callback));
+  if (!impl_->broken) impl_->scheduleTimeout(1);
+}
+const urma_jfr_id_t& UrmaIoContext::endpoint() const {
+  return impl_->hw->rx->jfr_id;
+}
+std::shared_ptr<UrmaIoContext::Peer> UrmaIoContext::importPeer(
+    const urma_jfr_id_t& id) {
+  impl_->checkThread();
+  // All imports use RM/CTP/OI, no token, and URMA_JFR. Scope the key by the
+  // actual SDK context as well as EID/UASID/ID, never by a numeric ID alone.
+  static std::mutex mutex;
+  struct Entry {
+    std::weak_ptr<Peer> peer;
+    std::shared_ptr<std::atomic<bool>> released;
+  };
+  static std::unordered_map<std::string, Entry> peers;
+  std::string key(
+      reinterpret_cast<const char*>(&impl_->hw->ctx), sizeof(impl_->hw->ctx));
+  key.append(reinterpret_cast<const char*>(id.eid.raw), 16);
+  uint8_t tail[8];
+  urma_detail::store32(tail, id.uasid);
+  urma_detail::store32(tail + 4, id.id);
+  key.append(reinterpret_cast<const char*>(tail), sizeof(tail));
+  std::lock_guard<std::mutex> lock(mutex);
+  auto found = peers.find(key);
+  if (found != peers.end()) {
+    if (auto p = found->second.peer.lock()) {
+      impl_->imports[key] = p;
+      return p;
+    }
+    // A weak reference expires before a deferred SDK unimport completes.
+    // Never create a second handle for that identity during retirement.
+    if (!found->second.released->load(std::memory_order_acquire))
+      return {};
+  }
+  if (peers.size() >= 256) {
+    for (auto it = peers.begin(); it != peers.end();)
+      if (it->second.released->load(std::memory_order_acquire))
+        it = peers.erase(it);
+      else
+        ++it;
+  }
+  if (impl_->imports.size() >= 256)
+    for (auto it = impl_->imports.begin(); it != impl_->imports.end();)
+      if (it->second.expired())
+        it = impl_->imports.erase(it);
+      else
+        ++it;
+  if (peers.size() >= 65536)
+    return {};
+  auto p = std::shared_ptr<Peer>(new Peer, [](Peer* value) {
+    urma_detail::cleanupOrDefer(std::unique_ptr<Peer>(value));
+  });
+  p->context = UrmaInit::acquireContext();
+  if (!p->context)
+    return {};
+  urma_rjfr_t remote{};
+  remote.jfr_id = id;
+  remote.trans_mode = URMA_TM_RM;
+  remote.tp_type = URMA_CTP;
+  remote.flag.bs.order_type = URMA_OI;
+  urma_token_t token{};
+  p->target = urma_import_jfr(p->context, &remote, &token);
+  if (!p->target)
+    return {};
+  peers[key] = {p, p->released};
+  impl_->imports[key] = p;
+  return p;
+}
+urma_target_jetty_t* UrmaIoContext::handle(const std::shared_ptr<Peer>& p) {
+  return p ? p->target : nullptr;
+}
+std::shared_ptr<UrmaIoContext::ImportedSegment>
+UrmaIoContext::importReadSegment(const urma_seg_t& description) {
+  impl_->checkThread();
+  // HELLO/SEGMENT publish full identities; PULL can only use an existing import.
+  std::string key(reinterpret_cast<const char*>(description.ubva.eid.raw), 16);
+  uint8_t fields[24];
+  urma_detail::store32(fields, description.ubva.uasid);
+  urma_detail::store64(fields + 4, description.ubva.va);
+  urma_detail::store64(fields + 12, description.len);
+  urma_detail::store32(fields + 20, description.token_id);
+  key.append(reinterpret_cast<const char*>(fields), sizeof(fields));
+  auto found = impl_->readImports.find(key);
+  if (found != impl_->readImports.end()) {
+    if (auto segment = found->second.segment.lock())
+      return segment;
+    if (!found->second.released->load(std::memory_order_acquire))
+      return {};
+  }
+  if (impl_->readImports.size() >= 256) {
+    for (auto it = impl_->readImports.begin();
+         it != impl_->readImports.end();) {
+      if (it->second.released->load(std::memory_order_acquire))
+        it = impl_->readImports.erase(it);
+      else
+        ++it;
+    }
+  }
+  if (impl_->readImports.size() >= 65536)
+    return {};
+  auto value = ImportedSegment::create(description);
+  if (!value) return {};
+  impl_->readImports[key] = {value, value->released};
+  return value;
+}
+urma_target_seg_t* UrmaIoContext::handle(
+    const std::shared_ptr<ImportedSegment>& segment) {
+  return segment ? segment->segment : nullptr;
+}
+
+const urma_seg_t* UrmaIoContext::initialReadSegment() {
+  impl_->checkThread();
+  auto initial = UrmaInit::initialSegment();
+  return initial ? &initial.segment()->seg : nullptr;
+}
+UrmaIoContext::ReadBuffer UrmaIoContext::takeReadBuffer(size_t size) {
+  impl_->checkThread();
+  return UrmaInit::allocateBuffer(size, UrmaMemoryPurpose::ReadTarget, impl_->poolSignal.get());
+}
+std::shared_ptr<void> UrmaIoContext::retainRead(size_t bytes) {
+  impl_->checkThread();
+  auto pool = impl_->readBudget;
+  if (!pool || !bytes || bytes > pool->capacity)
+    return {};
+  if (pool->pending.fetch_add(1) >= 1024) {
+    pool->pending.fetch_sub(1);
+    return {};
+  }
+  if (pool->pendingBytes.fetch_add(bytes) > pool->capacity - bytes) {
+    pool->pendingBytes.fetch_sub(bytes);
+    pool->pending.fetch_sub(1);
+    return {};
+  }
+  return std::shared_ptr<void>(pool.get(), [pool, bytes](void*) {
+    pool->pendingBytes.fetch_sub(bytes);
+    pool->pending.fetch_sub(1);
+  });
+}
+uint32_t UrmaIoContext::reserve(uint64_t id, bool freeNotification) {
+  impl_->checkThread();
+  if (impl_->broken || (!impl_->sockets.count(id) && !impl_->retired.count(id)))
+    return kNoSlot;
+  if (impl_->freeSlots.empty() ||
+      (!freeNotification && !impl_->freeWaiters.empty()) ||
+      (!impl_->waking &&
+       (freeNotification ? !impl_->freeWaiters.empty()
+                         : !impl_->waiters.empty()))) {
+    impl_->wait(id, freeNotification);
+    return kNoSlot;
+  }
+  auto slot = impl_->freeSlots.back();
+  impl_->freeSlots.pop_back();
+  impl_->hw->slots[slot].reserved = true;
+  return slot;
+}
+uint8_t* UrmaIoContext::buffer(uint32_t slot) {
+  return static_cast<uint8_t*>(impl_->hw->storage.memory) +
+      size_t(slot) * impl_->config.buffer_size;
+}
+void UrmaIoContext::waitForResources(uint64_t id) {
+  impl_->checkThread();
+  impl_->poolSignal->arm();
+  impl_->wait(id);
+  impl_->scheduleTimeout(1);
+}
+urma_target_seg_t* UrmaIoContext::segment() const {
+  return impl_->hw->storage.segment;
+}
+void UrmaIoContext::cancel(uint32_t slot) {
+  impl_->checkThread();
+  auto& s = impl_->hw->slots.at(slot);
+  if (!s.reserved || s.submitted)
+    throw std::logic_error("invalid URMA slot cancellation");
+  s = {};
+  impl_->freeSlots.push_back(slot);
+}
+urma_status_t UrmaIoContext::post(
+    uint32_t index,
+    uint64_t id,
+    urma_jfs_wr_t& wr,
+    std::shared_ptr<void> hold) {
+  impl_->checkThread();
+  auto& slot = impl_->hw->slots.at(index);
+  auto found = impl_->sockets.find(id);
+  auto retired = impl_->retired.find(id);
+  if (!slot.reserved || slot.submitted ||
+      (found == impl_->sockets.end() && retired == impl_->retired.end()))
+    throw std::logic_error("invalid URMA slot submission");
+  auto* ctx = &slot.completion;
+  *ctx = {};
+  ctx->socket = id;
+  ctx->user = wr.user_ctx;
+  ctx->index = index;
+  ctx->listener = found != impl_->sockets.end() ? found->second.listener
+                                              : retired->second.get();
+  ctx->read = wr.opcode == URMA_OPC_READ;
+  ctx->readObserved = found != impl_->sockets.end() ? &found->second.read : nullptr;
+  ctx->work = wr;
+  if (ctx->read) {
+    ctx->source[0] = wr.rw.src.sge[0];
+    ctx->destination = wr.rw.dst.sge[0];
+    ctx->work.rw.src.sge = ctx->source.data();
+    ctx->work.rw.dst.sge = &ctx->destination;
+  } else if (wr.send.src.sge) {
+    if (wr.send.src.num_sge > ctx->source.size())
+      throw std::logic_error("URMA SEND SGE count exceeds stable context");
+    std::copy_n(wr.send.src.sge, wr.send.src.num_sge, ctx->source.begin());
+    ctx->work.send.src.sge = ctx->source.data();
+  }
+  ctx->hold = std::move(hold);
+  ctx->work.user_ctx = reinterpret_cast<uintptr_t>(ctx);
+  if (ctx->read) {
+    ctx->work.flag.bs.complete_enable = 1;
+    if (impl_->polling || !impl_->pendingReads.empty()) {
+      impl_->pendingReads.push_back(index);
+      if (!impl_->polling)
+        impl_->scheduleTimeout(1);
+      // Ownership has transferred to the owner, even before hardware accepts
+      // this READ. It retries known-unaccepted WRs and cancels them on detach.
+      return URMA_SUCCESS;
+    }
+  }
+  slot.submitted = true;
+  urma_jfs_wr_t* bad = nullptr;
+  auto st = urma_post_jfs_wr(impl_->hw->tx, &ctx->work, &bad);
+  if (st == URMA_EAGAIN && bad == &ctx->work) {
+    slot.submitted = false;
+    cancel(index);
+    impl_->wait(id, wr.opcode == URMA_OPC_SEND_IMM && !wr.send.imm_data);
+    impl_->scheduleTimeout(1);
+  } else if (st != URMA_SUCCESS) {
+    // Acceptance is unknown. Retain all DMA references until owner teardown.
+    impl_->fail("URMA shared submit failed or acceptance unknown");
+  } else {
+    if (wr.opcode == URMA_OPC_READ)
+      ++impl_->reads;
+    else
+      ++impl_->sends;
+    impl_->scheduleTimeout(10);
+  }
+  return st;
+}
+void UrmaIoContext::poll() {
+  impl_->poll();
+}
+bool UrmaIoContext::hasDeferredReceives(uint64_t id) const {
+  impl_->checkThread();
+  auto it = impl_->sockets.find(id);
+  return it != impl_->sockets.end() && it->second.deferred;
+}
+UrmaIoContext::Snapshot UrmaIoContext::snapshot() const {
+  impl_->checkThread();
+  size_t imports = 0;
+  for (const auto& item : impl_->imports)
+    imports += !item.second.expired();
+  return {
+      impl_->hw->tx ? impl_->hw->tx->jfs_id.id : 0,
+      impl_->hw->rx ? impl_->hw->rx->jfr_id.id : 0,
+      impl_->config.rx_depth,
+      impl_->config.tx_depth,
+      impl_->rxTarget,
+      uint32_t(impl_->initialRx - impl_->pendingRx.size()),
+      impl_->sockets.size(),
+      imports,
+      impl_->hw->slots.size() - impl_->freeSlots.size(),
+      impl_->waiters.size() + impl_->freeWaiters.size(),
+      impl_->sends,
+      impl_->receives,
+      impl_->reads,
+      impl_->completions,
+      impl_->readConnections,
+      impl_->dataConnections,
+      impl_->retired.size()};
+}
+} // namespace folly
 #endif

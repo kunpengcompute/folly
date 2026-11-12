@@ -66,10 +66,9 @@ UrmaConfig loadUrmaConfigFile(const std::string& path, const UrmaConfig& base) {
     const auto root = parseJson(text, opts);
     keys(root, {"version",
                 "dev_name",
-                "io_free_sq_reserve",
-                "max_connections",
                 "max_send_sge",
                 "rx_depth",
+                "rx_target",
                 "tx_depth",
                 "buffer_size",
                 "handshake_timeout_ms",
@@ -78,8 +77,6 @@ UrmaConfig loadUrmaConfigFile(const std::string& path, const UrmaConfig& base) {
                 "read_window",
                 "offer_window",
                 "max_pending_bytes",
-                "max_pending_records",
-                "max_retained_bytes",
                 "registered_pool"});
     uint32_t version = 3;
     number(root, "version", version);
@@ -91,10 +88,9 @@ UrmaConfig loadUrmaConfigFile(const std::string& path, const UrmaConfig& base) {
         throw std::invalid_argument("dev_name must be a string without NUL");
       c.dev_name = name->asString();
     }
-    number(root, "io_free_sq_reserve", c.io_free_sq_reserve);
-    number(root, "max_connections", c.max_connections);
     number(root, "max_send_sge", c.max_send_sge);
     number(root, "rx_depth", c.rx_depth);
+    number(root, "rx_target", c.rx_target);
     number(root, "tx_depth", c.tx_depth);
     number(root, "buffer_size", c.buffer_size);
     number(root, "handshake_timeout_ms", c.handshake_timeout_ms);
@@ -102,8 +98,6 @@ UrmaConfig loadUrmaConfigFile(const std::string& path, const UrmaConfig& base) {
     number(root, "read_window", c.read_window);
     number(root, "offer_window", c.offer_window);
     number(root, "max_pending_bytes", c.max_pending_bytes);
-    number(root, "max_pending_records", c.max_pending_records);
-    number(root, "max_retained_bytes", c.max_retained_bytes);
     boolean(root, "enable_read", c.enable_read);
     if (auto* pool = root.get_ptr("registered_pool")) {
       keys(*pool,
@@ -145,15 +139,11 @@ UrmaConfig loadUrmaConfigFile(const std::string& path, const UrmaConfig& base) {
       if (p.zero_copy && !p.enabled)
         throw std::invalid_argument("zero_copy requires enabled pool");
     }
-    if (c.read_window != 1)
-      throw std::invalid_argument(
-          "H24 uses one outstanding READ per connection");
-    if (!c.offer_window || c.offer_window > 8 ||
-        (c.offer_window > 1 && !c.registered_pool.enabled))
-      throw std::invalid_argument(
-          "offer window must be 1..8; >1 requires pool");
-    if (!c.rx_depth || c.rx_depth > 4096 || !c.tx_depth || c.tx_depth > 4096 ||
-        c.buffer_size < 32 || c.buffer_size > 65536 ||
+    if (!c.read_window || c.read_window > 1024 ||
+        !c.offer_window || c.offer_window > 1024 || !c.registered_pool.enabled)
+      throw std::invalid_argument("READ/offer bounds must be 1..1024 with a registered pool");
+    if (c.rx_depth > 65536 || c.rx_target > 65536 || !c.tx_depth || c.tx_depth > 4096 ||
+        c.buffer_size <= 128 || c.buffer_size > 65536 ||
         !c.handshake_timeout_ms || c.max_pending_bytes < c.buffer_size)
       throw std::invalid_argument("invalid basic URMA configuration");
 

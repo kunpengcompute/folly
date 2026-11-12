@@ -2,11 +2,9 @@
  */
 #include <folly/io/async/urma/UrmaCleanup.h>
 #include <folly/io/async/urma/UrmaInit.h>
-#include <folly/io/async/urma/UrmaResourceExecutor.h>
 #ifdef FOLLY_HAVE_URMA
 #include <folly/Indestructible.h>
 #include <folly/ScopeGuard.h>
-#include <folly/io/async/urma/UrmaIoContext.h>
 #include <folly/logging/xlog.h>
 #include <folly/memory/IoBufPool.h>
 
@@ -66,10 +64,6 @@ struct PoolContextCleanup final : urma_detail::CleanupTask {
 std::unique_ptr<PoolContextCleanup> poolCleanup;
 }  // namespace
 void UrmaInit::init(const UrmaConfig& requested) {
-  // Pay thread startup at explicit initialization, not on the first RPC.
-  // Keep executor observers outside the context mutex. This acquires no SDK
-  // resources and can throw without publishing a partially initialized context.
-  urma_detail::warmResourceExecutor();
   std::lock_guard<std::mutex> lock(mutex);
   if (shutdownRequested)
     throw std::runtime_error("URMA shutdown is still pending");
@@ -78,18 +72,14 @@ void UrmaInit::init(const UrmaConfig& requested) {
   const UrmaConfig config =
       path ? loadUrmaConfigFile(path, requested) : requested;
   urma_detail::MemoryPool::validate(config.registered_pool);
-  if (!config.offer_window || config.offer_window > 8 ||
-      (config.offer_window > 1 && !config.registered_pool.enabled))
-    throw std::invalid_argument("offer window must be 1..8; >1 requires pool");
-  if (!config.registered_pool.enabled || config.read_window != 1)
-    throw std::invalid_argument(
-        "H24 transport requires a registered pool and one READ per connection");
-  if (!config.rx_depth || !config.tx_depth || config.rx_depth > 4096 ||
-      config.tx_depth > 4096 || config.buffer_size < 32 ||
-      config.buffer_size > 65536 || !config.handshake_timeout_ms ||
-      config.max_pending_bytes < config.buffer_size) {
-    throw std::invalid_argument("invalid basic URMA configuration");
-  }
+  if (!config.offer_window || config.offer_window > 1024 ||
+      !config.read_window || config.read_window > 1024 ||
+      !config.registered_pool.enabled || !config.max_send_sge ||
+      config.max_send_sge > 4 || !config.tx_depth || config.tx_depth > 4096 ||
+      config.rx_depth > 65536 || config.rx_target > 65536 ||
+      config.buffer_size <= 128 || config.buffer_size > 65536 ||
+      !config.handshake_timeout_ms || config.max_pending_bytes < config.buffer_size)
+    throw std::invalid_argument("invalid URMA configuration");
   // Copy the allocating string before acquiring SDK resources. Publishing the
   // effective configuration below is a non-throwing move.
   UrmaConfig effective = config;
@@ -133,8 +123,9 @@ void UrmaInit::init(const UrmaConfig& requested) {
   urma_eid_t eid{};
   if (device && urma_query_device(device, &attr) == URMA_SUCCESS &&
       (attr.dev_cap.trans_mode & URMA_TM_RM)) {
-    effective.rx_depth =
-        std::min(effective.rx_depth, attr.dev_cap.max_jfr_depth);
+    effective.rx_depth = effective.rx_depth
+        ? std::min(effective.rx_depth, attr.dev_cap.max_jfr_depth)
+        : attr.dev_cap.max_jfr_depth;
     effective.tx_depth =
         std::min(effective.tx_depth, attr.dev_cap.max_jfs_depth);
     effective.max_send_sge = std::min<uint32_t>(
@@ -147,9 +138,19 @@ void UrmaInit::init(const UrmaConfig& requested) {
     effective.buffer_size =
         std::min<uint64_t>(effective.buffer_size,
                            std::min<uint64_t>(4096, attr.dev_cap.max_msg_size));
-    readCapacity = urma_detail::UrmaIoContext::validateCapacity(effective);
+    // A legal PULL must fit a pool class as well as the hardware limit.
+    // Otherwise the receiver could wait forever for a block it cannot create.
+    size_t poolReadCapacity = 0;
+    const auto& pool = effective.registered_pool;
+    for (const auto& tier : pool.classes) {
+      if (tier.bytes <= pool.pool_size &&
+          tier.bytes <= pool.budgets[size_t(UrmaMemoryPurpose::ReadSource)] &&
+          tier.bytes <= pool.budgets[size_t(UrmaMemoryPurpose::ReadTarget)])
+        poolReadCapacity = std::max(poolReadCapacity, tier.bytes);
+    }
+    readCapacity = std::min<uint64_t>(attr.dev_cap.max_read_size, poolReadCapacity);
     // Check limits before creating a context so rejection needs no teardown.
-    if (effective.rx_depth && effective.tx_depth &&
+    if (effective.rx_depth && effective.rx_target <= effective.rx_depth && effective.tx_depth &&
         effective.buffer_size >= 32 &&
         uint64_t(effective.rx_depth) + effective.tx_depth + 1 <=
             attr.dev_cap.max_jfc_depth) {
@@ -225,12 +226,22 @@ UrmaPoolBuffer UrmaInit::poolAlloc(size_t size, UrmaMemoryPurpose purpose,
                                   UrmaPoolSignal* waiter) {
   auto pool = std::atomic_load(&*publishedPool);
   if (!pool) return {};
-  auto buffer = pool->allocate(size, purpose);
+  auto buffer = pool->allocate(size, purpose, waiter);
   if (!buffer) {
     IoBufPool::reclaim(pool->identity(), false);
     buffer = pool->allocate(size, purpose, waiter);
   }
   return buffer;
+}
+std::unique_ptr<IOBuf> UrmaInit::takeBuffer(Buffer buffer, size_t length) {
+  if (!buffer.hold) throw std::invalid_argument("empty registered buffer lease");
+  return takePoolBuffer(std::move(buffer.hold), length);
+}
+UrmaInit::Buffer UrmaInit::allocateBuffer(
+    size_t bytes, UrmaMemoryPurpose purpose, UrmaPoolSignal* waiter) {
+  auto block = poolAlloc(bytes, purpose, waiter);
+  if (!block) return {};
+  return {block.data(), block.segment(), block.capacity(), std::move(block)};
 }
 UrmaPoolBuffer UrmaInit::initialSegment() {
   auto pool = std::atomic_load(&*publishedPool);

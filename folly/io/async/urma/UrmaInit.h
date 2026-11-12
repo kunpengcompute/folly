@@ -10,10 +10,20 @@
 namespace folly {
 class UrmaInit {
  public:
-  // Starts the fixed, process-wide preparation workers before acquiring SDK
-  // state. fini() releases SDK/pool resources; these four idle workers are
-  // reused across init/fini cycles and joined at process shutdown. Each socket
-  // prepares its own queues and notification fd when connecting.
+  // Compatibility view used by the shared owner; this is a lease from the
+  // same PR22 allocator, never a second registered pool.
+  struct Buffer {
+    void* memory{nullptr};
+    urma_target_seg_t* segment{nullptr};
+    size_t size{0};
+    UrmaPoolBuffer hold;
+  };
+  static std::unique_ptr<IOBuf> takeBuffer(Buffer buffer, size_t length);
+  static Buffer allocateBuffer(size_t bytes,
+      UrmaMemoryPurpose purpose = UrmaMemoryPurpose::ReadTarget,
+      UrmaPoolSignal* waiter = nullptr);
+  // Acquires the process SDK context and registered pool. Queue resources are
+  // prepared by each EventBase's shared owner when first needed.
   static void init(const UrmaConfig& config);
   // Requests shutdown and rejects new transports. Existing owners must still
   // be released by the caller; cleanup then retries automatically, including

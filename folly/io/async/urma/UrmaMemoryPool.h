@@ -44,9 +44,10 @@ struct UrmaPoolConfig {
   size_t tls_cache_blocks{2};
   // Optional growth unit; pool_size remains the initial total capacity.
   size_t region_bytes{4 * 1024 * 1024};
-  // Maximum held physical bytes per purpose. Class reserves protect progress.
+  // Maximum held physical bytes per purpose. RX zero uses the pool hard limit.
+  // Class reserves protect progress; budgets do not allocate memory.
   std::array<size_t, kUrmaMemoryPurposes> budgets{
-      {32 * 1024 * 1024, 16 * 1024 * 1024, 4 * 1024 * 1024, 102 * 1024 * 1024,
+      {0, 16 * 1024 * 1024, 4 * 1024 * 1024, 102 * 1024 * 1024,
        102 * 1024 * 1024, 4 * 1024 * 1024}};
   std::vector<UrmaPoolClass> classes{
       {4096, {{0, 4, 4, 2, 2}}},

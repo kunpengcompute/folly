@@ -1,12 +1,12 @@
 {
   "version": 3,
-  "rx_depth": 32,
-  "tx_depth": 8,
+  "rx_depth": 0,
+  "tx_depth": 1024,
   "buffer_size": 4096,
   "enable_read": true,
   "read_threshold": 4352,
-  "read_window": 1,
-  "offer_window": 1,
+  "read_window": 1024,
+  "offer_window": 1024,
   "handshake_timeout_ms": 5000,
   "registered_pool": {
     "enabled": true,
@@ -16,5 +16,6 @@
     "elastic": true,
     "tls_block_size": 16384,
     "tls_cache_blocks": 2
-  }
+  },
+  "rx_target": 256
 }

@@ -106,6 +106,9 @@ struct MemoryPool::State : std::enable_shared_from_this<State> {
         config(c),
         hard(c.pool_max_size ? c.pool_max_size : c.pool_size),
         buckets(c.classes.size()) {}
+  size_t budget(size_t p) const {
+    return config.budgets[p] ? config.budgets[p] : hard;
+  }
   void unlink(Block& b) noexcept {
     if (!b.listed) return;
     auto& list = buckets[b.tier];
@@ -410,7 +413,7 @@ struct MemoryPool::State : std::enable_shared_from_this<State> {
                 auto& request = buckets[t].requested[p];
                 if (!request) continue;
                 const size_t n = config.classes[t].bytes;
-                if (n > config.budgets[p] - held[p]) {
+                if (n > budget(p) - held[p]) {
                   request = false;
                   continue;
                 }
@@ -475,8 +478,9 @@ void MemoryPool::validate(const UrmaPoolConfig& c) {
           "URMA size classes must increase in 4 KiB units");
     previous = tier.bytes;
     for (size_t p = 0; p < kUrmaMemoryPurposes; ++p) {
-      if (byPurpose[p] > c.budgets[p] ||
-          tier.reserve[p] > (c.budgets[p] - byPurpose[p]) / tier.bytes ||
+      const size_t limit = c.budgets[p] ? c.budgets[p] : hard;
+      if (byPurpose[p] > limit ||
+          tier.reserve[p] > (limit - byPurpose[p]) / tier.bytes ||
           tier.reserve[p] > (c.pool_size - reserveBytes) / tier.bytes)
         throw std::invalid_argument(
             "URMA startup class reserves exceed soft capacity/budget");
@@ -487,8 +491,9 @@ void MemoryPool::validate(const UrmaPoolConfig& c) {
   }
   if (c.tls_block_size > c.classes.back().bytes)
     throw std::invalid_argument("TLS block has no registered size class");
-  for (auto n : c.budgets)
-    if (!n || n > hard || n % 4096)
+  for (size_t p = 0; p < c.budgets.size(); ++p)
+    if ((!c.budgets[p] && p != size_t(UrmaMemoryPurpose::Rx)) ||
+        c.budgets[p] > hard || c.budgets[p] % 4096)
       throw std::invalid_argument(
           "URMA purpose budget outside hard capacity/alignment");
 }
@@ -520,7 +525,7 @@ UrmaPoolBuffer MemoryPool::allocate(size_t bytes, UrmaMemoryPurpose purpose,
   for (size_t t = 0; t < s.buckets.size(); ++t) {
     const size_t capacity = s.config.classes[t].bytes;
     if (capacity < bytes) continue;
-    if (capacity > s.config.budgets[p] - s.held[p]) break;
+    if (capacity > s.budget(p) - s.held[p]) break;
     try {
       if (s.buckets[t].count <= s.protectedFree(t, p)) {
         if (!s.carve(t)) {
