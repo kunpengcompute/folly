@@ -16,6 +16,15 @@ namespace {
 // are measured from payload(), so capacity/used/remaining share one coordinate.
 struct alignas(std::max_align_t) BlockLayout {
   size_t capacity{0}, used{0};
+  size_t padding() const {
+    constexpr size_t alignment = alignof(std::max_align_t);
+    return (alignment - used % alignment) % alignment;
+  }
+  bool fits(size_t bytes) const {
+    const size_t remaining = capacity - used;
+    const size_t pad = padding();
+    return pad <= remaining && bytes <= remaining - pad;
+  }
 };
 struct IoBufBlock {
   std::shared_ptr<urma_detail::MemoryPool> pool;
@@ -80,7 +89,7 @@ std::unique_ptr<IOBuf> IoBufPool::createFromPoolShared(
   const size_t limit = pool->config().tls_cache_blocks;
   auto block = cache.blocks[cache.current];
   if (block && (!pool->reusable(block->storage) ||
-                capacity > block->layout->capacity - block->layout->used))
+                !block->layout->fits(capacity)))
     block.reset();
   if (!block) {
     for (size_t i = 0; i < limit; ++i) {
@@ -115,9 +124,9 @@ std::unique_ptr<IOBuf> IoBufPool::createFromPoolShared(
     }
   }
   auto cookie = std::make_unique<std::shared_ptr<IoBufBlock>>(block);
-  const auto offset = block->layout->used;
+  const auto offset = block->layout->used + block->layout->padding();
   // Reserve this non-overlapping slice even if IOBuf metadata allocation fails.
-  block->layout->used += capacity;
+  block->layout->used = offset + capacity;
   return IOBuf::takeOwnership(block->payload() + offset, capacity, 0, freeSlice,
                               cookie.release());
 }

@@ -131,10 +131,12 @@ struct UrmaAsyncSocket::Impl final : UrmaRoute,
     bool ready{false};
   };
   struct Received {
+    enum class ReadState { Unsubmitted, Accepted, Unknown, Completed };
     PendingCharge charge;
     uint64_t sequence{0}, address{0};
     size_t length{0};
     bool pull{false};
+    ReadState readState{ReadState::Unsubmitted};
     std::unique_ptr<IOBuf> data;
     std::shared_ptr<FreeReply> reply;
   };
@@ -148,9 +150,10 @@ struct UrmaAsyncSocket::Impl final : UrmaRoute,
   State state{State::Connecting};
   bool haveHello{false}, receivedAck{false}, ackSent{false};
   bool helloSent{false};
+  bool peerEof{false};
   bool registered{false}, failedFlag{false};
-  bool running{false}, delivering{false}, closeAfterWrites{false},
-      writeShutdown{false};
+  bool running{false}, progressAgain{false}, delivering{false},
+      closeAfterWrites{false}, writeShutdown{false};
   size_t handshakeWrites{0}, activeWr{0};
   AsyncTransport::ReadCallback* reader{nullptr};
   AsyncTransport::BufferCallback* bufferCallback{nullptr};
@@ -163,6 +166,7 @@ struct UrmaAsyncSocket::Impl final : UrmaRoute,
   IOBufQueue reads{IOBufQueue::cacheChainLength()};
   std::shared_ptr<RxBudget> rxBudget, readBudget;
   uint64_t nextRecord{1}, nextReceive{1};
+  uint64_t receiveEnd{0};
   uint32_t sendTimeout{0};
   size_t pendingBytes{0}, queuedCapacity{0}, bytesWritten{0}, bytesRead{0};
   size_t rawWritten{0}, rawRead{0};
@@ -170,6 +174,7 @@ struct UrmaAsyncSocket::Impl final : UrmaRoute,
   bool notifyingBuffer{false}, readActive{false}, timedOut{false};
   Clock::time_point started{Clock::now()}, lastProgress{started};
   Clock::time_point receiveSince{};
+  Clock::time_point eofDeadline{};
   Clock::time_point sendRetry{}, receiveRetry{};
   Executor::KeepAlive<EventBase> drainKeepAlive;
   Clock::time_point drainDeadline{};
@@ -239,7 +244,11 @@ struct UrmaAsyncSocket::Impl final : UrmaRoute,
     });
   }
   void writeErr(size_t, const AsyncSocketException& ex) noexcept override {
-    guarded([&] { drain(true, ex); });
+    guarded([&] {
+      if (handshakeWrites) --handshakeWrites;
+      drain(true, ex);
+      progress();
+    });
   }
   void getReadBuffer(void** p, size_t* n) override {
     *p = tcpBuffer.data();
@@ -249,7 +258,17 @@ struct UrmaAsyncSocket::Impl final : UrmaRoute,
     guarded([&] { consumeHandshake(n); });
   }
   void readEOF() noexcept override {
-    guarded([&] { drain(false, closedError); });
+    guarded([&] {
+      if (state == State::Closed || state == State::Draining) return;
+      if (!receiveEnd || !handshake.empty())
+        throw std::runtime_error("URMA TCP EOF without complete stream boundary");
+      // Keep receiving READ/DATA and delivering callbacks. FIN is not a CQ
+      // barrier, and a paused application reader must keep its queued bytes.
+      peerEof = true;
+      eofDeadline = Clock::now() + std::chrono::seconds(30);
+      tcp->setReadCB(nullptr);
+      progress();
+    });
   }
   void readErr(const AsyncSocketException& ex) noexcept override {
     guarded([&] { drain(true, ex); });
@@ -347,18 +366,20 @@ void UrmaAsyncSocket::Impl::sendHello() {
   armTimer();
 }
 void UrmaAsyncSocket::Impl::sendHandshake(const void* data, size_t bytes) {
+  auto buffer = IOBuf::copyBuffer(data, bytes);
   ++handshakeWrites;
-  tcp->writeChain(this, IOBuf::copyBuffer(data, bytes));
+  tcp->writeChain(this, std::move(buffer));
 }
 void UrmaAsyncSocket::Impl::consumeHandshake(size_t n) {
-  if (state != State::Handshake || handshake.size() + n > kHelloBytes + 4)
-    throw std::runtime_error("unexpected URMA TCP handshake bytes");
+  if ((state != State::Handshake && state != State::Open) || receiveEnd ||
+      handshake.size() + n > kHelloBytes + 4 + kEndBytes)
+    throw std::runtime_error("unexpected URMA TCP control bytes");
   handshake.insert(handshake.end(), tcpBuffer.begin(), tcpBuffer.begin() + n);
   if (!haveHello && handshake.size() >= kHelloBytes) {
     Hello hello;
     if (!decodeHello(handshake.data(), kHelloBytes, hello) ||
         hello.bufferSize > 4096)
-      throw std::runtime_error("incompatible URMA HELLO 4 / H24 protocol");
+      throw std::runtime_error("incompatible URMA HELLO 5 / H24 protocol");
     peer->value->hello = hello;
     haveHello = true;
     handshake.erase(handshake.begin(), handshake.begin() + kHelloBytes);
@@ -377,14 +398,21 @@ void UrmaAsyncSocket::Impl::consumeHandshake(size_t n) {
     }
     connection->wait(shared_from_this());
   }
-  if (haveHello && !handshake.empty()) {
-    if (handshake.size() > 4)
-      throw std::runtime_error("unexpected handshake ACK");
-    if (handshake.size() == 4) {
-      if (receivedAck || getInteger(handshake.data(), 4) != 1)
-        throw std::runtime_error("invalid handshake ACK");
+  if (haveHello && !receivedAck && handshake.size() >= 4) {
+    if (getInteger(handshake.data(), 4) != 1)
+      throw std::runtime_error("invalid handshake ACK");
+    handshake.erase(handshake.begin(), handshake.begin() + 4);
+    receivedAck = true;
+  }
+  if (receivedAck && !handshake.empty()) {
+    if (handshake.size() > kEndBytes)
+      throw std::runtime_error("unexpected bytes after URMA stream boundary");
+    if (handshake.size() == kEndBytes) {
+      if (!decodeEnd(handshake.data(), handshake.size(), receiveEnd) ||
+          receiveEnd < nextReceive ||
+          (!received.empty() && received.rbegin()->first >= receiveEnd))
+        throw std::runtime_error("invalid URMA stream boundary");
       handshake.clear();
-      receivedAck = true;
     }
   }
   progress();
@@ -779,6 +807,9 @@ void UrmaAsyncSocket::Impl::onRecord(const RecordHeader& h,
     rawRead += kHeaderBytes;
     return;
   }
+  if (state == State::Draining || state == State::Closed) return;
+  if (receiveEnd && h.sequence >= receiveEnd)
+    throw std::runtime_error("URMA record beyond stream boundary");
   if (h.sequence < nextReceive || received.count(h.sequence)) {
     if (h.type == Message::Pull)
       throw std::runtime_error("duplicate PULL is not a new READ");
@@ -897,9 +928,11 @@ void UrmaAsyncSocket::Impl::receiveProgress() {
       return;
     }
     if (result == PostResult::Unknown) {
+      entry->readState = Received::ReadState::Unknown;
       failed("READ acceptance unknown");
       return;
     }
+    entry->readState = Received::ReadState::Accepted;
     receiveRetry = {};
     ++copyStats.read_wr_submitted;
     ++copyStats.read_submit_calls;
@@ -969,6 +1002,7 @@ void UrmaAsyncSocket::Impl::onTx(TxCompletionCtx& work, bool success) {
   } else if (work.kind == Operation::Read) {
     auto entry = std::static_pointer_cast<Received>(work.completion);
     readActive = false;
+    entry->readState = Received::ReadState::Completed;
     work.destination->dma = {};
     if (success) {
       entry->reply->ready =
@@ -980,6 +1014,12 @@ void UrmaAsyncSocket::Impl::onTx(TxCompletionCtx& work, bool success) {
       copyStats.transferred_read_target_bytes += entry->length;
       bytesRead += entry->length;
       rawRead += entry->length;
+    } else {
+      // This CQE ends local DMA even on failure. No success FREE may be sent;
+      // the peer still quarantines its export unless it obtains safe proof.
+      auto it = std::find(freeReplies.begin(), freeReplies.end(), entry->reply);
+      if (it != freeReplies.end()) freeReplies.erase(it);
+      entry->reply.reset();
     }
   }
   // Ambiguous failures end local access, not a possible remote READ. Those
@@ -1006,6 +1046,10 @@ void UrmaAsyncSocket::Impl::deliver() {
       void* destination = nullptr;
       size_t capacity = 0;
       cb->getReadBuffer(&destination, &capacity);
+      // Application code may close the socket or unregister/replace itself.
+      // Leave queued data for the new reader, without notifying the old one.
+      if (state != State::Open || !callbacksAllowed() || reader != cb)
+        break;
       if (!destination || !capacity)
         throw std::runtime_error("empty application read buffer");
       const size_t length = std::min(capacity, reads.front()->length());
@@ -1016,7 +1060,7 @@ void UrmaAsyncSocket::Impl::deliver() {
       cb->readDataAvailable(length);
     }
   }
-  if (reader && !reads.empty()) {
+  if (state == State::Open && callbacksAllowed() && reader && !reads.empty()) {
     connection->wait(shared_from_this());
     connection->wake();
   }
@@ -1039,11 +1083,24 @@ void UrmaAsyncSocket::Impl::notifyBuffer() {
   }
 }
 void UrmaAsyncSocket::Impl::progress() noexcept {
-  if (running || state == State::Closed) return;
+  if (state == State::Closed) return;
+  if (running) {
+    progressAgain = true;
+    return;
+  }
   auto keep = shared_from_this();
   DestructorGuard guard(owner);
   running = true;
-  auto reset = makeGuard([&] { running = false; });
+  auto reset = makeGuard([&] {
+    running = false;
+    // A read/write callback may enqueue after sendProgress() already ran.
+    // Waiting alone cannot restart an otherwise idle, timeout-free socket.
+    if (std::exchange(progressAgain, false) && connection &&
+        state != State::Closed) {
+      connection->wait(keep);
+      connection->wake();
+    }
+  });
   try {
     if (state == State::Handshake && connection) sendHello();
     finishHandshake();
@@ -1056,6 +1113,9 @@ void UrmaAsyncSocket::Impl::progress() noexcept {
       }
       finishWrites();
       deliver();
+      if (state == State::Open && peerEof && nextReceive == receiveEnd &&
+          reads.empty() && writes.empty() && !delivering)
+        drain(false, closedError);
       if (state == State::Open && writes.empty() &&
           (closeAfterWrites || writeShutdown))
         drain(false, closedError);
@@ -1087,6 +1147,7 @@ void UrmaAsyncSocket::Impl::drain(bool error,
                                   const AsyncSocketException& ex) noexcept {
   failedFlag |= error;
   if (state == State::Closed || state == State::Draining) return;
+  const bool graceful = state == State::Open && !failedFlag && writes.empty();
   state = State::Draining;
   if (!timedOut) {
     // Public socket destruction can be immediately followed by IO executor
@@ -1100,7 +1161,18 @@ void UrmaAsyncSocket::Impl::drain(bool error,
   auto reset = makeGuard([&] { running = wasRunning; });
   if (tcp) {
     tcp->setReadCB(nullptr);
-    tcp->closeNow();
+    try {
+      if (graceful) {
+        auto end = encodeEnd(nextRecord);
+        sendHandshake(end.data(), end.size());
+        tcp->close();  // flush the boundary before FIN, including async writes
+      } else {
+        tcp->closeNow();
+      }
+    } catch (...) {
+      failedFlag = true;
+      tcp->closeNow();
+    }
   }
   reads.move();
   for (const auto& write : writes) {
@@ -1134,12 +1206,21 @@ void UrmaAsyncSocket::Impl::drain(bool error,
 void UrmaAsyncSocket::Impl::maybeClosed() {
   if (state != State::Draining) return;
   for (auto it = received.begin(); it != received.end();) {
-    if (!it->second->pull)
+    const auto status = it->second->readState;
+    if (status != Received::ReadState::Accepted &&
+        status != Received::ReadState::Unknown) {
+      // Unsubmitted/rejected READs have no CQE to wait for. Completed READs
+      // have ended DMA; their success FREE (if any) has its own holder.
+      if (it->second->pull) --receiveOffers;
       it = received.erase(it);
-    else
-      ++it;  // unresolved remote source responsibility cannot be discarded
+    } else {
+      ++it;  // accepted/unknown DMA keeps destination, import and route alive
+    }
   }
-  if (activeWr || !sources.empty() || readActive || !freeReplies.empty() ||
+  // A broken SQ cannot send queued FREEs. Dropping these unposted controls
+  // does not release the peer's export; uncertain in-flight WRs remain pinned.
+  if (connection && connection->io().broken) freeReplies.clear();
+  if (handshakeWrites || activeWr || !sources.empty() || readActive || !freeReplies.empty() ||
       !received.empty())
     return;
   finishWrites();
@@ -1163,6 +1244,8 @@ void UrmaAsyncSocket::Impl::armTimer() {
   auto deadline = Clock::time_point::max();
   if (state == State::Draining && drainKeepAlive)
     deadline = drainDeadline;
+  if (state == State::Open && peerEof && nextReceive != receiveEnd)
+    deadline = std::min(deadline, eofDeadline);
   if (state == State::Connecting || state == State::Handshake)
     deadline = started + std::chrono::milliseconds(config.handshake_timeout_ms);
   if (sendTimeout && !writes.empty())
@@ -1201,6 +1284,7 @@ void UrmaAsyncSocket::Impl::onTimer() {
        now - started >=
            std::chrono::milliseconds(config.handshake_timeout_ms)) ||
       sendExpired ||
+      (state == State::Open && peerEof && nextReceive != receiveEnd && now >= eofDeadline) ||
       (!received.empty() && now - receiveSince >= std::chrono::seconds(30)) ||
       (!sources.empty() && now - lastProgress >= std::chrono::seconds(30))) {
     timedOut = true;
@@ -1273,8 +1357,10 @@ void UrmaAsyncSocket::setReadCB(ReadCallback* cb) noexcept {
         cb->readErr(impl_->closedError);
       else
         cb->readEOF();
-    } else
+    } else {
       impl_->deliver();
+      impl_->progress();  // a resumed reader can finish a pending remote EOF
+    }
   });
 }
 AsyncTransport::ReadCallback* UrmaAsyncSocket::getReadCallback()

@@ -31,6 +31,10 @@ SEND 根据实际地址查询注册范围：安全 headroom 可就地放 H24，�
 
 READ 成功后先准备 FREE24，再移交目标 IOBuf；源端收到匹配 FREE 且本地访问结束才能释放。数据和写回调保持顺序，错误回调只执行一次。超时或断链不能证明远端已停止读取，未决源保持有界隔离，不强制释放。
 
+关闭时按 READ 的提交状态结算接收项：未提交或 SDK 明确拒绝的项没有未来 CQE，直接撤销本地持有；已接受或接受状态未知的项保留目标 DMA pin、导入与 route，直到 CQE 证明本地访问结束。失败 CQE 撤销尚未发送的成功 FREE，不能伪造成功确认。队列损坏时撤销未提交的 FREE；这些本地清理不会解除对端尚无完成证明的源导出，对端仍按上述隔离规则处理。
+
+正常关闭在全部写入完成后，经 TCP 发送 END12（magic + 下一个 DATA/PULL 序号）并在写出后发送 FIN。接收端收到 FIN 后进入结束接收阶段，继续收割 CQ、推进 READ/FREE 和按序交付；交付到 END 的排他边界且已有写入结算后，才通知正常 EOF。应用暂停读取时保留尾部缓冲，恢复回调后继续交付。FIN 未带完整边界、越界记录或尾包缺失超过 30 秒均报错，不能把一次空 CQ 当作流结束证明。显式本地 closeNow 仍可丢弃本地未交付数据；中断未完成写入的关闭不会发送成功边界。
+
 同一 writeChain 的连续完成前缀可先归还 IOBuf 节点、物理容量和待发字节额度，无需等待整批尾部完成。回收位置以现有在途 DATA 和待 FREE 的 READ 源中最早的范围为界；后面的 CQE 不能越过前面的 RNR 或 READ 持有。写回调仍按整次写入完成并保持调用顺序。
 
 免拷贝的边界是注册序列化输出到对端协议接收输入之间的正文：DATA 把已完成接收的原块 A 交给拥有型 IOBuf，接收槽换用块 B；READ 则把独立注册目标块 T 交给 IOBuf，接收槽中的 PULL/FREE 只承载控制消息。上层仍持有 A/T 时，补投不能复用该正文存储。
@@ -43,7 +47,7 @@ Header/Rocket 的移动读取入口和 IOBuf 字段可继续共享这些正文�
 
 `max_connections` 限制连接数；`max_pending_bytes`、`max_pending_records` 和 `max_retained_bytes` 限制每连接排队及持有。`enable_read`、`read_threshold` 保留独立的 READ 开关和阈值；SEND 的 headroom 容量限制不决定 READ 阈值。库、随库 JSON 和 benchmark 默认均开启 TLS 与弹性池；JSON 可显式关闭弹性增长或 IOBuf 注册分配。注册与注销次数、耗时、用途持有、TLS 留存及分配失败由 `poolStats()` 提供。
 
-线上格式为 HELLO98（hello_ver=4、impl_ver=2）、H24、PULL32 和 FREE24，HELLO 不再携带 FC endpoint。**两端必须同步升级，旧共享队列协议不兼容**。JSON 为 version 3，已删除的共享队列、信用流控参数会作为未知字段报错；`read_window` 仅允许 1，`offer_window` 限制本地保留的未确认 READ 描述。FREE 是 READ 完成确认，决定源存储何时可释放。未实现 TCP 业务数据降级。
+线上格式为 HELLO98（hello_ver=5、impl_ver=2）、H24、PULL32 和 FREE24，TCP 关闭增加 END12 边界，HELLO 不携带 FC endpoint。**两端必须同步升级，不支持 END 的 HELLO4 及旧共享队列协议会在握手时拒绝**。JSON 为 version 3，已删除的共享队列、信用流控参数会作为未知字段报错；`read_window` 仅允许 1，`offer_window` 限制本地保留的未确认 READ 描述。FREE 是 READ 完成确认，决定源存储何时可释放。END 只在关闭时发送，不是信用或逐包确认，也未引入 TCP 业务数据降级。
 
 URMA 配置和统计结构也有变化，依赖这些头文件的程序需要同步重编译；不能直接把新动态库替换进使用旧头文件编译的程序。IOBuf 本身未增加数据成员。
 

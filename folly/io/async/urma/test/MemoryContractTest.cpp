@@ -7,9 +7,12 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstring>
 #include <iostream>
 #include <fstream>
+#include <limits>
+#include <new>
 #include <poll.h>
 #include <unistd.h>
 #include <thread>
@@ -57,6 +60,54 @@ UrmaPoolConfig config() {
   c.retry_ms = 2;
   c.idle_ms = 10;
   return c;
+}
+void alignedTlsSlices() {
+  auto c = config();
+  auto p = std::make_shared<urma_detail::MemoryPool>(nullptr, c);
+  check(p->warm(0ms), "alignment pool warm");
+  std::vector<std::unique_ptr<IOBuf>> slices;
+  const auto allocate = [&](size_t bytes) {
+    auto b = IoBufPool::createFromPoolShared(p, bytes);
+    check(bool(b), "alignment slice allocation");
+    check(reinterpret_cast<uintptr_t>(b->data()) % alignof(std::max_align_t) == 0,
+          "TLS slice is not max_align_t aligned");
+    std::memset(b->writableData(), 0x5a, bytes);
+    auto* address = b->writableData();
+    slices.push_back(std::move(b));
+    return address;
+  };
+  allocate(1);
+  auto* word = new (allocate(sizeof(uint64_t))) uint64_t(0x123456789abcdef0ULL);
+  check(*word == 0x123456789abcdef0ULL, "aligned typed slice write");
+  for (size_t n : {3, 5, 17, 31, 127}) allocate(n);
+  slices.clear();
+  p->trim();
+
+  // Leave only one byte after the preceding odd slice. Padding must prevent
+  // using that tail even though the requested byte alone would fit.
+  constexpr size_t alignment = alignof(std::max_align_t);
+  const auto* first = allocate(1);
+  auto pin = p->lookup(first, 1, false);
+  const size_t usable = pin.capacity() -
+      (reinterpret_cast<uintptr_t>(first) -
+       reinterpret_cast<uintptr_t>(pin.data()));
+  pin = {};
+  const auto* sameBlock = allocate(usable - alignment - 1);
+  check(sameBlock == first + alignment, "test did not fill the same TLS block");
+  auto tail = IoBufPool::createFromPoolShared(p, 1);
+  check(tail && reinterpret_cast<uintptr_t>(tail->data()) % alignment == 0 &&
+            tail->data() != first + usable - 1,
+        "alignment padding overran the remaining TLS capacity");
+  for (const auto& b : slices)
+    for (size_t n = 0; n < b->capacity(); ++n)
+      check(b->data()[n] == 0x5a, "aligned slices overlap");
+  check(!IoBufPool::createFromPoolShared(p, std::numeric_limits<size_t>::max()),
+        "oversized TLS slice overflowed");
+  tail.reset();
+  slices.clear();
+  check(p->shutdown(1000ms) && registered == 0, "alignment pool cleanup");
+  std::cout << "PASS TLS odd slices, max_align_t/typed access, padding boundary "
+               "and overflow\n";
 }
 void largeBodiesStayRegistered() {
   constexpr size_t kBodyBytes = 8 * 1024 * 1024;
@@ -213,6 +264,7 @@ extern "C" urma_status_t urma_unregister_seg(urma_target_seg_t* s) {
 }
 int main(int argc, char** argv) {
   try {
+    alignedTlsSlices();
     largeBodiesStayRegistered();
     resourceNotifications();
     check(argc == 2, "shipped config fixture argument missing");
@@ -269,6 +321,18 @@ int main(int argc, char** argv) {
     putInteger(wire.data() + 6, 3, 2);
     check(!decodeHello(wire.data(), wire.size(), decoded),
           "shared-queue protocol version accepted");
+    putInteger(wire.data() + 6, 4, 2);
+    check(!decodeHello(wire.data(), wire.size(), decoded),
+          "peer without EOF stream boundary accepted");
+    uint64_t endSequence = 0;
+    auto endFrame = encodeEnd(0x123456789abcdefULL);
+    check(decodeEnd(endFrame.data(), endFrame.size(), endSequence) &&
+              endSequence == 0x123456789abcdefULL &&
+              !decodeEnd(endFrame.data(), endFrame.size() - 1, endSequence),
+          "stream boundary byte order / truncated frame");
+    endFrame = encodeEnd(0);
+    check(!decodeEnd(endFrame.data(), endFrame.size(), endSequence),
+          "zero stream boundary accepted");
     wire = encodeHello(hello);
     wire[44] = 1;
     check(!decodeHello(wire.data(), wire.size(), decoded),
@@ -354,7 +418,11 @@ int main(int argc, char** argv) {
     check(a && b && a->buffer() == a->data() && a->length() == 0 &&
               a->capacity() == 100,
           "slice create contract");
-    check(b->data() == a->data() + 100, "small slices do not share a block");
+    check(p->lookup(a->data(), 100, false).data() ==
+                  p->lookup(b->data(), 100, false).data() &&
+              b->data() >= a->data() + a->capacity() &&
+              reinterpret_cast<uintptr_t>(b->data()) % alignof(std::max_align_t) == 0,
+          "aligned small slices must share a block without overlapping");
     std::memset(a->writableData(), 0x51, 100);
     a->append(100);
     auto clone = a->cloneOne();

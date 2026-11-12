@@ -20,7 +20,12 @@ endforeach()
 add_executable(UrmaSocketContractTest SocketContractTest.cpp)
 target_link_libraries(UrmaSocketContractTest PRIVATE folly ${CMAKE_DL_LIBS})
 apply_folly_compile_options_to_target(UrmaSocketContractTest)
-foreach(mode send read pressure multi retry cancel prepare_fail queue_fail process threads uncertain chain chain_single_sge new_region owner_exit rnr_data rnr_read rnr_free rnr_timeout rnr_pull_timeout rnr_cancel rnr_unknown batch_reclaim rnr_full_duplex rnr_fanout completion_order)
+foreach(mode send read pressure multi retry cancel prepare_fail queue_fail process threads uncertain chain chain_single_sge new_region owner_exit rnr_data rnr_read rnr_free rnr_timeout rnr_pull_timeout rnr_cancel rnr_unknown batch_reclaim rnr_full_duplex rnr_fanout completion_order
+    callback_read callback_read_movable callback_write callback_close
+    callback_unregister callback_replace tls_alignment
+    drain_read_budget drain_read_sq drain_read_reject drain_read_accepted
+    drain_read_unknown drain_read_failed eof_tail eof_movable eof_paused
+    eof_read_budget eof_read_reject eof_truncated)
   add_test(NAME URMA.Socket.${mode} COMMAND UrmaSocketContractTest ${mode})
   set_tests_properties(URMA.Socket.${mode} PROPERTIES TIMEOUT 45
     SKIP_RETURN_CODE 77 LABELS "URMA;device" RESOURCE_LOCK urma_device)

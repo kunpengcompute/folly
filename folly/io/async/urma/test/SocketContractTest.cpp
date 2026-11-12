@@ -6,6 +6,7 @@
 #include <folly/io/async/urma/UrmaAsyncSocket.h>
 #include <folly/io/async/urma/UrmaInit.h>
 #include <folly/io/async/urma/UrmaIoContext.h>
+#include <folly/memory/IoBufPool.h>
 #include <poll.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -14,10 +15,14 @@
 #include <chrono>
 #include <cstddef>
 #include <cstring>
+#include <functional>
 #include <iostream>
 #include <map>
 #include <mutex>
+#include <new>
+#include <set>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "TestUtil.h"
@@ -60,6 +65,14 @@ size_t maxConcurrentRetries{0};
 urma_jfs_t* rnrQueue{nullptr};
 uint64_t rnrSequence{0};
 std::weak_ptr<UrmaIoContext> rnrOwner;
+bool captureRoute{false}, holdReceive{false}, holdRead{false};
+bool rejectRead{false}, unknownRead{false}, failReadCompletion{false};
+unsigned readAttempts{0};
+std::weak_ptr<UrmaRoute> lastPostedRoute;
+urma_jfc_t* heldCq{nullptr};
+std::set<uint64_t> readIds;
+std::deque<urma_cr_t> heldCompletions;
+constexpr uint64_t rxSlotBit = uint64_t(1) << 63;
 TxCompletionCtx* contextOf(urma_jfs_wr_t* wr) {
   // These fixture WRs are members of owning contexts, not standard-layout
   // objects for offsetof(). Compute the offset from a live instance instead.
@@ -93,15 +106,18 @@ struct Endpoint : AsyncTransport::ReadCallback,
     }
   };
   AsyncTransport::UniquePtr socket;
+  AsyncSocket* control{nullptr};  // accepted TCP control stream, owned by socket
   std::deque<Completion> completions;
   std::vector<std::unique_ptr<IOBuf>> held;
   std::vector<uint8_t> external;
   std::array<uint8_t, 16384> buffer{};
   size_t sent{0}, received{0}, callbacks{0}, errors{0};
   size_t buffered{0}, cleared{0};
+  size_t eofs{0}, bytesAtEof{0};
   unsigned seed{0};
   const uint8_t* lastSource{nullptr};
   bool hold{false}, movable{true}, closing{false};
+  std::function<void()> afterRead, afterWrite, onGetBuffer;
   explicit Endpoint(AsyncTransport::UniquePtr s) : socket(std::move(s)) {
     socket->setReadCB(this);
     socket->setSendTimeout(5000);
@@ -115,7 +131,10 @@ struct Endpoint : AsyncTransport::ReadCallback,
   UrmaAsyncSocket& transport() {
     return *static_cast<UrmaAsyncSocket*>(socket.get());
   }
-  void writeSuccess() noexcept override { ++callbacks; }
+  void writeSuccess() noexcept override {
+    ++callbacks;
+    if (auto action = std::exchange(afterWrite, {})) action();
+  }
   void onEgressBuffered() override {
     ++buffered;
     if (socket->getAllocatedBytesBuffered() < socket->getAppBytesBuffered())
@@ -131,6 +150,7 @@ struct Endpoint : AsyncTransport::ReadCallback,
     std::cerr << "write: " << e.what() << '\n';
   }
   void getReadBuffer(void** p, size_t* n) override {
+    if (auto action = std::exchange(onGetBuffer, {})) action();
     *p = buffer.data();
     *n = buffer.size();
   }
@@ -146,6 +166,7 @@ struct Endpoint : AsyncTransport::ReadCallback,
   }
   void readDataAvailable(size_t n) noexcept override {
     checkBytes(buffer.data(), n);
+    if (auto action = std::exchange(afterRead, {})) action();
   }
   void readBufferAvailable(std::unique_ptr<IOBuf> b) noexcept override {
     auto* p = b.get();
@@ -155,8 +176,11 @@ struct Endpoint : AsyncTransport::ReadCallback,
     } while (p != b.get());
     if (hold)
       held.push_back(b->clone());  // exercise last shared reference, not first
+    if (auto action = std::exchange(afterRead, {})) action();
   }
   void readEOF() noexcept override {
+    ++eofs;
+    bytesAtEof = received;
     if (!closing) ++errors;
   }
   void readErr(const AsyncSocketException& e) noexcept override {
@@ -229,8 +253,11 @@ struct Listener : AsyncServerSocket::AcceptCallback {
   void connectionAccepted(NetworkSocket fd, const SocketAddress&,
                           AcceptInfo) noexcept override {
     try {
+      auto tcp = AsyncSocket::newSocket(&evb, fd);
+      auto* control = tcp.get();
       auto p = std::make_unique<Endpoint>(
-          AsyncTransport::UniquePtr(new UrmaAsyncSocket(&evb, fd.toFd())));
+          AsyncTransport::UniquePtr(new UrmaAsyncSocket(std::move(tcp))));
+      p->control = control;
       p->seed = 19;
       if (automaticSend) {
         p->closing = true;
@@ -253,6 +280,216 @@ void pump(EventBase& evb, F predicate, const char* why) {
     std::this_thread::sleep_for(100us);
   } while (std::chrono::steady_clock::now() < end);
   throw std::runtime_error(why);
+}
+void shutdownRegression(EventBase& evb, Endpoint& client, Endpoint& server,
+                        const std::string& mode) {
+  client.socket->setSendTimeout(0);
+  server.socket->setSendTimeout(0);
+  client.closing = server.closing = true;
+  client.seed = 73;
+  server.seed = 19;
+  captureRoute = true;
+  server.send(1, 73, true);
+  auto route = lastPostedRoute.lock();
+  captureRoute = false;
+  require(bool(route), "shutdown fixture did not capture its own route");
+  auto owner = route->ioOwner->shared_from_this();
+  pump(evb, [&] { return server.callbacks == 1 && client.received == 1; },
+       "shutdown fixture warmup");
+  heldCq = owner->io().cq;
+
+  if (mode == "eof_tail" || mode == "eof_movable" || mode == "eof_paused") {
+    holdReceive = true;
+    server.movable = mode == "eof_movable";
+    if (mode == "eof_paused") server.socket->setReadCB(nullptr);
+    for (size_t i = 0; i < 80; ++i) client.send(300, 19, true);
+    pump(evb, [&] { return client.callbacks == 80; }, "tail SEND completions");
+    client.socket->closeNow();
+    pump(evb, [&] {
+      return !server.control->getReadCallback() && heldCompletions.size() == 80;
+    }, "TCP FIN was not dispatched ahead of RX CQEs");
+    require(!server.eofs && !server.errors && !server.received,
+            "EOF overtook the held tail DATA");
+    holdReceive = false;
+    UrmaIoContextTestPeer::completionReady(*owner);
+    if (mode == "eof_paused") {
+      pump(evb, [&] { return heldCompletions.empty(); }, "paused tail CQ drain");
+      require(!server.eofs && !server.received, "paused reader lost its tail");
+      server.socket->setReadCB(&server);
+    }
+    pump(evb, [&] { return server.eofs == 1; }, "tail EOF never completed");
+    require(server.received == 24000 && server.bytesAtEof == 24000 &&
+                !server.errors && !client.errors,
+            "normal EOF lost or corrupted tail DATA");
+  } else if (mode == "eof_read_budget" || mode == "eof_read_reject") {
+    auto budget = owner->readBudget();
+    const auto limit = budget->limit;
+    if (mode == "eof_read_budget") budget->limit = 0;
+    else rejectRead = true;
+    client.send(16384, 19, true);
+    pump(evb, [&] {
+      return server.transport().getCopyStats().max_receive_offers == 1 &&
+          (mode == "eof_read_budget" || readAttempts != 0);
+    }, "PULL did not wait for READ resources");
+    // Deliver the TCP boundary/EOF callbacks before any successful READ.
+    // Fragment the frame to cover incremental TCP control parsing as well.
+    std::array<uint8_t, 12> end{};
+    putInteger(end.data(), kMagic, 4);
+    putInteger(end.data() + 4, 2, 8);
+    auto* cb = server.control->getReadCallback();
+    for (size_t offset : {size_t(0), size_t(3)}) {
+      void* p; size_t capacity;
+      cb->getReadBuffer(&p, &capacity);
+      const size_t n = offset ? end.size() - offset : 3;
+      require(capacity >= n, "TCP control buffer too small");
+      std::memcpy(p, end.data() + offset, n);
+      cb->readDataAvailable(n);
+    }
+    cb->readEOF();
+    require(!server.eofs && !server.errors, "EOF cancelled an unsubmitted tail READ");
+    budget->limit = limit;
+    rejectRead = false;
+    owner->wake();
+    pump(evb, [&] { return server.eofs == 1 && client.callbacks == 1; },
+         "tail READ did not resume after EOF");
+    require(server.bytesAtEof == 16384 && !server.errors && !client.errors &&
+                server.transport().getCopyStats().read_wr_submitted == 1,
+            "tail READ/FREE/EOF ordering failed");
+  } else if (mode == "eof_truncated") {
+    // A FIN with no boundary cannot be labelled successful stream completion.
+    auto* cb = server.control->getReadCallback();
+    cb->readEOF();
+    require(server.errors == 1 && !server.eofs,
+            "unframed TCP EOF was reported as a normal EOF");
+  } else {
+    const bool budgetBlocked = mode == "drain_read_budget";
+    const bool sqBlocked = mode == "drain_read_sq";
+    rejectRead = mode == "drain_read_reject";
+    unknownRead = mode == "drain_read_unknown";
+    failReadCompletion = mode == "drain_read_failed";
+    holdRead = !budgetBlocked && !sqBlocked && !rejectRead;
+    auto budget = owner->readBudget();
+    const auto limit = budget->limit;
+    if (budgetBlocked) budget->limit = 0;
+    if (sqBlocked) owner->io().inflight = owner->io().sendDepth;
+    // The fixture owns the source outright: no remote socket export is
+    // cancelled or falsely acknowledged to make local cleanup pass.
+    auto source = UrmaInit::createPoolBuffer(16384, UrmaMemoryPurpose::ReadSource);
+    require(bool(source), "shutdown READ source");
+    auto descriptor = IOBuf::create(4);
+    putInteger(descriptor->writableData(), 16384, 4);
+    descriptor->append(4);
+    route->onRecord({Message::Pull, route->socketId, 1}, std::move(descriptor),
+                    reinterpret_cast<uint64_t>(source->data()));
+    route->progress();
+    if (holdRead) {
+      pump(evb, [&] { return !heldCompletions.empty(); }, "READ CQE was not held");
+      require(owner->io().inflight == 1, "READ lost its in-flight owner");
+      auto& flight = *std::find_if(owner->io().flights.begin(), owner->io().flights.end(),
+                                  [](const auto& p) { return bool(p); });
+      require(flight && flight->destination && flight->destination->dma,
+              "accepted/unknown READ dropped its DMA pin before CQE");
+    } else {
+      require(!server.transport().getCopyStats().read_wr_submitted &&
+                  (rejectRead ? readAttempts == 1 : readAttempts == 0),
+              "unsubmitted READ fixture submitted work");
+    }
+    server.socket->closeNow();
+    if (sqBlocked) owner->io().inflight = 0;
+    budget->limit = limit;
+    rejectRead = false;
+    if (holdRead) {
+      require(owner->io().inflight == 1 && UrmaIoContext::activeRoutes() != 0,
+              "close freed a READ before its CQE");
+      holdRead = false;
+      UrmaIoContextTestPeer::completionReady(*owner);
+    }
+    client.socket->closeNow();
+    pump(evb, [] { return UrmaIoContext::activeRoutes() == 0; },
+         "closed READ retained a route with no future CQE");
+    require(!server.received && readIds.empty(), "closed READ was delivered or not settled");
+    require(!UrmaInit::poolStats().exported_bytes,
+            "shutdown fixture accidentally created a remote source responsibility");
+  }
+  client.socket->closeNow();
+  server.socket->closeNow();
+  pump(evb, [] { return UrmaIoContext::activeRoutes() == 0; }, "shutdown cleanup");
+  require(heldCompletions.empty(), "shutdown lost removed CQEs");
+  heldCq = nullptr;
+  readIds.clear();
+}
+void callbackReentry(EventBase& evb, Endpoint& client, Endpoint& server,
+                     const std::string& mode) {
+  // Let handshake completions settle before the single triggering write.
+  // No transport send timeout, reply timer, or extra traffic may rescue it.
+  client.socket->setSendTimeout(0);
+  server.socket->setSendTimeout(0);
+  const auto settled = std::chrono::steady_clock::now() + 50ms;
+  while (std::chrono::steady_clock::now() < settled) {
+    evb.loopOnce(EVLOOP_NONBLOCK);
+    std::this_thread::sleep_for(100us);
+  }
+  client.seed = 73;
+  server.seed = 19;
+  if (mode == "callback_write") {
+    client.afterWrite = [&] { client.send(32, 19, true); };
+    client.send(32, 19, true);
+    pump(evb, [&] { return client.callbacks == 2 && server.received == 64; },
+         "writeSuccess continuation stalled without unrelated traffic");
+  } else if (mode == "callback_read" || mode == "callback_read_movable") {
+    server.movable = mode == "callback_read_movable";
+    server.afterRead = [&] { server.send(32, 73, true); };
+    client.send(32, 19, true);
+    pump(evb, [&] { return client.received == 32 && server.callbacks == 1; },
+         "read callback reply stalled without unrelated traffic");
+  } else {
+    struct Reader : AsyncTransport::ReadCallback {
+      std::array<uint8_t, 64> buffer{};
+      size_t received{0}, errors{0};
+      void getReadBuffer(void** p, size_t* n) override {
+        *p = buffer.data();
+        *n = buffer.size();
+      }
+      void readDataAvailable(size_t n) noexcept override {
+        for (size_t i = 0; i < n; ++i)
+          if (buffer[i] != pattern(received + i, 19)) ++errors;
+        received += n;
+      }
+      void readEOF() noexcept override {}
+      void readErr(const AsyncSocketException&) noexcept override { ++errors; }
+    } replacement;
+    server.movable = false;
+    bool called = false;
+    server.onGetBuffer = [&] {
+      called = true;
+      if (mode == "callback_close") {
+        client.closing = server.closing = true;
+        server.socket->closeNow();
+      } else {
+        server.socket->setReadCB(
+            mode == "callback_replace" ? &replacement : nullptr);
+      }
+      // Endpoint::getReadBuffer still returns a valid buffer after reentry.
+    };
+    client.send(32, 19, true);
+    pump(evb, [&] { return called; }, "getReadBuffer was not invoked");
+    require(!server.received, "obsolete read callback received data");
+    if (mode != "callback_close") {
+      if (mode == "callback_unregister") {
+        for (int i = 0; i < 32; ++i) evb.loopOnce(EVLOOP_NONBLOCK);
+        require(!server.received && !replacement.received &&
+                    !server.socket->getReadCallback(),
+                "unregistered callback still received data");
+        server.socket->setReadCB(&replacement);
+      }
+      pump(evb, [&] { return replacement.received == 32; },
+           "replacement reader did not receive retained data");
+      require(!server.received && !replacement.errors,
+              "reader replacement lost bytes or notified old callback");
+    }
+    server.socket->setReadCB(nullptr);
+  }
+  require(!client.errors && !server.errors, "callback reentry failed");
 }
 void processPeer(bool server, int incoming, int outgoing,
                  const UrmaConfig& config) {
@@ -457,6 +694,21 @@ extern "C" urma_status_t urma_post_jfs_wr(urma_jfs_t* queue, urma_jfs_wr_t* wr,
                                           urma_jfs_wr_t** bad) {
   static auto real = reinterpret_cast<decltype(&urma_post_jfs_wr)>(
       dlsym(RTLD_NEXT, "urma_post_jfs_wr"));
+  if (captureRoute) lastPostedRoute = contextOf(wr)->route;
+  if (wr->opcode == URMA_OPC_READ && queue->jfs_cfg.jfc == heldCq) {
+    ++readAttempts;
+    if (rejectRead) {
+      *bad = wr;
+      return static_cast<urma_status_t>(-1);
+    }
+    readIds.insert(wr->user_ctx);
+    const auto rc = real(queue, wr, bad);
+    if (unknownRead && rc == URMA_SUCCESS) {
+      *bad = nullptr;
+      return static_cast<urma_status_t>(-1);
+    }
+    return rc;
+  }
   if (wr->opcode == URMA_OPC_SEND || wr->opcode == URMA_OPC_SEND_IMM)
     require(wr->flag.bs.place_order == URMA_STRONG_ORDER &&
                 wr->flag.bs.comp_order == 1,
@@ -525,7 +777,31 @@ extern "C" urma_status_t urma_post_jfs_wr(urma_jfs_t* queue, urma_jfs_wr_t* wr,
 extern "C" int urma_poll_jfc(urma_jfc_t* cq, int count, urma_cr_t* out) {
   static auto real = reinterpret_cast<decltype(&urma_poll_jfc)>(
       dlsym(RTLD_NEXT, "urma_poll_jfc"));
-  int n = real(cq, count, out);
+  int n = 0;
+  if (cq == heldCq) {
+    while (!holdReceive && !holdRead && n < count && !heldCompletions.empty()) {
+      out[n++] = heldCompletions.front();
+      heldCompletions.pop_front();
+    }
+  }
+  const int polled = n == count ? 0 : real(cq, count - n, out + n);
+  if (polled < 0) return polled;
+  n += polled;
+  if (cq == heldCq) {
+    int delivered = 0;
+    for (int i = 0; i < n; ++i) {
+      auto c = out[i];
+      const bool read = !(c.user_ctx & rxSlotBit) && readIds.count(c.user_ctx);
+      if (read && failReadCompletion) c.status = URMA_CR_LOC_ACCESS_ERR;
+      if ((holdReceive && (c.user_ctx & rxSlotBit)) || (holdRead && read))
+        heldCompletions.push_back(c);
+      else {
+        if (read) readIds.erase(c.user_ctx);
+        out[delivered++] = c;
+      }
+    }
+    n = delivered;
+  }
   if (n < 0) return n;
   if (reverseCompletions && n > 1) {
     std::reverse(out, out + n);
@@ -579,12 +855,14 @@ int main(int argc, char** argv) {
     return 77;
   }
   const std::string mode = argc > 1 ? argv[1] : "send";
+  const bool shutdownMode = mode.compare(0, 4, "eof_") == 0 ||
+      mode.compare(0, 11, "drain_read_") == 0;
   const bool chainMode = mode == "chain" || mode == "chain_single_sge";
   try {
     UrmaConfig config;
     config.dev_name = device();
     config.registered_pool.enabled = config.registered_pool.zero_copy = true;
-    config.enable_read = mode == "read" || mode == "retry" ||
+    config.enable_read = shutdownMode || mode == "read" || mode == "retry" ||
                          mode == "process" || mode == "threads" ||
                          mode == "uncertain" || mode == "new_region" ||
                          mode == "rnr_read" || mode == "rnr_free" ||
@@ -592,10 +870,12 @@ int main(int argc, char** argv) {
                          mode == "rnr_cancel" || mode == "batch_reclaim" ||
                          mode == "rnr_full_duplex";
     config.offer_window = 2;
+    if (shutdownMode) config.rx_depth = config.tx_depth = 128;
     if (mode == "chain_single_sge") config.max_send_sge = 1;
     if (mode == "read") config.tx_depth = 2;  // one data/READ slot + FREE reserve
     if (mode == "rnr_full_duplex") config.tx_depth = 2;
     config.max_pending_bytes = mode == "pressure" ? 65536 : 262144;
+    if (shutdownMode) config.max_pending_bytes = 2 * 1024 * 1024;
     if (mode == "batch_reclaim") config.max_pending_bytes = 32768;
     if (mode == "new_region") {
       auto& p = config.registered_pool;
@@ -607,6 +887,25 @@ int main(int argc, char** argv) {
     }
     if (mode == "process") return separateProcesses(config);
     UrmaInit::init(config);
+    if (mode == "tls_alignment") {
+      std::vector<std::unique_ptr<IOBuf>> slices;
+      for (size_t n : {1, 8, 3, 17, 5, 31, 127}) {
+        auto b = IOBuf::create(n);
+        require(IoBufPool::owns(*b), "IOBuf::create did not use registered TLS");
+        require(reinterpret_cast<uintptr_t>(b->data()) %
+                        alignof(std::max_align_t) == 0,
+                "IOBuf::create returned a misaligned TLS slice");
+        if (n == sizeof(uint64_t)) {
+          auto* value = new (b->writableData()) uint64_t(0x123456789abcdef0ULL);
+          require(*value == 0x123456789abcdef0ULL, "typed IOBuf access failed");
+        }
+        slices.push_back(std::move(b));
+      }
+      slices.clear();
+      finalize();
+      std::cout << "PASS Socket.tls_alignment IOBuf::create registered TLS alignment\n";
+      return 0;
+    }
     if (mode == "threads") {
       multipleOwners();
       finalize();
@@ -682,6 +981,29 @@ int main(int argc, char** argv) {
       require(jfsCreated >= 2 * connections && jfrCreated >= 2 * connections,
               "sockets reused a shared JFS/JFR instead of independent queues");
       if (mode == "retry") rejectTx = rejectRx = 1;
+      if (shutdownMode) {
+        shutdownRegression(evb, *clients[0], *accepted.peers[0], mode);
+        stopListener(*listener, accepted, evb);
+        clients.clear(); accepted.peers.clear();
+        finalize();
+        std::cout << "PASS Socket." << mode << " shutdown ownership, tail delivery and cleanup\n";
+        return 0;
+      }
+      if (mode.compare(0, 9, "callback_") == 0) {
+        callbackReentry(evb, *clients[0], *accepted.peers[0], mode);
+        clients[0]->closing = accepted.peers[0]->closing = true;
+        clients[0]->socket->closeNow();
+        accepted.peers[0]->socket->closeNow();
+        pump(evb, [] { return UrmaIoContext::activeRoutes() == 0; },
+             "callback reentry cleanup");
+        stopListener(*listener, accepted, evb);
+        clients.clear();
+        accepted.peers.clear();
+        finalize();
+        std::cout << "PASS Socket." << mode
+                  << " timeout-free idle callback reentry and cleanup\n";
+        return 0;
+      }
       if (mode == "completion_order") {
         auto& client = *clients[0];
         auto& server = *accepted.peers[0];

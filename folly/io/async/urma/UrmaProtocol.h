@@ -11,6 +11,7 @@
 namespace folly::urma_detail {
 constexpr uint32_t kMagic = 0x55524d41;
 constexpr size_t kHeaderBytes = 24, kHelloBytes = 98, kPullBytes = 32;
+constexpr size_t kEndBytes = 12;
 enum class Message : uint8_t { Data = 0, Pull = 1, Free = 2 };
 inline uint64_t getInteger(const uint8_t* p, size_t n) {
   uint64_t result = 0;
@@ -22,6 +23,19 @@ inline void putInteger(uint8_t* p, uint64_t v, size_t n) {
     p[--n] = uint8_t(v);
     v >>= 8;
   }
+}
+// Sent on TCP before a graceful FIN. The exclusive DATA/PULL sequence bounds
+// the receive stream across the independently dispatched TCP and URMA paths.
+inline std::array<uint8_t, kEndBytes> encodeEnd(uint64_t nextSequence) {
+  std::array<uint8_t, kEndBytes> p{};
+  putInteger(p.data(), kMagic, 4);
+  putInteger(p.data() + 4, nextSequence, 8);
+  return p;
+}
+inline bool decodeEnd(const uint8_t* p, size_t n, uint64_t& nextSequence) {
+  if (n != kEndBytes || getInteger(p, 4) != kMagic) return false;
+  nextSequence = getInteger(p + 4, 8);
+  return nextSequence != 0;
 }
 struct RecordHeader {
   Message type;
@@ -54,7 +68,7 @@ inline std::array<uint8_t, kHelloBytes> encodeHello(const Hello& h) {
   std::array<uint8_t, kHelloBytes> p{};
   putInteger(p.data(), kMagic, 4);
   putInteger(p.data() + 4, kHelloBytes, 2);
-  putInteger(p.data() + 6, 4, 2);
+  putInteger(p.data() + 6, 5, 2);
   putInteger(p.data() + 8, 2, 2);
   putInteger(p.data() + 10, h.bufferSize, 4);
   putInteger(p.data() + 14, h.receiveCount, 4);
@@ -74,7 +88,7 @@ inline std::array<uint8_t, kHelloBytes> encodeHello(const Hello& h) {
 }
 inline bool decodeHello(const uint8_t* p, size_t n, Hello& h) {
   if (n != kHelloBytes || getInteger(p, 4) != kMagic ||
-      getInteger(p + 4, 2) != kHelloBytes || getInteger(p + 6, 2) != 4 ||
+      getInteger(p + 4, 2) != kHelloBytes || getInteger(p + 6, 2) != 5 ||
       getInteger(p + 8, 2) != 2 || p[42] != URMA_CTP || (p[43] & ~4) || p[44] ||
       p[45])
     return false;
