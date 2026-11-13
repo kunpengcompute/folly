@@ -22,6 +22,14 @@
 #include <folly/io/async/urma/UrmaIoContext.h>
 
 namespace {
+std::vector<std::shared_ptr<void>> holdReadSlots(folly::UrmaIoContext& owner) {
+  std::vector<std::shared_ptr<void>> holds;
+  for (unsigned i = 0; i < 1024; ++i) {
+    holds.push_back(owner.retainRead());
+    require(bool(holds.back()), "READ responsibility fixture");
+  }
+  return holds;
+}
 struct Receive {
   uint64_t address, user;
   uint32_t length;
@@ -50,12 +58,12 @@ uint64_t rejectSequence = 0;
 using Completions = std::vector<std::pair<urma_jfc_t*, urma_cr_t>>;
 Completions heldFreeCompletions;
 bool reorderData = false, holdDataCompletions = false;
-bool holdReads = false;
+bool holdReads = false, holdPullReceives = false;
 int rejectReadAfter = -1;
 bool blockReadPosts = false, unknownReadBoundary = false;
 urma_status_t rejectReadStatus = URMA_EAGAIN;
 size_t readPostCalls = 0, maxReadBatch = 0, acceptedReadWrs = 0;
-Completions heldReads, heldPullCompletions, heldData;
+Completions heldReads, heldPullCompletions, heldData, heldPullReceives;
 unsigned checkedPulls = 0, checkedFrees = 0;
 std::atomic<unsigned> segmentImports{0}, segmentUnimports{0};
 unsigned lastDataSges = 0, checkedSegments = 0;
@@ -285,9 +293,9 @@ static urma_status_t postOne(
       }
       if (pull) {
         require(
-            sg.len == 32 && wr->opcode == URMA_OPC_SEND_IMM &&
-                wr->send.imm_data,
-            "PULL32 must carry its address in immediate data");
+            sg.len == 40 && wr->opcode == URMA_OPC_SEND_IMM &&
+                !wr->send.imm_data && folly::urma_detail::load64(packet + 32),
+            "PULL40 must carry its address in the registered payload");
         ++checkedPulls;
       }
       if (header.kind == Kind::Free) {
@@ -309,11 +317,14 @@ static urma_status_t postOne(
       rx.remote_id = jfs->jfs_id;
       rx.opcode = wr->opcode == URMA_OPC_SEND ? URMA_CR_OPC_SEND
                                               : URMA_CR_OPC_SEND_WITH_IMM;
-      rx.imm_data = wr->send.imm_data;
+      // No application fields live in immediate; providers may encode it.
+      rx.imm_data = (wr->send.imm_data & 0xffffff00001fffffULL) | 0x123400000ULL;
       if (holdSegmentReady && header.kind == Kind::SegmentReady)
         heldSegmentReady.emplace_back(receiver->jfr_cfg.jfc, rx);
       else if (holdSegmentRevoked && header.kind == Kind::SegmentRevoked)
         heldSegmentRevoked.emplace_back(receiver->jfr_cfg.jfc, rx);
+      else if (holdPullReceives && pull)
+        heldPullReceives.emplace_back(receiver->jfr_cfg.jfc, rx);
       else if (holdFree && header.kind == Kind::Free)
         heldFrees.emplace_back(receiver->jfr_cfg.jfc, rx);
       else if (holdDataCompletions && header.kind == Kind::Data)

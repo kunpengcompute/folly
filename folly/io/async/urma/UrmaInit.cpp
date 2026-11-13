@@ -26,7 +26,6 @@ size_t owners = 0;
 uint32_t maxReadSize = 0;
 bool libraryOwned = false;
 std::atomic<bool> poolIOBufEnabled{false};
-void freePoolIOBuf(void*, void* p) { delete static_cast<UrmaPoolBuffer*>(p); }
 // Keep unresolved registrations alive even during static destruction.
 folly::Indestructible<std::shared_ptr<urma_detail::MemoryPool>> memoryPool;
 folly::Indestructible<std::shared_ptr<urma_detail::MemoryPool>> publishedPool;
@@ -138,17 +137,9 @@ void UrmaInit::init(const UrmaConfig& requested) {
     effective.buffer_size =
         std::min<uint64_t>(effective.buffer_size,
                            std::min<uint64_t>(4096, attr.dev_cap.max_msg_size));
-    // A legal PULL must fit a pool class as well as the hardware limit.
-    // Otherwise the receiver could wait forever for a block it cannot create.
-    size_t poolReadCapacity = 0;
-    const auto& pool = effective.registered_pool;
-    for (const auto& tier : pool.classes) {
-      if (tier.bytes <= pool.pool_size &&
-          tier.bytes <= pool.budgets[size_t(UrmaMemoryPurpose::ReadSource)] &&
-          tier.bytes <= pool.budgets[size_t(UrmaMemoryPurpose::ReadTarget)])
-        poolReadCapacity = std::max(poolReadCapacity, tier.bytes);
-    }
-    readCapacity = std::min<uint64_t>(attr.dev_cap.max_read_size, poolReadCapacity);
+    // Transfer policy is independent of allocator size classes. Keep the
+    // existing 16 MiB per-READ bound, additionally capped by the device.
+    readCapacity = std::min<uint64_t>(attr.dev_cap.max_read_size, 16 * 1024 * 1024);
     // Check limits before creating a context so rejection needs no teardown.
     if (effective.rx_depth && effective.rx_target <= effective.rx_depth && effective.tx_depth &&
         effective.buffer_size >= 32 &&
@@ -175,6 +166,17 @@ void UrmaInit::init(const UrmaConfig& requested) {
   try {
     *memoryPool = std::make_shared<urma_detail::MemoryPool>(
         context, settings.registered_pool);
+    const auto& pool = settings.registered_pool;
+    const size_t hard = pool.pool_max_size ? pool.pool_max_size : pool.pool_size;
+    maxReadSize = std::min<size_t>(maxReadSize,
+        std::max(pool.pool_size, pool.elastic ? hard - pool.pool_size : size_t(0)));
+    if (!(*memoryPool)->bufferSize(maxReadSize)) {
+      const auto limit = maxReadSize;
+      maxReadSize = 0;
+      for (const auto& tier : settings.registered_pool.classes)
+        if (tier.bytes <= limit && (*memoryPool)->bufferSize(tier.bytes))
+          maxReadSize = tier.bytes;
+    }
     if (!(*memoryPool)->warm(std::chrono::seconds(5)))
       throw std::runtime_error("URMA soft capacity unavailable at startup");
     std::atomic_store(&*publishedPool, *memoryPool);
@@ -222,14 +224,14 @@ void UrmaInit::releaseContext() {
   std::lock_guard<std::mutex> lock(mutex);
   --owners;
 }
-UrmaPoolBuffer UrmaInit::poolAlloc(size_t size, UrmaMemoryPurpose purpose,
+UrmaPoolBuffer UrmaInit::poolAlloc(size_t size,
                                   UrmaPoolSignal* waiter) {
   auto pool = std::atomic_load(&*publishedPool);
   if (!pool) return {};
-  auto buffer = pool->allocate(size, purpose, waiter);
+  auto buffer = pool->allocate(size, waiter);
   if (!buffer) {
     IoBufPool::reclaim(pool->identity(), false);
-    buffer = pool->allocate(size, purpose, waiter);
+    buffer = pool->allocate(size, waiter);
   }
   return buffer;
 }
@@ -238,8 +240,8 @@ std::unique_ptr<IOBuf> UrmaInit::takeBuffer(Buffer buffer, size_t length) {
   return takePoolBuffer(std::move(buffer.hold), length);
 }
 UrmaInit::Buffer UrmaInit::allocateBuffer(
-    size_t bytes, UrmaMemoryPurpose purpose, UrmaPoolSignal* waiter) {
-  auto block = poolAlloc(bytes, purpose, waiter);
+    size_t bytes, UrmaPoolSignal* waiter) {
+  auto block = poolAlloc(bytes, waiter);
   if (!block) return {};
   return {block.data(), block.segment(), block.capacity(), std::move(block)};
 }
@@ -292,9 +294,8 @@ std::vector<UrmaPoolRegionInfo> UrmaInit::poolRegions() {
   auto pool = *memoryPool;
   return pool ? (pool)->regions() : std::vector<UrmaPoolRegionInfo>{};
 }
-std::unique_ptr<IOBuf> UrmaInit::createPoolBuffer(size_t size,
-                                                  UrmaMemoryPurpose purpose) {
-  auto allocation = poolAlloc(size, purpose);
+std::unique_ptr<IOBuf> UrmaInit::createPoolBuffer(size_t size) {
+  auto allocation = poolAlloc(size);
   if (!allocation) return nullptr;
   // Like IOBuf::create(), capacity is uninitialized and length starts at zero.
   // Only the caller's appended range can be planned as SEND/READ input.
@@ -303,23 +304,29 @@ std::unique_ptr<IOBuf> UrmaInit::createPoolBuffer(size_t size,
   auto capacity = owner->capacity();
   // takeOwnership takes the free callback on failure too (freeOnError=true).
   auto* cookie = owner.release();
-  return IOBuf::takeOwnership(data, capacity, 0, freePoolIOBuf, cookie);
+  return IOBuf::takeOwnership(data, capacity, 0, UrmaInit::freePoolBuffer, cookie);
+}
+bool UrmaInit::poolIOBufAllocationEnabled() {
+  return poolIOBufEnabled.load(std::memory_order_acquire);
+}
+void UrmaInit::freePoolBuffer(void*, void* p) {
+  delete static_cast<UrmaPoolBuffer*>(p);
 }
 std::unique_ptr<IOBuf> UrmaInit::tryCreateIOBuf(size_t size) {
-  if (!size || !poolIOBufEnabled.load(std::memory_order_acquire))
-    return nullptr;
-  // Logging/allocator observers may themselves allocate IOBufs.
+  if (!poolIOBufAllocationEnabled()) return nullptr;
   static thread_local bool active = false;
-  if (active) return nullptr;
+  if (active) throw std::bad_alloc();
   active = true;
   auto reset = makeGuard([&] { active = false; });
-  // Never block on init/fini or register memory on an application/IO thread.
+  // The synchronous caller owns retry policy. Never block completion/reclaim
+  // on an EventBase or disguise a pool miss as successful heap allocation.
   auto pool = std::atomic_load(&*publishedPool);
-  if (!pool) return nullptr;
-  return IoBufPool::createFromPoolShared(pool, size);
+  auto result = pool ? IoBufPool::createFromPoolShared(pool, std::max(size, size_t(1))) : nullptr;
+  if (!result) throw std::bad_alloc();
+  return result;
 }
 bool UrmaInit::ownsPoolBuffer(const IOBuf& buffer) {
-  return (buffer.isManagedOne() && buffer.getFreeFn() == freePoolIOBuf) ||
+  return (buffer.isManagedOne() && buffer.getFreeFn() == UrmaInit::freePoolBuffer) ||
          IoBufPool::owns(buffer);
 }
 std::unique_ptr<IOBuf> UrmaInit::takePoolBuffer(UrmaPoolBuffer buffer,
@@ -329,7 +336,7 @@ std::unique_ptr<IOBuf> UrmaInit::takePoolBuffer(UrmaPoolBuffer buffer,
   auto owner = std::make_unique<UrmaPoolBuffer>(std::move(buffer));
   auto* data = owner->data();
   const auto capacity = owner->capacity();
-  return IOBuf::takeOwnership(data, capacity, length, freePoolIOBuf,
+  return IOBuf::takeOwnership(data, capacity, length, UrmaInit::freePoolBuffer,
                               owner.release());
 }
 }  // namespace folly

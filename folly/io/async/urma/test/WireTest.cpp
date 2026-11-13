@@ -16,15 +16,17 @@ int main() {
                     PacketKind::Segment, PacketKind::SegmentReady,
                     PacketKind::SegmentRevoke, PacketKind::SegmentRevoked}) {
     size_t size = kind == PacketKind::Data ? 25
-        : kind == PacketKind::Pull         ? 32
+        : kind == PacketKind::Pull         ? 40
         : kind == PacketKind::Segment      ? 64
                                            : 24;
     encodeHeader(packet.data(), {kind, UINT64_MAX, (uint64_t(1) << 48) + 7});
     store32(packet.data() + 24, 8192);
+    store64(packet.data() + 32, 0xffffae398028ULL);
     require(decodeHeader(packet.data(), size, h));
     require(
         h.kind == kind && h.destination == UINT64_MAX &&
         h.sequence == (uint64_t(1) << 48) + 7);
+    require(load64(packet.data() + 32) == 0xffffae398028ULL);
     require(load32(packet.data()) == 0x55524d41 && packet[6] == uint8_t(kind));
     for (size_t n = 0; n < size; ++n)
       require(!decodeHeader(packet.data(), n, h));
@@ -38,10 +40,13 @@ int main() {
   }
   encodeHeader(packet.data(), {PacketKind::Pull, 1, 1});
   store32(packet.data() + 24, 0);
-  require(!decodeHeader(packet.data(), 32, h));
+  require(!decodeHeader(packet.data(), 40, h));
   store32(packet.data() + 24, 1);
   store32(packet.data() + 28, 1);
-  require(!decodeHeader(packet.data(), 32, h));
+  require(!decodeHeader(packet.data(), 40, h));
+  store32(packet.data() + 28, 0);
+  store64(packet.data() + 32, 0);
+  require(!decodeHeader(packet.data(), 40, h));
   encodeHeader(packet.data(), {PacketKind::Data, 0, 1});
   require(!decodeHeader(packet.data(), 25, h));
   encodeHeader(packet.data(), {PacketKind::Data, 1, 0});
@@ -120,8 +125,8 @@ int main() {
   end = encodeEnd(0);
   require(!decodeEnd(end.data(), end.size(), boundary));
   encodeHello(hello.data(), local);
-  store16(hello.data() + 6, 6);
+  store16(hello.data() + 6, 7);
   require(!decodeHello(hello.data(), hello.size(), decoded));
   std::cout
-      << "PASS H24/PULL32/FREE24/SEGMENT64/READY24 and HELLO102: exact wire, full uint64 IDs, versions, READ ranges\n";
+      << "PASS H24/PULL40/FREE24/SEGMENT64/READY24 and HELLO102: exact wire, full uint64 IDs, versions, READ ranges\n";
 }

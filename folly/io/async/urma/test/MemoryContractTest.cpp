@@ -55,8 +55,8 @@ UrmaPoolConfig config() {
   c.pool_max_size = 131072;
   c.region_bytes = 65536;
   c.tls_block_size = 16384;
-  c.budgets.fill(65536);
-  c.classes = {{4096, {{0, 0, 1, 0, 0}}}, {12288, {}}, {16384, {}}};
+
+  c.classes = {{4096}, {12288}, {16384}};
   c.retry_ms = 2;
   c.idle_ms = 10;
   return c;
@@ -64,27 +64,26 @@ UrmaPoolConfig config() {
 void rxUsesPoolHardLimit() {
   auto c = config();
   c.elastic = true;
-  c.budgets[size_t(UrmaMemoryPurpose::Rx)] = 0;
+
   auto p = std::make_shared<urma_detail::MemoryPool>(nullptr, c);
   check(p->warm(0ms), "RX hard-limit pool warm");
   std::vector<UrmaPoolBuffer> buffers;
-  // One 4 KiB READ-control reserve remains unavailable to RX.
-  const size_t target = c.pool_max_size / 4096 - 1;
+  const size_t target = c.pool_max_size / 4096;
   const auto deadline = std::chrono::steady_clock::now() + 2s;
   while (buffers.size() < target && std::chrono::steady_clock::now() < deadline) {
-    if (auto b = p->allocate(4096, UrmaMemoryPurpose::Rx))
+    if (auto b = p->allocate(4096))
       buffers.push_back(std::move(b));
     else
       std::this_thread::sleep_for(2ms);
   }
   check(buffers.size() == target && buffers.size() * 4096 > c.pool_size,
-        "RX zero budget did not follow the expanded pool capacity");
-  check(!p->allocate(4096, UrmaMemoryPurpose::Rx) &&
+        "shared allocations did not follow the expanded pool capacity");
+  check(!p->allocate(4096) &&
             p->stats().registered_bytes <= c.pool_max_size,
-        "RX bypassed hard capacity or consumed the control reserve");
+        "allocation bypassed hard capacity");
   buffers.clear();
   check(p->shutdown(2s) && registered == 0, "RX hard-limit pool cleanup");
-  std::cout << "PASS RX uses expanded hard capacity and preserves control reserve\n";
+  std::cout << "PASS allocations share all expanded hard capacity\n";
 }
 void alignedTlsSlices() {
   auto c = config();
@@ -138,18 +137,18 @@ void largeBodiesStayRegistered() {
   constexpr size_t kBodyBytes = 8 * 1024 * 1024;
   constexpr size_t kSerializationBytes = 64;
   constexpr size_t kRequests = 10;
-  constexpr auto kSource = size_t(UrmaMemoryPurpose::ReadSource);
   UrmaPoolConfig c;
   check(c.enabled && c.zero_copy && c.elastic && c.tls_cache_blocks &&
             c.pool_max_size > c.pool_size,
         "default policy must enable registered TLS and elastic capacity");
+  c.elastic = false;
   auto p = std::make_shared<urma_detail::MemoryPool>(nullptr, c);
   check(p->warm(0ms), "default pool maintenance did not start");
   const auto registrations = calls.load();
   std::vector<std::unique_ptr<IOBuf>> bodies;
   for (size_t i = 0; i < kRequests; ++i) {
     auto b = IoBufPool::createFromPoolShared(p, kBodyBytes + kSerializationBytes);
-    check(bool(b), "default source budget cannot retain ten large RPC bodies");
+    check(bool(b), "default pool cannot retain ten large RPC bodies");
     std::memset(b->writableData(), int(i + 1), b->capacity());
     b->append(kBodyBytes + kSerializationBytes);
     check(IoBufPool::owns(*b) && bool(p->lookup(b->data(), b->length(), true)),
@@ -160,55 +159,55 @@ void largeBodiesStayRegistered() {
   auto dma = p->lookup(clone->data(), clone->length(), false);
   auto exported = p->lookup(clone->data(), clone->length(), true);
   check(dma && exported, "large source lifetime pins missing");
-  // Fill the same bounded purpose; improving packing must not bypass its cap.
+  // Fill the shared capacity; lifetime pins still prevent reuse.
   while (auto b =
              IoBufPool::createFromPoolShared(p, kBodyBytes + kSerializationBytes))
     bodies.push_back(std::move(b));
   auto full = p->stats();
-  check(full.held_by_purpose[kSource] <= c.budgets[kSource] &&
+  check(full.allocated_bytes <= c.pool_size &&
             full.registered_bytes == c.pool_size && calls == registrations,
-        "large-body allocation exceeded its budget or registered per request");
-  auto control = p->allocate(24, UrmaMemoryPurpose::ReadControl);
-  check(bool(control), "large sources consumed READ completion storage");
-  control = {};
+        "large-body allocation exceeded total capacity or registered per request");
   bodies.clear();
   p->trim();
-  check(p->stats().held_by_purpose[kSource] != 0 &&
+  check(p->stats().allocated_bytes != 0 &&
             clone->data()[0] == 1 && clone->data()[clone->length() - 1] == 1,
         "large clone/source contents or accounting released early");
   clone.reset();
   p->trim();
-  const auto held = p->stats().held_by_purpose[kSource];
+  const auto held = p->stats().allocated_bytes;
   check(held != 0 && !p->shutdown(0ms), "DMA/export-pinned large block released");
   dma = {};
-  check(p->stats().held_by_purpose[kSource] == held,
+  check(p->stats().allocated_bytes == held,
         "large exported source lost its physical charge");
   exported = {};
   check(p->shutdown(1000ms) && registered == 0,
         "large-body final return failed to reclaim registration");
-  std::cout << "PASS ten concurrent 8 MiB bodies, purpose cap, control reserve, "
+  std::cout << "PASS ten concurrent 8 MiB bodies, total capacity, "
                "clone/DMA/export lifetime and single registration\n";
 }
 void resourceNotifications() {
   using namespace urma_detail;
   auto c = config();
-  c.budgets[size_t(UrmaMemoryPurpose::Tx)] = 4096;
+
   auto p = std::make_shared<MemoryPool>(nullptr, c);
   auto signal = std::make_shared<UrmaPoolSignal>();
   p->subscribe(signal);
   pollfd event{signal->fd(), POLLIN, 0};
-  auto block = p->allocate(4096, UrmaMemoryPurpose::Tx, signal.get());
+  std::vector<UrmaPoolBuffer> pressure;
+  for (size_t n = 4096; n < c.pool_size; n += 4096)
+    pressure.push_back(p->allocate(4096));
+  auto block = p->allocate(4096, signal.get());
   check(bool(block), "notification allocation setup");
   block = {};
   check(::poll(&event, 1, 0) == 0, "normal block return woke an idle owner");
-  block = p->allocate(4096, UrmaMemoryPurpose::Tx);
-  check(!p->allocate(4096, UrmaMemoryPurpose::Tx, signal.get()),
-        "notification budget shortage setup");
+  block = p->allocate(4096);
+  check(!p->allocate(4096, signal.get()),
+        "notification capacity shortage setup");
   std::thread returner([b = std::move(block)]() mutable { b = {}; });
   returner.join();
   check(::poll(&event, 1, 0) == 1, "failed allocation missed cross-thread return");
   signal->consume();
-  block = p->allocate(4096, UrmaMemoryPurpose::Tx, signal.get());
+  block = p->allocate(4096, signal.get());
   block = {};
   check(::poll(&event, 1, 0) == 0, "satisfied allocation kept waking owner");
 
@@ -224,10 +223,10 @@ void resourceNotifications() {
     }
   });
   for (unsigned i = 1; i <= 1000; ++i) {
-    held = p->allocate(4096, UrmaMemoryPurpose::Tx);
+    held = p->allocate(4096);
     check(bool(held), "concurrent return fixture allocation");
     requested.store(i);
-    auto available = p->allocate(4096, UrmaMemoryPurpose::Tx, signal.get());
+    auto available = p->allocate(4096, signal.get());
     while (finished.load() < i) std::this_thread::yield();
     check(available || ::poll(&event, 1, 0) == 1,
           "concurrent physical-block return lost its wakeup");
@@ -237,9 +236,73 @@ void resourceNotifications() {
   signal->signal();
   check(::poll(&event, 1, 0) == 1, "control notification incorrectly gated");
   signal->consume();
+  pressure.clear();
   check(p->shutdown(0ms) && registered == 0, "notification cleanup");
   std::cout << "PASS quiet resource returns, allocation/clone waiters and "
-               "1000 concurrent budget-return races\n";
+               "1000 concurrent block-return races\n";
+}
+void largeExtents() {
+  const size_t page = sysconf(_SC_PAGESIZE);
+  constexpr size_t mib = 1024 * 1024;
+  UrmaPoolConfig c;
+  c.elastic = false;
+  c.pool_size = c.pool_max_size = 64 * mib;
+  auto p = std::make_shared<urma_detail::MemoryPool>(nullptr, c);
+  auto prefix = p->allocate(4096);
+  const size_t request = 16 * mib + 13;
+  const size_t capacity = request + (page - request % page) % page;
+  auto large = p->allocate(request);
+  check(large && large.capacity() == capacity &&
+            reinterpret_cast<uintptr_t>(large.data()) % page == 0 &&
+            large.segment() == prefix.segment(),
+        "large request did not carve a page-aligned registered extent");
+  auto* address = large.data();
+  auto pin = p->lookup(address, request, true);
+  auto other = p->allocate(32 * mib);
+  check(other && !p->allocate(20 * mib), "large fragmentation fixture");
+  large = {};
+  check(!p->allocate(request), "exported large extent was reused before FREE");
+  pin = {};
+  large = p->allocate(request);
+  check(large && large.data() == address, "returned large extent was not reused");
+  large = {}; other = {}; prefix = {};
+  large = p->allocate(48 * mib + 1);
+  check(large && p->stats().register_calls == 1 &&
+            p->stats().allocated_bytes == large.capacity(),
+        "returned extents failed to coalesce or physical charge was incorrect");
+  check(!p->allocate(size_t(-1)) && !p->bufferSize(size_t(-1)) &&
+            !p->allocate(c.pool_size + 1), "large capacity/alignment overflow");
+  large = {};
+  check(p->shutdown(0ms) && registered == 0, "large fixed pool cleanup");
+
+  c.elastic = true;
+  c.pool_size = c.region_bytes = 16 * mib;
+  c.pool_max_size = 48 * mib;
+  c.retry_ms = 2;
+  p = std::make_shared<urma_detail::MemoryPool>(nullptr, c);
+  p->warm(0ms);
+  auto full = p->allocate(c.pool_size);
+  failRegistration = true;
+  check(!p->allocate(20 * mib + 1), "large growth unexpectedly synchronous");
+  auto deadline = std::chrono::steady_clock::now() + 2s;
+  while (!p->stats().registration_failures && std::chrono::steady_clock::now() < deadline)
+    std::this_thread::sleep_for(2ms);
+  check(p->stats().registration_failures && registered == c.pool_size &&
+            p->stats().registered_bytes + p->stats().registering_bytes <= c.pool_max_size,
+        "failed large registration published storage or exceeded hard capacity");
+  failRegistration = false;
+  deadline = std::chrono::steady_clock::now() + 2s;
+  while (!large && std::chrono::steady_clock::now() < deadline) {
+    large = p->allocate(20 * mib + 1);
+    if (!large) std::this_thread::sleep_for(2ms);
+  }
+  check(large && large.capacity() == 20 * mib + page &&
+            large.segment() != full.segment() &&
+            p->stats().registered_bytes == c.pool_size + large.capacity(),
+        "large growth recovery did not use aligned physical capacity");
+  large = {}; full = {};
+  check(p->shutdown(2s) && registered == 0, "large growth cleanup");
+  std::cout << "PASS >16 MiB alignment, reuse/coalescing, export pins, overflow and growth rollback\n";
 }
 }  // namespace
 extern "C" urma_target_seg_t* urma_register_seg(urma_context_t*,
@@ -265,6 +328,7 @@ int main(int argc, char** argv) {
     alignedTlsSlices();
     largeBodiesStayRegistered();
     resourceNotifications();
+    largeExtents();
     check(argc == 2, "shipped config fixture argument missing");
     UrmaConfig base;
     base.dev_name = "device-supplied-by-caller";
@@ -275,9 +339,8 @@ int main(int argc, char** argv) {
               example.registered_pool.zero_copy &&
               example.registered_pool == base.registered_pool &&
               example.registered_pool.pool_max_size >
-                  example.registered_pool.pool_size &&
-              example.rx_target == base.rx_target,
-          "shipped config overlay / startup reserves");
+                  example.registered_pool.pool_size,
+          "shipped config overlay");
     char path[] = "/tmp/urma-config-test-XXXXXX";
     int fd = ::mkstemp(path);
     check(fd >= 0, "temporary config creation failed");
@@ -296,18 +359,27 @@ int main(int argc, char** argv) {
       catch (const std::invalid_argument&) { rejected = true; }
       check(rejected, "removed shared/credit configuration was accepted");
     }
+    for (const char* pool : {"{\"budgets\":{}}",
+                             "{\"classes\":[{\"bytes\":4096,\"reserve\":{}}]}"}) {
+      std::ofstream out(path);
+      out << "{\"version\":3,\"registered_pool\":" << pool << "}";
+      out.close();
+      bool rejected = false;
+      try { (void)loadUrmaConfigFile(path, base); }
+      catch (const std::invalid_argument&) { rejected = true; }
+      check(rejected, "obsolete purpose isolation accepted");
+    }
     using namespace urma_detail;
     auto c = config();
     auto bad = c;
-    bad.pool_size = 4096;
-    bad.classes[0].reserve[0] = 2;
+    bad.pool_max_size = bad.pool_size - 4096;
     bool rejected = false;
     try {
       urma_detail::MemoryPool::validate(bad);
     } catch (...) {
       rejected = true;
     }
-    check(rejected, "startup borrowed the hard limit for soft reserves");
+    check(rejected, "initial capacity exceeded hard limit");
     failRegistration = true;
     rejected = false;
     try {
@@ -331,8 +403,8 @@ int main(int argc, char** argv) {
     p->subscribe(std::make_shared<UrmaPoolSignal>());
     check(notifications == 0, "expired notification control block retained");
     std::cout << "PASS notification storage remains bounded across 1000 owner lifetimes\n";
-    auto tx = p->allocate(12000, UrmaMemoryPurpose::Tx);
-    auto rx = p->allocate(4096, UrmaMemoryPurpose::Rx);
+    auto tx = p->allocate(12000);
+    auto rx = p->allocate(4096);
     check(tx && rx && tx.capacity() == 12288 && tx.segment() == rx.segment(),
           "shared region / exact class");
     check(!p->lookup(static_cast<char*>(tx.data()) + 12287, 2, false),
@@ -345,7 +417,7 @@ int main(int argc, char** argv) {
     wakeup->arm();
     pollfd wakeEvent{wakeup->fd(), POLLIN, 0};
     tx = {};
-    check(p->stats().held_by_purpose[size_t(UrmaMemoryPurpose::Tx)] == 12288,
+    check(p->stats().allocated_bytes == 16384,
           "DMA/export hold lost budget");
     dma = {};
     check(::poll(&wakeEvent, 1, 0) == 0,
@@ -357,14 +429,14 @@ int main(int argc, char** argv) {
     rx = {};
     const auto before = calls.load();
     std::vector<UrmaPoolBuffer> held;
-    while (auto b = p->allocate(4096, UrmaMemoryPurpose::Tx)) held.push_back(b);
-    check(bool(p->allocate(4096, UrmaMemoryPurpose::Control)),
-          "data stole control reserve");
+    while (auto b = p->allocate(4096)) held.push_back(b);
+    check(held.size() * 4096 == c.pool_size && !p->allocate(4096),
+          "unused class reserve or allocation past total capacity");
     check(calls == before && p->stats().registering_bytes == 0 &&
               registered == c.pool_size,
           "fixed pool grew because hard > soft");
     held.clear();
-    std::cout << "PASS fixed soft/hard, class reserves, mixed purposes, 12 "
+    std::cout << "PASS fixed soft/hard, shared class capacity, 12 "
                  "KiB, DMA/export lifetime\n";
     auto a = IoBufPool::createFromPoolShared(p, 100);
     auto b = IoBufPool::createFromPoolShared(p, 100);
@@ -439,14 +511,14 @@ int main(int argc, char** argv) {
     p = std::make_shared<urma_detail::MemoryPool>(nullptr, c);
     check(p->warm(0ms), "elastic warm");
     auto initial = p->initialSegment();
-    // Independent purpose budgets may share physical capacity, never regions.
-    for (int i = 0; i < 3; ++i)
-      held.push_back(p->allocate(16384, UrmaMemoryPurpose::Tx));
-    auto extra = p->allocate(16384, UrmaMemoryPurpose::ReadTarget);
+    // Exhaust the initial region before requesting growth.
+    for (int i = 0; i < 4; ++i)
+      held.push_back(p->allocate(16384));
+    auto extra = p->allocate(16384);
     auto end = std::chrono::steady_clock::now() + 2s;
     while (!extra && std::chrono::steady_clock::now() < end) {
       std::this_thread::sleep_for(2ms);
-      extra = p->allocate(16384, UrmaMemoryPurpose::ReadTarget);
+      extra = p->allocate(16384);
     }
     check(bool(extra), "elastic growth did not publish");
     check(extra.segment() != initial.segment() &&
@@ -485,7 +557,7 @@ int main(int argc, char** argv) {
           "idle published segment did not become revocable");
     pollfd retiredEvent{retiredWake->fd(), POLLIN, 0};
     check(::poll(&retiredEvent, 1, 0) == 1,
-          "retired block returned purpose budget without waking waiters");
+          "retired block became revocable without waking waiters");
     std::this_thread::sleep_for(30ms);
     check(p->stats().registered_bytes == c.pool_max_size,
           "announced segment unregistered before peer lease ended");
@@ -501,19 +573,19 @@ int main(int argc, char** argv) {
     check(p->shutdown(2s) && registered == 0, "elastic cleanup");
     std::cout << "PASS optional growth/shrink, DMA-held retirement, R+E, "
                  "HELLO and announced-region leases\n";
-    // Reserve is physically free but unavailable to TX: it must not suppress
-    // growth. This uses a tier exactly matching the protected block.
+    // Growth reserves capacity before unlocking for registration.
     c.pool_size = 32768;
     c.pool_max_size = 65536;
     c.region_bytes = 32768;
-    c.budgets.fill(65536);
-    c.classes = {{4096, {}}, {16384, {{0, 0, 1, 0, 0, 0}}}};
+
+    c.classes = {{4096}, {16384}};
     p = std::make_shared<urma_detail::MemoryPool>(nullptr, c);
     p->warm(0ms);
-    tx = p->allocate(16384, UrmaMemoryPurpose::Tx);
+    tx = p->allocate(16384);
     check(bool(tx), "protected growth setup");
+    auto occupied = p->allocate(16384);
     pauseRegistration = true;
-    extra = p->allocate(16384, UrmaMemoryPurpose::Tx);
+    extra = p->allocate(16384);
     end = std::chrono::steady_clock::now() + 2s;
     while (!p->stats().registering_bytes &&
            std::chrono::steady_clock::now() < end)
@@ -525,7 +597,7 @@ int main(int argc, char** argv) {
     for (unsigned i = 0; i < 8; ++i)
       requesters.emplace_back([&] {
         for (int j = 0; j < 20; ++j) {
-          check(!p->allocate(16384, UrmaMemoryPurpose::ReadSource),
+          check(!p->allocate(16384),
                 "unpublished region escaped");
           auto s = p->stats();
           check(s.registered_bytes + s.registering_bytes <= c.pool_max_size,
@@ -545,17 +617,18 @@ int main(int argc, char** argv) {
     end = std::chrono::steady_clock::now() + 2s;
     while (!extra && std::chrono::steady_clock::now() < end) {
       std::this_thread::sleep_for(2ms);
-      extra = p->allocate(16384, UrmaMemoryPurpose::Tx);
+      extra = p->allocate(16384);
     }
     check(extra && p->stats().registered_bytes == 65536,
-          "protected free bytes suppressed needed growth");
-    check(bool(p->allocate(16384, UrmaMemoryPurpose::Control)),
-          "growth consumed protected reserve");
+          "failed registration did not recover");
+    check(bool(p->allocate(16384)),
+          "remaining shared capacity unavailable");
     auto cached = IoBufPool::createFromPoolShared(p, 100);
     check(bool(cached), "elastic TLS cache setup");
     cached.reset();
     extra = {};
     tx = {};
+    occupied = {};
     end = std::chrono::steady_clock::now() + 2s;
     while (p->stats().registered_bytes != c.pool_size &&
            std::chrono::steady_clock::now() < end)
@@ -564,63 +637,12 @@ int main(int argc, char** argv) {
               !p->stats().tls_retained_bytes,
           "automatic shrink did not reclaim idle TLS");
     check(p->shutdown(2s) && !registered, "protected growth cleanup");
-    {
-      // Repartition free initial storage while reserved-class allocations
-      // live in a growth region. Idle shrink must rebuild those reserves in
-      // retained storage, not keep the otherwise unused region forever.
-      auto policy = config();
-      policy.elastic = true;
-      policy.pool_max_size = 98304;
-      policy.region_bytes = 32768;
-      policy.budgets.fill(policy.pool_max_size);
-      policy.classes = {{16384, {{0, 0, 0, 1, 1, 0}}}, {32768, {}}};
-      auto pool = std::make_shared<urma_detail::MemoryPool>(nullptr, policy);
-      check(pool->warm(0ms), "reserve relocation warm");
-      auto retained = pool->initialSegment();
-      std::vector<UrmaPoolBuffer> pressure;
-      for (unsigned n = 0; n < 4; ++n) {
-        auto b = pool->allocate(16384, n < 3 ? UrmaMemoryPurpose::ReadSource
-                                            : UrmaMemoryPurpose::ReadTarget);
-        check(b && b.segment() == retained.segment(), "initial pressure fixture");
-        pressure.push_back(std::move(b));
-      }
-      UrmaPoolBuffer source;
-      auto deadline = std::chrono::steady_clock::now() + 2s;
-      while (!source && std::chrono::steady_clock::now() < deadline) {
-        source = pool->allocate(16384, UrmaMemoryPurpose::ReadSource);
-        if (!source) std::this_thread::sleep_for(2ms);
-      }
-      auto target = pool->allocate(16384, UrmaMemoryPurpose::ReadTarget);
-      check(source && target && source.segment() != retained.segment() &&
-                target.segment() == source.segment(), "growth reserve fixture");
-      pressure.clear();
-      auto repartition = pool->allocate(32768, UrmaMemoryPurpose::Tx);
-      check(repartition && repartition.segment() == retained.segment(),
-            "initial free storage was not repartitioned");
-      repartition = {};
-      source = {};
-      target = {};
-      deadline = std::chrono::steady_clock::now() + 2s;
-      while (pool->stats().registered_bytes != policy.pool_size &&
-             std::chrono::steady_clock::now() < deadline)
-        std::this_thread::sleep_for(2ms);
-      check(pool->stats().registered_bytes == policy.pool_size,
-            "free reserves in growth region prevented idle shrink");
-      source = pool->allocate(16384, UrmaMemoryPurpose::ReadSource);
-      target = pool->allocate(16384, UrmaMemoryPurpose::ReadTarget);
-      check(source && target && source.segment() == retained.segment() &&
-                target.segment() == retained.segment(),
-            "shrinking did not preserve usable source/target reserves");
-      source = {}; target = {}; retained = {};
-      check(pool->shutdown(2s) && !registered, "reserve relocation cleanup");
-      std::cout << "PASS idle shrink restores reserved classes in retained storage\n";
-    }
     // Contended allocation and TLS cache reclamation share the same public
     // pool.
     c = config();
     c.pool_size = 1024 * 1024;
     c.pool_max_size = 0;
-    c.budgets.fill(c.pool_size);
+
     p = std::make_shared<urma_detail::MemoryPool>(nullptr, c);
     std::vector<std::thread> threads;
     for (unsigned n = 0; n < 8; ++n)
@@ -633,7 +655,7 @@ int main(int argc, char** argv) {
           auto copy = value->cloneOne();
           value.reset();
           check(copy->data()[127] == n, "concurrent clone overwritten");
-          auto block = p->allocate(4096, UrmaMemoryPurpose::Rx);
+          auto block = p->allocate(4096);
           check(bool(block), "concurrent whole block allocation");
           auto pin = p->lookup(block.data(), 4096, false);
           block = {};
@@ -644,7 +666,7 @@ int main(int argc, char** argv) {
     p->trim();
     check(!p->stats().allocated_bytes && p->shutdown(0ms),
           "concurrent pool leaked physical holds");
-    std::cout << "PASS protected-class growth and 8-thread shared "
+    std::cout << "PASS growth rollback and 8-thread shared "
                  "pool/TLS/clone lifetime\n";
     return 0;
   } catch (const std::exception& e) {

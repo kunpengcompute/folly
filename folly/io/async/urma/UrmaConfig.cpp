@@ -37,15 +37,6 @@ void boolean(const dynamic& obj, const char* key, bool& out) {
     out = v->getBool();
   }
 }
-void purposes(const dynamic& obj,
-              std::array<size_t, kUrmaMemoryPurposes>& out) {
-  keys(obj,
-       {"rx", "tx", "control", "read_source", "read_target", "read_control"});
-  const char* names[] = {"rx",          "tx",          "control",
-                         "read_source", "read_target", "read_control"};
-  for (size_t i = 0; i < kUrmaMemoryPurposes; ++i)
-    number(obj, names[i], out[i]);
-}
 }  // namespace
 UrmaConfig loadUrmaConfigFile(const std::string& path, const UrmaConfig& base) {
   try {
@@ -103,7 +94,7 @@ UrmaConfig loadUrmaConfigFile(const std::string& path, const UrmaConfig& base) {
       keys(*pool,
            {"enabled", "zero_copy", "region_bytes", "pool_size",
             "pool_max_size", "elastic", "tls_block_size", "tls_cache_blocks",
-            "budgets", "classes", "idle_ms", "retry_ms"});
+            "classes", "idle_ms", "retry_ms"});
       auto& p = c.registered_pool;
       boolean(*pool, "enabled", p.enabled);
       boolean(*pool, "zero_copy", p.zero_copy);
@@ -115,19 +106,15 @@ UrmaConfig loadUrmaConfigFile(const std::string& path, const UrmaConfig& base) {
       boolean(*pool, "elastic", p.elastic);
       number(*pool, "idle_ms", p.idle_ms);
       number(*pool, "retry_ms", p.retry_ms);
-      if (auto* budgets = pool->get_ptr("budgets"))
-        purposes(*budgets, p.budgets);
       if (auto* classes = pool->get_ptr("classes")) {
         if (!classes->isArray() || classes->size() > 64)
           throw std::invalid_argument(
               "classes must be an array of at most 64 entries");
         p.classes.clear();
         for (const auto& entry : *classes) {
-          keys(entry, {"bytes", "reserve"});
+          keys(entry, {"bytes"});
           UrmaPoolClass tier{};
           number(entry, "bytes", tier.bytes);
-          if (auto* reserve = entry.get_ptr("reserve"))
-            purposes(*reserve, tier.reserve);
           p.classes.push_back(tier);
         }
       }

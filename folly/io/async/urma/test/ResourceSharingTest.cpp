@@ -2,7 +2,8 @@
 #include "TestUtil.h"
 struct TestListener : UrmaIoContext::Listener {
   unsigned wakes{0}, completions{0}, receives{0};
-  bool blockData{false};
+  bool blockData{false}, retainData{false};
+  std::unique_ptr<IOBuf> held;
   bool receiveReady(const urma_detail::PacketHeader& h, const urma_cr_t&,
                     const uint8_t*, size_t) override {
     return !blockData || h.kind != urma_detail::PacketKind::Data;
@@ -12,9 +13,12 @@ struct TestListener : UrmaIoContext::Listener {
   bool allowFailure{false};
   std::function<void()> onFailure, onCompletion;
   void receive(
-      const urma_detail::PacketHeader&,
+      const urma_detail::PacketHeader& h,
       const urma_cr_t&,
-      std::unique_ptr<IOBuf>) override { ++receives; }
+      std::unique_ptr<IOBuf> data) override {
+    ++receives;
+    if (retainData && h.kind == urma_detail::PacketKind::Data) held = std::move(data);
+  }
   void completed(const urma_cr_t& c, bool) override {
     ++completions;
     lastUser = c.user_ctx;
@@ -117,9 +121,9 @@ void elasticCases(bool pressureTimeout = false) {
   p.pool_size = p.region_bytes = 256 * 1024;
   p.pool_max_size = 1024 * 1024;
   p.tls_block_size = 16384;
-  p.classes = {{4096, {}}, {16384, {}}};
-  p.budgets.fill(p.pool_max_size);
-  p.budgets[0] = 0;
+  p.classes = {{4096}, {16384}};
+
+
   p.retry_ms = 2;
   p.idle_ms = 2000;
   UrmaInit::init(c);
@@ -130,7 +134,7 @@ void elasticCases(bool pressureTimeout = false) {
     std::vector<UrmaPoolBuffer> occupied;
     pauseRegistration = true;
     auto unpause = makeGuard([&] { pauseRegistration = false; });
-    while (auto b = UrmaInit::poolAlloc(4096, UrmaMemoryPurpose::Rx))
+    while (auto b = UrmaInit::poolAlloc(4096))
       occupied.push_back(std::move(b));
     auto& preparing = UrmaIoContext::get(&second);
     TestListener listener;
@@ -202,7 +206,7 @@ void elasticCases(bool pressureTimeout = false) {
       UrmaPoolBuffer source;
       deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
       while (!source && std::chrono::steady_clock::now() < deadline) {
-        auto b = UrmaInit::poolAlloc(8192, UrmaMemoryPurpose::ReadSource);
+        auto b = UrmaInit::poolAlloc(8192);
         if (b && b.regionId() != initialId) source = std::move(b);
         else if (b) occupied.push_back(std::move(b));
         else std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -268,8 +272,8 @@ void revocationCases(bool abandon = false) {
     p.zero_copy = false;
     p.pool_size = 256 * 1024; p.region_bytes = 16384;
     p.pool_max_size = 512 * 1024;
-    p.classes = {{4096, {}}, {16384, {}}};
-    p.budgets.fill(p.pool_max_size); p.budgets[0] = 0;
+    p.classes = {{4096}, {16384}};
+
     p.idle_ms = scenario == 2 ? 30 : 2000; p.retry_ms = 2;
     UrmaInit::init(c);
     EventBase evb;
@@ -300,13 +304,13 @@ void revocationCases(bool abandon = false) {
     std::vector<UrmaPoolBuffer> occupied;
     const auto initial = UrmaInit::initialSegment().regionId();
     pauseRegistration = true;
-    while (auto b = UrmaInit::poolAlloc(16384, UrmaMemoryPurpose::ReadSource))
+    while (auto b = UrmaInit::poolAlloc(16384))
       occupied.push_back(std::move(b));
     pauseRegistration = false;
     UrmaPoolBuffer source;
     stage = "growth";
     spin([&] {
-      if (!source) source = UrmaInit::poolAlloc(16384, UrmaMemoryPurpose::ReadSource);
+      if (!source) source = UrmaInit::poolAlloc(16384);
       return bool(source);
     });
     require(source.regionId() != initial && source.segment()->seg.len == 16384,
@@ -404,8 +408,8 @@ void closeReadCases(bool unknown) {
     auto& p = c.registered_pool;
     p.zero_copy = p.elastic = false;
     p.pool_size = p.pool_max_size = 256 * 1024;
-    p.classes = {{4096, {}}, {16384, {}}};
-    p.budgets.fill(p.pool_size);
+    p.classes = {{4096}, {16384}};
+
     UrmaInit::init(c);
     const auto frees = checkedFrees;
     {
@@ -430,7 +434,7 @@ void closeReadCases(bool unknown) {
       receiver.echo = false;
       receiver.allowReadError = unknown;
       receiver.expected.assign(8192, 'c');
-      auto budget = mode == 5 ? owner.retainRead(128 * 1024 * 1024) : nullptr;
+      auto budget = mode == 5 ? holdReadSlots(owner) : std::vector<std::shared_ptr<void>>{};
       const auto posts = readPostCalls, accepted = acceptedReadWrs;
       holdReads = mode == 1;
       holdFreeCompletions = mode == 2 || mode == 3;
@@ -464,14 +468,14 @@ void closeReadCases(bool unknown) {
         }
         completeHeld(heldFreeCompletions);
         holdReads = holdFreeCompletions = blockReadPosts = false;
-        budget.reset();
+        budget.clear();
         spin([&] { return sender->completed == 1 && !owner.snapshot().retired &&
             !owner.snapshot().inflight; });
         require(checkedFrees == frees + 1 && receiver.received == delivered,
                 "closed reader lost FREE or called the application again");
         require(mode < 4 || acceptedReadWrs == accepted,
                 "cancelled READ reached the SDK");
-        require(bool(owner.retainRead(128 * 1024 * 1024)), "closed FREE leaked READ budget");
+        (void)holdReadSlots(owner); // Every READ/FREE responsibility was released.
       }
       holdReads = holdFreeCompletions = blockReadPosts = unknownReadBoundary = false;
       sender.reset();
@@ -551,17 +555,176 @@ void rnrGapCases() {
               importsCreated == importsDeleted && segmentImports == segmentUnimports,
           "RNR recovery leaked resources");
 }
+void readPressureCases() {
+  UrmaConfig c;
+  c.rx_depth = c.rx_target = 4;
+  c.tx_depth = 8;
+  c.read_window = c.offer_window = 2;
+  c.max_pending_bytes = 32768;
+  c.registered_pool.zero_copy = c.registered_pool.elastic = false;
+  c.registered_pool.pool_size = c.registered_pool.pool_max_size = 256 * 1024;
+  UrmaInit::init(c);
+  {
+    EventBase first, second;
+    auto& a = UrmaIoContext::get(&first);
+    auto& b = UrmaIoContext::get(&second);
+    auto pump = [&] { first.loopOnce(EVLOOP_NONBLOCK); second.loopOnce(EVLOOP_NONBLOCK); };
+    auto spin = [&](auto done, int seconds = 3) {
+      const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
+      while (!done() && std::chrono::steady_clock::now() < deadline) {
+        pump(); std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+      require(done(), "bidirectional READ pressure did not progress");
+    };
+    Acceptor acceptor(second);
+    SocketAddress address;
+    auto server = listenOnLoopback(second, acceptor, address, 8);
+    auto client = std::make_unique<Echo>(UrmaAsyncSocket::newSocket(&first, address), false);
+    spin([&] { return acceptor.connections.size() == 1 &&
+        static_cast<UrmaAsyncSocket*>(client->socket.get())->isUrmaReady() &&
+        static_cast<UrmaAsyncSocket*>(acceptor.connections[0]->socket.get())->isUrmaReady(); });
+    auto& peer = *acceptor.connections[0];
+    peer.echo = false;
+    client->allowReadError = client->allowWriteError = true;
+    peer.allowReadError = peer.allowWriteError = true;
+    client->expected = peer.expected = std::string(8192, 'p');
+    auto source = [&] {
+      auto data = UrmaInit::createPoolBuffer(8192);
+      require(bool(data), "registered pressure source unavailable");
+      std::memset(data->writableData(), 'p', 8192); data->append(8192);
+      return data;
+    };
+    holdPullReceives = true;
+    client->socket->writeChain(client.get(), source());
+    peer.socket->writeChain(&peer, source());
+    spin([&] { return heldPullReceives.size() == 2 &&
+        !a.snapshot().inflight && !b.snapshot().inflight; });
+    std::vector<UrmaPoolBuffer> pressure;
+    while (auto block = UrmaInit::poolAlloc(4096)) pressure.push_back(std::move(block));
+    const auto accepted = acceptedReadWrs;
+    const auto frees = checkedFrees;
+    holdPullReceives = false; completeHeld(heldPullReceives);
+    spin([&] { return a.snapshot().waiting && b.snapshot().waiting; });
+    require(acceptedReadWrs == accepted && !client->completed && !peer.completed &&
+                !client->received && !peer.received &&
+                client->socket->getAppBytesBuffered() <= c.max_pending_bytes &&
+                peer.socket->getAppBytesBuffered() <= c.max_pending_bytes,
+            "exhausted READ submitted DMA or exceeded pending limits");
+    // The actual production READ/FREE deadline applies in both directions.
+    spin([&] { return client->readErrors == 1 && peer.readErrors == 1; }, 32);
+    spin([&] { return !a.snapshot().retired && !b.snapshot().retired &&
+        !a.snapshot().inflight && !b.snapshot().inflight; });
+    require(acceptedReadWrs == accepted && checkedFrees == frees + 2 &&
+                UrmaInit::poolStats().exported_bytes == 0 &&
+                !client->socket->getAppBytesBuffered() && !peer.socket->getAppBytesBuffered(),
+            "timeout lost cancellation FREE or retained pending data");
+    client.reset(); acceptor.connections.clear(); pressure.clear();
+    spin([&] { return a.snapshot().posted == c.rx_target && b.snapshot().posted == c.rx_target; });
+    // Reuse the same owners after resources return: a fresh bidirectional READ.
+    client = std::make_unique<Echo>(UrmaAsyncSocket::newSocket(&first, address), false);
+    spin([&] { return acceptor.connections.size() == 1 &&
+        static_cast<UrmaAsyncSocket*>(client->socket.get())->isUrmaReady(); });
+    auto& recovered = *acceptor.connections[0]; recovered.echo = false;
+    client->expected = recovered.expected = std::string(8192, 'p');
+    client->socket->writeChain(client.get(), source());
+    recovered.socket->writeChain(&recovered, source());
+    spin([&] { return client->completed == 1 && recovered.completed == 1 &&
+        client->received == 8192 && recovered.received == 8192; });
+    client->allowReadError = recovered.allowReadError = true;
+    client.reset(); acceptor.connections.clear();
+    spin([&] { return !a.snapshot().retired && !b.snapshot().retired; });
+    server->stopAccepting(); server.reset();
+    UrmaIoContext::release(&first); UrmaIoContext::release(&second);
+  }
+  UrmaInit::fini();
+  require(!UrmaInit::isInitialized() && !registrations &&
+              importsCreated == importsDeleted && segmentImports == segmentUnimports,
+          "bidirectional exhaustion left pool or import resources");
+  std::cout << "PASS bidirectional READ exhaustion, bounded timeout, cancellation FREE and recovery\n";
+}
+void bufferPressureCases() {
+  UrmaConfig c;
+  c.rx_depth = 8;
+  c.rx_target = 2;
+  c.tx_depth = 1024;
+  c.registered_pool.zero_copy = false;
+  c.registered_pool.elastic = false;
+  c.registered_pool.pool_size = c.registered_pool.pool_max_size = 65536;
+  c.registered_pool.tls_block_size = 4096;
+  UrmaInit::init(c);
+  {
+    EventBase first, second;
+    auto& a = UrmaIoContext::get(&first);
+    auto& b = UrmaIoContext::get(&second);
+    require(UrmaInit::poolStats().allocated_bytes == 6 * 4096,
+            "idle owner allocated TX-depth data storage");
+    TestListener sender, receiver;
+    receiver.retainData = true;
+    const auto id = a.attach(&sender), target = b.attach(&receiver);
+    auto peer = a.importPeer(b.endpoint());
+    auto slot = a.reserve(id);
+    auto* packet = a.buffer(slot, 25);
+    urma_detail::encodeHeader(packet, {urma_detail::PacketKind::Data, target, 1});
+    packet[24] = 73;
+    urma_sge_t sg{};
+    sg.addr = reinterpret_cast<uint64_t>(packet);
+    sg.len = 25;
+    sg.tseg = a.segment(slot);
+    urma_jfs_wr_t wr{};
+    wr.opcode = URMA_OPC_SEND;
+    wr.tjetty = UrmaIoContext::handle(peer);
+    wr.send.src = {&sg, 1};
+    std::vector<UrmaPoolBuffer> pressure;
+    while (auto block = UrmaInit::poolAlloc(4096)) pressure.push_back(std::move(block));
+    require(a.post(slot, id, wr, {}) == URMA_SUCCESS, "pressure DATA post");
+    b.poll(); // Keep TX occupied until its CQE is polled on a.
+    require(receiver.held && receiver.held->data()[0] == 73 && b.snapshot().posted == 1,
+            "held RX was reused while replacement allocation failed");
+    receiver.held.reset();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (b.snapshot().posted != 2 && std::chrono::steady_clock::now() < deadline)
+      second.loopOnce(EVLOOP_NONBLOCK);
+    require(b.snapshot().posted == 2, "last RX reference did not restore preposting");
+    auto control = a.reserve(id, true);
+    auto* emergency = a.buffer(control, 24, true);
+    require(emergency, "exhausted pool could not send FREE");
+    auto blocked = a.reserve(id, true);
+    require(!a.buffer(blocked, 24, true), "emergency block borrowed by two WRs");
+    a.cancel(control);
+    require(a.buffer(blocked, 24, true) == emergency, "cancel lost emergency block");
+    urma_detail::encodeHeader(emergency, {urma_detail::PacketKind::Free, target, 1});
+    sg.addr = reinterpret_cast<uint64_t>(emergency);
+    sg.len = 24;
+    sg.tseg = a.segment(blocked);
+    wr.opcode = URMA_OPC_SEND_IMM;
+    require(a.post(blocked, id, wr, {}) == URMA_SUCCESS, "emergency FREE post");
+    control = a.reserve(id, true);
+    require(!a.buffer(control, 24, true), "in-flight FREE storage reused before CQE");
+    a.cancel(control);
+    a.poll(); b.poll();
+    require(sender.completions == 2 && receiver.receives == 2,
+            "emergency completion did not preserve DATA/FREE");
+    pressure.clear();
+    a.detach(id); b.detach(target);
+  }
+  UrmaInit::fini();
+  require(!UrmaInit::isInitialized() && !registrations,
+          "pressure case retained registered storage");
+  std::cout << "PASS on-demand TX, emergency FREE, held RX and refill recovery\n";
+}
 int main(int argc, char** argv) {
   const bool readError = argc == 2 && !std::strcmp(argv[1], "--read-error");
   const bool pressureTimeout = argc == 2 && !std::strcmp(argv[1], "--rx-timeout");
   const bool revokeAbort = argc == 2 && !std::strcmp(argv[1], "--revoke-abort");
   const bool closeRead = argc == 2 && !std::strcmp(argv[1], "--close-read");
   const bool closeUnknown = argc == 2 && !std::strcmp(argv[1], "--close-read-unknown");
+  const bool readPressure = argc == 2 && !std::strcmp(argv[1], "--read-pressure");
   const bool rnrGap = argc == 2 && !std::strcmp(argv[1], "--rnr-gap");
   if (argc != 1 && !readError && !pressureTimeout && !revokeAbort &&
-      !closeRead && !closeUnknown && !rnrGap)
+      !closeRead && !closeUnknown && !rnrGap && !readPressure)
     return 2;
   try {
+    if (readPressure) { readPressureCases(); return 0; }
     if (rnrGap) { rnrGapCases(); return 0; }
     if (closeRead || closeUnknown) { closeReadCases(closeUnknown); return 0; }
     if (pressureTimeout) { elasticCases(true); return 0; }
@@ -674,14 +837,14 @@ int main(int argc, char** argv) {
         require(
             index != UrmaIoContext::kNoSlot,
             "unexpected sequential SQ exhaustion");
-        auto* packet = a.buffer(index);
+        auto* packet = a.buffer(index, 25);
         urma_detail::encodeHeader(
             packet, {urma_detail::PacketKind::Data, receiverId, i});
         packet[24] = 0;
         urma_sge_t sg{};
         sg.addr = reinterpret_cast<uint64_t>(packet);
         sg.len = 25;
-        sg.tseg = a.segment();
+        sg.tseg = a.segment(index);
         urma_jfs_wr_t send{};
         send.opcode = URMA_OPC_SEND;
         send.tjetty = UrmaIoContext::handle(peer);
@@ -711,13 +874,13 @@ int main(int argc, char** argv) {
       const auto delivered = receiver.receives;
       auto sendPacket = [&](urma_detail::PacketKind kind, uint64_t sequence) {
         auto index = a.reserve(id);
-        auto* packet = a.buffer(index);
+        auto* packet = a.buffer(index, 25);
         urma_detail::encodeHeader(packet, {kind, receiverId, sequence});
         packet[24] = 7;
         urma_sge_t sg{};
         sg.addr = reinterpret_cast<uint64_t>(packet);
         sg.len = kind == urma_detail::PacketKind::Data ? 25 : 24;
-        sg.tseg = a.segment();
+        sg.tseg = a.segment(index);
         urma_jfs_wr_t wr{};
         wr.opcode = kind == urma_detail::PacketKind::Data ? URMA_OPC_SEND : URMA_OPC_SEND_IMM;
         wr.tjetty = UrmaIoContext::handle(peer);
@@ -745,21 +908,24 @@ int main(int argc, char** argv) {
 
       id = a.attach(&listener);
       require(a.initialReadSegment() != nullptr, "initial READ segment");
-      auto reservation = a.retainRead(128 * 1024 * 1024);
-      require(
-          bool(reservation) && !a.retainRead(1),
-          "owner READ byte budget not enforced");
-      reservation.reset();
       std::vector<std::shared_ptr<void>> responsibilities;
       for (int i = 0; i < 1024; ++i) {
-        responsibilities.push_back(a.retainRead(1));
+        responsibilities.push_back(a.retainRead());
         require(
             bool(responsibilities.back()), "owner READ count budget too small");
       }
-      require(!a.retainRead(1), "owner FREE responsibility count unbounded");
+      require(!a.retainRead(), "owner FREE responsibility count unbounded");
       responsibilities.clear();
       require(
-          bool(a.retainRead(1)), "owner READ responsibility did not recover");
+          bool(a.retainRead()), "owner READ responsibility did not recover");
+      for (size_t i = 0; i < 65536; ++i) {
+        responsibilities.push_back(a.retainReadSource());
+        require(bool(responsibilities.back()), "source responsibility limit too small");
+      }
+      require(!b.retainReadSource(), "source metadata bound was only per owner");
+      responsibilities.pop_back();
+      require(bool(b.retainReadSource()), "returned source responsibility did not recover");
+      responsibilities.clear();
       auto slot = a.reserve(id);
       unsigned releasedHold = 0;
       auto hold = std::shared_ptr<int>(new int, [&](int* p) {
@@ -1344,13 +1510,13 @@ int main(int argc, char** argv) {
 
       // Resource pressure must leave a valid PULL queued, not fail the stream
       // or start READ before its destination and active budget are available.
-      for (bool countLimit : {false, true}) {
-        stage = countLimit ? "READ count wait" : "READ byte wait";
+      {
+        stage = "READ count wait";
         std::vector<std::shared_ptr<void>> pressure;
-        const size_t count = countLimit ? 1024 : 1;
+        const size_t count = 1024;
         for (size_t i = 0; i < count; ++i) {
           pressure.push_back(
-              owner.retainRead(countLimit ? 1 : 128 * 1024 * 1024));
+              owner.retainRead());
           require(bool(pressure.back()), "could not occupy READ budget");
         }
         ordered.expected.assign(8192, 'b');
@@ -1393,9 +1559,8 @@ int main(int argc, char** argv) {
           ordered.socket->good() && !ordered.completed && !ordered.received &&
               owner.snapshot().reads == readsBefore,
           "destination pressure closed the stream or submitted READ");
-      auto budget = owner.retainRead(128 * 1024 * 1024);
-      require(bool(budget), "destination wait held active READ byte budget");
-      budget.reset();
+      auto budget = holdReadSlots(owner);
+      budget.clear();
       // No CQE is needed to wake a buffer returned by an application thread.
       std::thread releaser(
           [buffers = std::move(pressure)]() mutable { buffers.clear(); });
@@ -1534,6 +1699,7 @@ int main(int argc, char** argv) {
               importsCreated == importsDeleted && segmentImports == segmentUnimports &&
               jfsCreated == jfsDeleted && jfrCreated == jfrDeleted,
           "final resource imbalance");
+      bufferPressureCases();
       elasticCases();
       revocationCases();
     }

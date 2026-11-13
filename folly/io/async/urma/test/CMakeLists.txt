@@ -13,7 +13,7 @@ foreach(test MemoryContract Wire ResourceSharing Init Buffer CleanupQueue Socket
     set_tests_properties(URMA.${test} PROPERTIES TIMEOUT 60 LABELS "URMA")
   endif()
 endforeach()
-foreach(mode read-error rx-timeout revoke-abort close-read close-read-unknown rnr-gap)
+foreach(mode read-error rx-timeout revoke-abort close-read close-read-unknown rnr-gap read-pressure)
   add_test(NAME URMA.ResourceSharing.${mode} COMMAND UrmaResourceSharingTest --${mode})
   set_tests_properties(URMA.ResourceSharing.${mode} PROPERTIES TIMEOUT 60 LABELS "URMA")
 endforeach()

@@ -104,7 +104,7 @@ struct Endpoint : AsyncTransport::ReadCallback,
     std::cerr << "read: " << e.what() << '\n';
   }
   void send(size_t n, unsigned value) {
-    auto b = UrmaInit::createPoolBuffer(n, UrmaMemoryPurpose::ReadSource);
+    auto b = UrmaInit::createPoolBuffer(n);
     require(bool(b), "test source allocation");
     for (size_t i = 0; i < n; ++i)
       b->writableData()[i] = pattern(sent + i, value);
@@ -262,20 +262,19 @@ void boundaryContract(EventBase& evb, Endpoint& client, Endpoint& server,
     return;
   }
   if (mode == "eof_read_budget" || mode == "eof_read_reject") {
-    std::shared_ptr<void> budget;
+    std::vector<std::shared_ptr<void>> budget;
     if (mode == "eof_read_budget") {
-      budget = owner.retainRead(128 * 1024 * 1024);
-      require(bool(budget), "READ budget fixture");
+      budget = holdReadSlots(owner);
     } else blockReadPosts = true;
     const auto pulls = checkedPulls;
     const auto attempts = readPostCalls;
     client.send(16384, 19);
     pump(evb, [&] { return checkedPulls > pulls &&
-        (budget || readPostCalls > attempts); }, "tail PULL did not wait");
+        (!budget.empty() || readPostCalls > attempts); }, "tail PULL did not wait");
     feedEnd(server, 2);
     require(!server.eofs && !server.errors && !server.received,
             "EOF cancelled an unsubmitted tail READ");
-    budget.reset(); blockReadPosts = false;
+    budget.clear(); blockReadPosts = false;
     owner.poll();
     pump(evb, [&] { return server.eofs == 1 && client.callbacks == 1; },
          "tail READ did not resume after EOF");

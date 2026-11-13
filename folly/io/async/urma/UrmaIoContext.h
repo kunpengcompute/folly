@@ -78,7 +78,8 @@ class UrmaIoContext {
   ReadBuffer takeReadBuffer(size_t);
   // Bounds active READs and unsent/inflight FREE responsibilities. PULLs
   // waiting for admission remain in the connection's bounded record queue.
-  std::shared_ptr<void> retainRead(size_t);
+  std::shared_ptr<void> retainRead();
+  std::shared_ptr<void> retainReadSource();
   std::shared_ptr<ImportedSegment> importReadSegment(const urma_seg_t&);
   static urma_target_seg_t* handle(const std::shared_ptr<ImportedSegment>&);
   // Reserve before writing the DMA buffer. A slot is one WR, also for READ.
@@ -87,8 +88,9 @@ class UrmaIoContext {
   // Retry on owner progress, with a timer for resources returned by another
   // thread/owner. Registration is deduplicated and detach cancels the wait.
   void waitForResources(uint64_t);
-  uint8_t* buffer(uint32_t);
-  urma_target_seg_t* segment() const;
+  // Allocated only for this WR; null means retry after pool/owner progress.
+  uint8_t* buffer(uint32_t, size_t bytes, bool control = false);
+  urma_target_seg_t* segment(uint32_t) const;
   void cancel(uint32_t);
   // READs admitted during CQ dispatch are chained at the next poll boundary,
   // with one completion and one slot per WR. Success transfers ownership;

@@ -176,7 +176,7 @@ int main(int argc,char**argv){
       if(run.server)return 2;
       UrmaIoContext::get(&run.evb);
       while (true) {
-        auto block = UrmaInit::allocateBuffer(1024 * 1024, UrmaMemoryPurpose::ReadSource);
+        auto block = UrmaInit::allocateBuffer(1024 * 1024);
         if (!block.memory) break;
         pressure.push_back(std::move(block));
       }

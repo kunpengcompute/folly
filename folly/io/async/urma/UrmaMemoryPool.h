@@ -4,7 +4,6 @@
 #ifdef FOLLY_HAVE_URMA
 #include <urma_api.h>
 
-#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -14,26 +13,13 @@
 #include <vector>
 
 namespace folly {
-enum class UrmaMemoryPurpose : size_t {
-  Rx,
-  Tx,
-  Control,
-  ReadSource,
-  ReadTarget,
-  ReadControl,  // READ completion messages have a separate progress reserve.
-  Count
-};
-constexpr size_t kUrmaMemoryPurposes = size_t(UrmaMemoryPurpose::Count);
 struct UrmaPoolClass {
   size_t bytes;
-  std::array<size_t, kUrmaMemoryPurposes> reserve;
-  bool operator==(const UrmaPoolClass& other) const {
-    return bytes == other.bytes && reserve == other.reserve;
-  }
+  bool operator==(const UrmaPoolClass& other) const { return bytes == other.bytes; }
 };
 struct UrmaPoolConfig {
   bool enabled{true};
-  // Process-wide IOBuf allocation mode after UrmaInit; misses use normal heap.
+  // Process-wide IOBuf allocation mode after UrmaInit; misses throw bad_alloc.
   bool zero_copy{true};
   // Initial process-wide capacity, not the size of each region.
   size_t pool_size{256 * 1024 * 1024};
@@ -44,26 +30,9 @@ struct UrmaPoolConfig {
   size_t tls_cache_blocks{2};
   // Optional growth unit; pool_size remains the initial total capacity.
   size_t region_bytes{4 * 1024 * 1024};
-  // Maximum held physical bytes per purpose. RX zero uses the pool hard limit.
-  // Class reserves protect progress; budgets do not allocate memory.
-  std::array<size_t, kUrmaMemoryPurposes> budgets{
-      {0, 16 * 1024 * 1024, 4 * 1024 * 1024, 102 * 1024 * 1024,
-       102 * 1024 * 1024, 4 * 1024 * 1024}};
   std::vector<UrmaPoolClass> classes{
-      {4096, {{0, 4, 4, 2, 2}}},
-      {16384, {{0, 0, 0, 2, 2}}},
-      {65536, {{0, 0, 0, 1, 1}}},
-      {262144, {{4, 0, 0, 1, 1}}},
-      {1048576, {{0, 0, 0, 1, 1}}},
-      // Grow intermediate large classes on demand; a protocol header must not
-      // turn a 1 MiB payload into a 16 MiB allocation/clear on every request.
-      {2097152, {{0, 0, 0, 0, 0}}},
-      {4194304, {{0, 0, 0, 0, 0}}},
-      {8388608, {{0, 0, 0, 0, 0}}},
-      // An 8 MiB body also needs serializer/TLS metadata. Keep those small
-      // additions from doubling each source and target's physical charge.
-      {8388608 + 65536, {{0, 0, 0, 0, 0}}},
-      {16777216, {{0, 0, 0, 1, 1}}}};
+      {4096}, {16384}, {65536}, {262144}, {1048576}, {2097152}, {4194304},
+      {8388608}, {8388608 + 65536}, {16777216}};
   uint32_t idle_ms{1000};
   uint32_t retry_ms{100};
   bool operator==(const UrmaPoolConfig& other) const;
@@ -81,7 +50,6 @@ struct UrmaPoolStats {
   size_t tls_retained_bytes{0};
   uint64_t register_calls{0}, unregister_calls{0};
   uint64_t register_nanoseconds{0}, unregister_nanoseconds{0};
-  std::array<size_t, kUrmaMemoryPurposes> held_by_purpose{};
 };
 struct UrmaPoolRegionInfo {
   uint64_t id;
@@ -139,8 +107,7 @@ class MemoryPool {
   static void validate(const UrmaPoolConfig& config);
   MemoryPool(urma_context_t* context, const UrmaPoolConfig& config);
   ~MemoryPool();
-  UrmaPoolBuffer allocate(size_t bytes, UrmaMemoryPurpose purpose,
-                          UrmaPoolSignal* waiter = nullptr);
+  UrmaPoolBuffer allocate(size_t bytes, UrmaPoolSignal* waiter = nullptr);
   UrmaPoolBuffer lookup(const void* address, size_t length, bool exported);
   // Region leases prevent unregister while a peer can still reference a segment.
   UrmaPoolBuffer initialSegment();

@@ -89,7 +89,7 @@ extern "C" urma_status_t urma_post_jfs_wr(urma_jfs_t* j,urma_jfs_wr_t* w,urma_jf
   }
   if(pull&&once("bad-length"))std::memset(packet+24,0xff,4);
   if(pull&&once("zero-length"))std::memset(packet+24,0,4);
-  if(pull&&once("bad-address"))w->send.imm_data=UINT64_MAX;
+  if(pull&&once("bad-address"))folly::urma_detail::store64(packet+32, UINT64_MAX);
   if(pull&&once("bad-reserved"))packet[31]=1;
   if(free&&once("bad-free"))packet[23]^=1;
   if(data&&w->send.src.sge[0].len>3992)std::abort();

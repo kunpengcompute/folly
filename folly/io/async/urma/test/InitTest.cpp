@@ -152,9 +152,10 @@ int main() {
   try {
     folly::UrmaConfig config;
     config.registered_pool.pool_size = 64 * 1024;
-    config.registered_pool.budgets.fill(64 * 1024);
+    config.registered_pool.elastic = false;
+
     config.registered_pool.tls_block_size = 4096;
-    config.registered_pool.classes = {{4096, {{0, 0, 0, 0, 0, 0}}}};
+    config.registered_pool.classes = {{4096}};
     // Exceed string's inline storage so copying configuration must allocate.
     config.dev_name = "urma-allocation-failure-test";
     std::strcpy(device.name, config.dev_name.c_str());
@@ -205,13 +206,8 @@ int main() {
       require(
           folly::UrmaInit::getConfig().dev_name == config.dev_name,
           "effective configuration not published");
-      const auto& effective = folly::UrmaInit::getConfig();
-      require(folly::UrmaInit::getMaxReadSize() == 4096,
-              "negotiated READ limit must fit a registered pool class");
-      require(
-          effective.rx_depth == 4096 && effective.rx_target == 256 &&
-              effective.tx_depth == 1024,
-          "automatic receive depth must preserve the fixed posted target");
+      require(folly::UrmaInit::getMaxReadSize() == 64 * 1024,
+              "READ limit must fit physical pool capacity, independently of largest class");
       folly::UrmaInit::fini();
       require(
           !folly::UrmaInit::isInitialized() && contexts == 0,
@@ -221,6 +217,61 @@ int main() {
                 << borrowed << '\n';
     }
     std::cout << "11 initialization cases passed\n";
+    reset();
+    folly::UrmaInit::init(config);
+    {
+      auto owned = [](const folly::IOBuf& b) {
+        return folly::UrmaInit::ownsPoolBuffer(b) &&
+            bool(folly::UrmaInit::lookupSegment(b.buffer(), b.capacity()));
+      };
+      auto a = folly::IOBuf::copyBuffer("abcd", 4);
+      auto clone = a->cloneOne();
+      clone->unshare();
+      require(owned(*a) && owned(*clone), "unshare escaped the registered pool");
+      clone->reserve(32, 8192);
+      require(owned(*clone) && clone->headroom() >= 32 &&
+                  !std::memcmp(clone->data(), "abcd", 4),
+              "reserve lost registered storage or data");
+      a->appendChain(std::move(clone));
+      a->coalesce();
+      require(owned(*a) && a->length() == 8, "coalesce escaped the pool");
+      auto text = a->moveToFbString();
+      require(text == "abcdabcd" && a->empty(), "registered-to-string ownership");
+      auto combined = folly::IOBuf::createCombined(100);
+      auto separate = folly::IOBuf::createSeparate(100);
+      folly::IOBuf direct(folly::IOBuf::CREATE, 100);
+      require(owned(*combined) && owned(*separate) && owned(direct),
+              "alternate IOBuf allocation escaped the registered pool");
+    }
+    folly::UrmaInit::trimPool();
+    {
+      auto original = folly::IOBuf::copyBuffer("held", 4);
+      auto clone = original->cloneOne();
+      std::vector<folly::UrmaPoolBuffer> pressure;
+      while (auto block = folly::UrmaInit::poolAlloc(4096))
+        pressure.push_back(std::move(block));
+      // Fill the remainder of the active TLS block too; no fresh registered
+      // block can be acquired by any of these synchronous allocation paths.
+      auto fails = [](auto operation) {
+        bool failed = false;
+        try { operation(); } catch (const std::bad_alloc&) { failed = true; }
+        require(failed, "pool exhaustion silently returned heap storage");
+      };
+      fails([] { (void)folly::IOBuf::create(8192); });
+      fails([] { (void)folly::IOBuf::createCombined(8192); });
+      fails([] { (void)folly::IOBuf::createSeparate(8192); });
+      fails([&] { clone->unshare(); });
+      clone.reset();
+      fails([&] { original->reserve(32, 8192); });
+      require(original->length() == 4 && !std::memcmp(original->data(), "held", 4),
+              "failed growth changed the original IOBuf");
+      pressure.clear();
+      original->reserve(32, 8192);
+      require(folly::UrmaInit::ownsPoolBuffer(*original), "retry did not regain registered storage");
+    }
+    folly::UrmaInit::fini();
+    require(!folly::UrmaInit::isInitialized(), "strict IOBuf test leaked pool");
+    std::cout << "PASS registered create/reserve/unshare/coalesce, explicit exhaustion and retry\n";
     reset();
     failPoolRegistration = true;
     bool registrationRejected = false;

@@ -35,10 +35,6 @@ constexpr uint32_t kReady = 1;
 constexpr auto kReadTimeout = std::chrono::seconds(30);
 constexpr auto kRnrRetryDelay = std::chrono::milliseconds(1);
 constexpr auto kRnrTimeout = std::chrono::seconds(5);
-// A local memory bound, not receive credit. Closed/unconfirmed READ sources
-// keep their charge; loss of a peer cannot create unbounded DMA quarantine.
-constexpr size_t kExposedReadLimit = 128 * 1024 * 1024;
-std::atomic<size_t> exposedReadBytes{0};
 using urma_detail::store32;
 using urma_detail::load32;
 bool supportedReadSegmentAttr(urma_seg_attr_t attr) {
@@ -69,31 +65,14 @@ struct UrmaAsyncSocket::Impl final : AsyncSocket::ConnectCallback,
     urma_context_t* ctx{nullptr};
     std::shared_ptr<UrmaIoContext::Peer> peer;
     RegisteredBuffer source, destination;
-    std::shared_ptr<void> readBudget;
+    std::shared_ptr<void> readBudget, sourceResponsibility;
     std::shared_ptr<UrmaIoContext::ImportedSegment> imported;
     std::shared_ptr<void> parent;
     UrmaPoolBuffer exported;
     std::atomic<bool> sourceExposed{false};
-    size_t exposureCharge{0};
-    bool chargeExposure() {
-      if (exposureCharge)
-        return true;
-      auto value = exposedReadBytes.load(std::memory_order_relaxed);
-      while (source.size <= kExposedReadLimit - value) {
-        if (exposedReadBytes.compare_exchange_weak(
-                value, value + source.size)) {
-          exposureCharge = source.size;
-          return true;
-        }
-      }
-      return false;
-    }
     void releaseExposure() {
-      if (exposureCharge) {
-        exposedReadBytes.fetch_sub(exposureCharge);
-        exposureCharge = 0;
-      }
       exported = {};
+      sourceResponsibility.reset();
       sourceExposed.store(false, std::memory_order_release);
     }
     bool tryCleanup() noexcept override {
@@ -225,7 +204,7 @@ struct UrmaAsyncSocket::Impl final : AsyncSocket::ConnectCallback,
     }
     void receive(const urma_detail::PacketHeader& h, const urma_cr_t& c,
                  std::unique_ptr<IOBuf> data) override {
-      if (c.opcode != URMA_CR_OPC_SEND_WITH_IMM || c.imm_data || data->length() ||
+      if (c.opcode != URMA_CR_OPC_SEND_WITH_IMM || data->length() ||
           std::memcmp(c.remote_id.eid.raw, peerId.eid.raw, 16)) return;
       if (h.kind == SendKind::Free) {
         auto it = sources.find(h.sequence);
@@ -269,12 +248,17 @@ struct UrmaAsyncSocket::Impl final : AsyncSocket::ConnectCallback,
         if (Clock::now() < work->retryAt) break;
         auto slot = io->reserve(socket, true);
         if (slot == UrmaIoContext::kNoSlot) break;
-        auto* packet = io->buffer(slot);
+        auto* packet = io->buffer(slot, urma_detail::kHeaderSize, true);
+        if (!packet) {
+          io->cancel(slot);
+          io->waitForResources(socket);
+          break;
+        }
         urma_detail::encodeHeader(packet, {work->kind, destination, work->sequence});
         urma_sge_t sge{};
         sge.addr = reinterpret_cast<uintptr_t>(packet);
         sge.len = urma_detail::kHeaderSize;
-        sge.tseg = io->segment();
+        sge.tseg = io->segment(slot);
         urma_jfs_wr_t wr{};
         wr.opcode = URMA_OPC_SEND_IMM;
         wr.tjetty = UrmaIoContext::handle(res->peer);
@@ -447,9 +431,17 @@ struct UrmaAsyncSocket::Impl final : AsyncSocket::ConnectCallback,
     urma_detail::encodeHello(h.data(), hello);
     sendHandshake(h.data(), h.size());
   }
+  static std::unique_ptr<IOBuf> copyHandshake(const void* p, size_t n) {
+    // TCP control storage is independent of registered DMA capacity, so pool
+    // pressure cannot prevent HELLO or the final stream boundary from draining.
+    auto bytes = std::make_unique<uint8_t[]>(n);
+    std::memcpy(bytes.get(), p, n);
+    return IOBuf::takeOwnership(bytes.release(), n,
+        [](void* data, void*) { delete[] static_cast<uint8_t*>(data); });
+  }
   void sendHandshake(const void* p, size_t n) {
     ++handshakeWrites;
-    tcp->writeChain(this, IOBuf::copyBuffer(p, n));
+    tcp->writeChain(this, copyHandshake(p, n));
   }
   void connectSuccess() noexcept override { start(); }
   void connectErr(const AsyncSocketException& e) noexcept override {
@@ -690,7 +682,7 @@ struct UrmaAsyncSocket::Impl final : AsyncSocket::ConnectCallback,
                       const urma_cr_t& c, const IOBuf& data) {
     if (!peerRead || (h.kind == SendKind::Segment
         ? c.opcode != URMA_CR_OPC_SEND
-        : c.opcode != URMA_CR_OPC_SEND_WITH_IMM || c.imm_data)) {
+        : c.opcode != URMA_CR_OPC_SEND_WITH_IMM)) {
       fail("invalid URMA segment control"); return;
     }
     try {
@@ -703,6 +695,12 @@ struct UrmaAsyncSocket::Impl final : AsyncSocket::ConnectCallback,
     if (!sourceWaiting)
       outgoingSince = Clock::now();
     auto resources = operationResources();
+    resources->sourceResponsibility = io->retainReadSource();
+    if (!resources->sourceResponsibility) {
+      sourceWaiting = true;
+      io->waitForResources(socketId);
+      return false;
+    }
     auto* node = work->write->data.get();
     size_t skip = work->offset;
     while (skip >= node->length()) {
@@ -726,7 +724,7 @@ struct UrmaAsyncSocket::Impl final : AsyncSocket::ConnectCallback,
       // Compatibility for external buffers. Normal serialized IOBufs
       // already belong to the registered pool and never take this copy path.
       resources->source =
-          UrmaInit::allocateBuffer(work->bytes, UrmaMemoryPurpose::ReadSource);
+          UrmaInit::allocateBuffer(work->bytes);
       if (resources->source.memory)
         resources->exported =
             UrmaInit::holdReadExport(resources->source.memory, work->bytes);
@@ -745,11 +743,6 @@ struct UrmaAsyncSocket::Impl final : AsyncSocket::ConnectCallback,
         sourceWaiting = true;
         io->waitForResources(socketId);
       }
-      return false;
-    }
-    if (!resources->chargeExposure()) {
-      sourceWaiting = true;
-      io->waitForResources(socketId);
       return false;
     }
     sourceWaiting = false;
@@ -775,7 +768,7 @@ struct UrmaAsyncSocket::Impl final : AsyncSocket::ConnectCallback,
   bool postRead(uint64_t sequence, Record& record) {
     if (readActive >= config.read_window)
       return false;
-    auto budget = io->retainRead(record.length);
+    auto budget = io->retainRead();
     if (!budget) {
       io->waitForResources(socketId);
       return false;
@@ -896,10 +889,10 @@ struct UrmaAsyncSocket::Impl final : AsyncSocket::ConnectCallback,
         (receiveEnd && h.sequence >= receiveEnd)) return true;
     size_t length = bytes;
     if (h.kind == SendKind::Pull) {
-      if (c.opcode != URMA_CR_OPC_SEND_WITH_IMM || !peerRead || bytes != 8 ||
+      if (c.opcode != URMA_CR_OPC_SEND_WITH_IMM || !peerRead || bytes != 16 ||
           load32(payload + 4)) return true;
       length = load32(payload);
-      if (!findReadSegment(c.imm_data, length)) return true;
+      if (!findReadSegment(urma_detail::load64(payload + 8), length)) return true;
     } else if (c.opcode != URMA_CR_OPC_SEND || !length ||
                length > config.buffer_size - urma_detail::kHeaderSize) return true;
     const size_t held = reads.chainLength() + recordBytes;
@@ -926,7 +919,7 @@ struct UrmaAsyncSocket::Impl final : AsyncSocket::ConnectCallback,
         h.kind == Kind::SegmentRevoke || h.kind == Kind::SegmentRevoked) {
       receiveSegment(h, c, *data);
     } else if (h.kind == Kind::Free) {
-      if (c.opcode != URMA_CR_OPC_SEND_WITH_IMM || c.imm_data ||
+      if (c.opcode != URMA_CR_OPC_SEND_WITH_IMM ||
           data->length()) {
         fail("invalid URMA FREE24");
         return;
@@ -935,13 +928,13 @@ struct UrmaAsyncSocket::Impl final : AsyncSocket::ConnectCallback,
     } else {
       size_t length = data->length();
       if (h.kind == Kind::Pull) {
-        if (c.opcode != URMA_CR_OPC_SEND_WITH_IMM || !peerRead || length != 8 ||
+        if (c.opcode != URMA_CR_OPC_SEND_WITH_IMM || !peerRead || length != 16 ||
             load32(data->data() + 4)) {
-          fail("invalid URMA PULL32");
+          fail("invalid URMA PULL40");
           return;
         }
         length = load32(data->data());
-        if (!findReadSegment(c.imm_data, length)) {
+        if (!findReadSegment(urma_detail::load64(data->data() + 8), length)) {
           fail("URMA PULL outside acknowledged segment or READ limit");
           return;
         }
@@ -963,7 +956,7 @@ struct UrmaAsyncSocket::Impl final : AsyncSocket::ConnectCallback,
           h.sequence,
           Record{
               h.kind,
-              c.imm_data,
+              h.kind == Kind::Pull ? urma_detail::load64(data->data() + 8) : 0,
               length,
               std::move(data),
               false,
@@ -1037,21 +1030,14 @@ struct UrmaAsyncSocket::Impl final : AsyncSocket::ConnectCallback,
     auto slot = io->reserve(socketId, control);
     if (slot == UrmaIoContext::kNoSlot) return false;
     auto cancelSlot = makeGuard([&] { io->cancel(slot); });
-    auto* packet = io->buffer(slot);
-    const size_t payload = work->kind == SendKind::Pull ? 8 : work->bytes;
+    uint8_t* packet = nullptr;
+    const size_t payload = work->kind == SendKind::Pull ? 16 : work->bytes;
     std::array<urma_sge_t, 4> sges{};
-    sges[0].addr = reinterpret_cast<uint64_t>(packet);
     sges[0].len = payload + urma_detail::kHeaderSize;
-    sges[0].tseg = io->segment();
     uint32_t count = 1;
     work->pins = {};
     bool direct = false;
-    if (work->kind == SendKind::Pull) {
-      store32(packet + urma_detail::kHeaderSize, work->bytes);
-      store32(packet + urma_detail::kHeaderSize + 4, 0);
-    } else if (work->kind == SendKind::Segment) {
-      std::memcpy(packet + urma_detail::kHeaderSize, work->control.data(), payload);
-    } else if (work->kind == SendKind::Data) {
+    if (work->kind == SendKind::Data) {
       const auto* node = work->write->data.get();
       if (!node->isChained() && !node->isSharedOne() && !work->offset &&
           work->bytes == work->write->bytes &&
@@ -1084,11 +1070,6 @@ struct UrmaAsyncSocket::Impl final : AsyncSocket::ConnectCallback,
           remaining -= n;
         }
         if (remaining) {
-          // Keep the planned DATA/coalescing boundary. More fragments than
-          // the available SGEs are copied into this slot's registered buffer.
-          io::Cursor fallback(node);
-          fallback.skip(work->offset);
-          fallback.pull(packet + urma_detail::kHeaderSize, payload);
           work->pins = {};
           count = 1;
         } else {
@@ -1096,6 +1077,28 @@ struct UrmaAsyncSocket::Impl final : AsyncSocket::ConnectCallback,
           direct = true;
         }
       }
+    }
+    if (!packet) {
+      packet = io->buffer(slot, sges[0].len, control);
+      if (!packet) {
+        io->waitForResources(socketId);
+        return false;
+      }
+      sges[0].addr = reinterpret_cast<uint64_t>(packet);
+      sges[0].tseg = io->segment(slot);
+    }
+    if (work->kind == SendKind::Pull) {
+      store32(packet + urma_detail::kHeaderSize, work->bytes);
+      store32(packet + urma_detail::kHeaderSize + 4, 0);
+      urma_detail::store64(packet + urma_detail::kHeaderSize + 8,
+          reinterpret_cast<uint64_t>(work->resources->source.memory));
+    } else if (work->kind == SendKind::Segment) {
+      std::memcpy(packet + urma_detail::kHeaderSize, work->control.data(), payload);
+    } else if (work->kind == SendKind::Data && !direct) {
+      // Preserve the planned coalescing boundary for heap/excess fragments.
+      io::Cursor cursor(work->write->data.get());
+      cursor.skip(work->offset);
+      cursor.pull(packet + urma_detail::kHeaderSize, payload);
     }
     urma_detail::encodeHeader(packet, {work->kind, peerSocketId, work->sequence});
     urma_jfs_wr_t wr{};
@@ -1108,9 +1111,7 @@ struct UrmaAsyncSocket::Impl final : AsyncSocket::ConnectCallback,
     wr.flag.bs.complete_enable = 1;
     wr.send.src.sge = sges.data();
     wr.send.src.num_sge = count;
-    wr.send.imm_data = work->kind == SendKind::Pull
-        ? reinterpret_cast<uint64_t>(work->resources->source.memory)
-        : 0;
+    wr.send.imm_data = 0;
     wr.user_ctx = reinterpret_cast<uintptr_t>(work.get());
     bool announcedBefore = false;
     if (work->kind == SendKind::Segment)
@@ -1444,7 +1445,7 @@ struct UrmaAsyncSocket::Impl final : AsyncSocket::ConnectCallback,
         auto end = urma_detail::encodeEnd(sendSequence + 1);
         // No callback may retain Impl after closeNow/destruction. A normal
         // close() waits for the boundary in flush() before reaching stop().
-        tcp->writeChain(nullptr, IOBuf::copyBuffer(end.data(), end.size()));
+        tcp->writeChain(nullptr, copyHandshake(end.data(), end.size()));
       }
       tcp->close();
     } else {
@@ -1562,11 +1563,21 @@ AsyncTransport::ReadCallback* UrmaAsyncSocket::getReadCallback()
 }
 void UrmaAsyncSocket::write(WriteCallback* cb, const void* p, size_t n,
                             WriteFlags flags) noexcept {
-  writeChain(cb, IOBuf::copyBuffer(p, n), flags);
+  // Like writev(), retain the caller's bytes until its completion callback.
+  // Registered staging (when needed) is acquired asynchronously by postSend.
+  try { writeChain(cb, IOBuf::wrapBuffer(p, n), flags); }
+  catch (const std::bad_alloc&) {
+    if (cb) cb->writeErr(0, AsyncSocketException(
+        AsyncSocketException::INTERNAL_ERROR, "URMA write metadata allocation failed"));
+  }
 }
 void UrmaAsyncSocket::writev(
     WriteCallback* cb, const iovec* vec, size_t n, WriteFlags flags) noexcept {
-  writeChain(cb, IOBuf::wrapIov(vec, n), flags);
+  try { writeChain(cb, IOBuf::wrapIov(vec, n), flags); }
+  catch (const std::bad_alloc&) {
+    if (cb) cb->writeErr(0, AsyncSocketException(
+        AsyncSocketException::INTERNAL_ERROR, "URMA write metadata allocation failed"));
+  }
 }
 void UrmaAsyncSocket::writeChain(
     WriteCallback* cb, std::unique_ptr<IOBuf>&& p, WriteFlags flags) noexcept {

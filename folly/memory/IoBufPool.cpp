@@ -106,13 +106,13 @@ std::unique_ptr<IOBuf> IoBufPool::createFromPoolShared(
   if (!block) {
     const auto bytes =
         std::max(pool->config().tls_block_size, capacity + sizeof(BlockLayout));
-    auto storage = pool->allocate(bytes, UrmaMemoryPurpose::ReadSource);
+    auto storage = pool->allocate(bytes);
     if (!storage) {
       // A miss is not proof of physical exhaustion: release reusable TLS first.
       for (size_t i = 0; i < limit; ++i)
         if (cache.blocks[i] && cache.blocks[i].use_count() == 1) cache.drop(i);
       reclaim(pool->identity(), false);  // current cache is locked and skipped
-      storage = pool->allocate(bytes, UrmaMemoryPurpose::ReadSource);
+      storage = pool->allocate(bytes);
     }
     if (!storage) return nullptr;
     block = std::make_shared<IoBufBlock>(pool, std::move(storage));

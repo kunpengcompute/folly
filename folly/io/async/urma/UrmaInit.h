@@ -20,7 +20,6 @@ class UrmaInit {
   };
   static std::unique_ptr<IOBuf> takeBuffer(Buffer buffer, size_t length);
   static Buffer allocateBuffer(size_t bytes,
-      UrmaMemoryPurpose purpose = UrmaMemoryPurpose::ReadTarget,
       UrmaPoolSignal* waiter = nullptr);
   // Acquires the process SDK context and registered pool. Queue resources are
   // prepared by each EventBase's shared owner when first needed.
@@ -39,7 +38,7 @@ class UrmaInit {
   static uint32_t getMaxReadSize();
   static void releaseContext();
   // A miss returns empty; background growth is requested only in elastic mode.
-  static UrmaPoolBuffer poolAlloc(size_t size, UrmaMemoryPurpose purpose,
+  static UrmaPoolBuffer poolAlloc(size_t size,
                                   UrmaPoolSignal* waiter = nullptr);
   static UrmaPoolBuffer lookupSegment(const void* addr, size_t length);
   static UrmaPoolBuffer holdReadExport(const void* addr, size_t length);
@@ -55,9 +54,12 @@ class UrmaInit {
   static std::vector<UrmaPoolRegionInfo> poolRegions();
   // Explicit opt-in allocator. No hidden prefix; length=0, capacity>=size.
   static std::unique_ptr<IOBuf> createPoolBuffer(
-      size_t size, UrmaMemoryPurpose purpose = UrmaMemoryPurpose::Tx);
+      size_t size);
   // Used by IOBuf::create only in explicitly enabled zero_copy mode.
+  // Returns null only when interception is disabled; a pool miss throws.
   static std::unique_ptr<IOBuf> tryCreateIOBuf(size_t size);
+  static bool poolIOBufAllocationEnabled();
+  static void freePoolBuffer(void*, void*);
   static bool ownsPoolBuffer(const IOBuf& buffer);
   // Retains the allocation until the last IOBuf/clone is destroyed. Capacity
   // is the whole block; length alone identifies the initialized bytes.

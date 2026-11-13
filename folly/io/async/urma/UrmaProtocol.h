@@ -8,11 +8,11 @@
 
 namespace folly::urma_detail {
 constexpr size_t kHeaderSize = 24;
-constexpr size_t kPullSize = 32;
+constexpr size_t kPullSize = 40;
 constexpr size_t kHelloSize = 102;
 constexpr size_t kSegmentSize = 40;
-constexpr uint16_t kHelloVersion = 7;
-constexpr uint8_t kWireVersion = 4;
+constexpr uint16_t kHelloVersion = 8;
+constexpr uint8_t kWireVersion = 5;
 constexpr uint32_t kMagic = 0x55524d41;
 enum class PacketKind : uint8_t {
   Data = 0, Pull = 1, Free = 2, Segment = 3, SegmentReady = 4,
@@ -69,7 +69,7 @@ inline bool decodeHeader(const uint8_t* p, size_t n, PacketHeader& h) {
   h = {PacketKind(p[6]), load64(p + 8), load64(p + 16)};
   return h.kind == PacketKind::Data ? n > kHeaderSize
       : h.kind == PacketKind::Pull
-      ? n == kPullSize && load32(p + 24) && !load32(p + 28)
+      ? n == kPullSize && load32(p + 24) && !load32(p + 28) && load64(p + 32)
       : h.kind == PacketKind::Segment ? n == kHeaderSize + kSegmentSize
       : n == kHeaderSize;
 }
