@@ -206,8 +206,8 @@ int main() {
       require(
           folly::UrmaInit::getConfig().dev_name == config.dev_name,
           "effective configuration not published");
-      require(folly::UrmaInit::getMaxReadSize() == 64 * 1024,
-              "READ limit must fit physical pool capacity, independently of largest class");
+      require(folly::UrmaInit::getMaxReadSize() == 4096,
+              "READ limit exceeds the largest class");
       folly::UrmaInit::fini();
       require(
           !folly::UrmaInit::isInitialized() && contexts == 0,
@@ -232,6 +232,8 @@ int main() {
       require(owned(*clone) && clone->headroom() >= 32 &&
                   !std::memcmp(clone->data(), "abcd", 4),
               "reserve lost registered storage or data");
+      require(clone->capacity() > folly::UrmaInit::getMaxReadSize(),
+              "READ limit incorrectly restricted continuous pool allocation");
       a->appendChain(std::move(clone));
       a->coalesce();
       require(owned(*a) && a->length() == 8, "coalesce escaped the pool");

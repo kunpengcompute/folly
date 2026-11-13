@@ -137,9 +137,10 @@ void UrmaInit::init(const UrmaConfig& requested) {
     effective.buffer_size =
         std::min<uint64_t>(effective.buffer_size,
                            std::min<uint64_t>(4096, attr.dev_cap.max_msg_size));
-    // Transfer policy is independent of allocator size classes. Keep the
-    // existing 16 MiB per-READ bound, additionally capped by the device.
-    readCapacity = std::min<uint64_t>(attr.dev_cap.max_read_size, 16 * 1024 * 1024);
+    // Bound each READ by the largest reusable class and the device. The pool
+    // can still allocate larger continuous IOBufs; transport slices them.
+    readCapacity = std::min<uint64_t>(
+        attr.dev_cap.max_read_size, config.registered_pool.classes.back().bytes);
     // Check limits before creating a context so rejection needs no teardown.
     if (effective.rx_depth && effective.rx_target <= effective.rx_depth && effective.tx_depth &&
         effective.buffer_size >= 32 &&

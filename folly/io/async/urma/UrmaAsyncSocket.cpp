@@ -601,17 +601,17 @@ struct UrmaAsyncSocket::Impl final : AsyncSocket::ConnectCallback,
   void planWrite(Write& write) {
     if (write.planned)
       return;
+    const auto readLimit = std::min(peerHello.maxRead, UrmaInit::getMaxReadSize());
     for (size_t length : write.recordLengths) {
       if (!length)
         continue;
-      const bool read = peerRead &&
-          UrmaInit::getMaxReadSize() && length > config.read_threshold &&
-          length <= peerHello.maxRead;
+      const bool read = peerRead && readLimit && length > config.read_threshold;
       // Decide per record first. Adjacent eligible READ records can then share
       // one PULL, without pulling a small record into a READ or crossing the
       // peer's holding limit. This never waits for another independent write.
       if (!write.ranges.empty() && write.ranges.back().read == read &&
-          (!read || length <= peerHello.maxRead - write.ranges.back().remaining))
+          (!read || (write.ranges.back().remaining <= readLimit &&
+                     length <= readLimit - write.ranges.back().remaining)))
         write.ranges.back().remaining += length;
       else
         write.ranges.push_back({length, read});
@@ -1192,7 +1192,8 @@ struct UrmaAsyncSocket::Impl final : AsyncSocket::ConnectCallback,
       work->offset = write->submitted;
       work->kind = write->ranges.front().read ? SendKind::Pull : SendKind::Data;
       work->bytes = work->kind == SendKind::Pull
-          ? write->ranges.front().remaining
+          ? std::min<size_t>(write->ranges.front().remaining,
+                            std::min(peerHello.maxRead, UrmaInit::getMaxReadSize()))
           : std::min(write->ranges.front().remaining, smallWriteLimit());
       if (sendSequence == UINT64_MAX) {
         fail("URMA wire sequence exhausted");

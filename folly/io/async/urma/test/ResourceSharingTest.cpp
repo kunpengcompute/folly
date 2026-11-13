@@ -1430,6 +1430,40 @@ int main(int argc, char** argv) {
         sharedSources.clear();
       }
 
+      stage = "oversized registered IOBuf split into ordered READs";
+      ordered.expected.assign(config.registered_pool.classes.back().bytes + 137, 'L');
+      for (size_t i = 0; i < ordered.expected.size(); ++i)
+        ordered.expected[i] = char((i / 4096 + i) % 251);
+      ordered.received = ordered.completed = 0;
+      auto largeSource = IOBuf::copyBuffer(ordered.expected);
+      const auto readLimit = UrmaInit::getMaxReadSize();
+      const auto slices = (ordered.expected.size() + readLimit - 1) / readLimit;
+      const auto slicePullsBefore = checkedPulls;
+      const auto before =
+          static_cast<UrmaAsyncSocket*>(ordered.socket.get())->getUrmaStats();
+      holdReads = true;
+      ordered.socket->writeChain(&ordered, largeSource->clone());
+      spin([&] { return heldReads.size() == slices; });
+      const auto after =
+          static_cast<UrmaAsyncSocket*>(ordered.socket.get())->getUrmaStats();
+      require(checkedPulls == slicePullsBefore + slices &&
+                  after.directReadBytes - before.directReadBytes == ordered.expected.size() &&
+                  after.copiedReadBytes == before.copiedReadBytes &&
+                  !ordered.received && !ordered.completed,
+              "oversized READ copied, downgraded to SEND or completed early");
+      for (size_t i = heldReads.size(); i > 1; --i)
+        signalQueue(heldReads[i - 1].first, heldReads[i - 1].second);
+      for (int i = 0; i < 32; ++i) evb.loopOnce(EVLOOP_NONBLOCK);
+      require(!ordered.received && !ordered.completed,
+              "later READ slice bypassed the first slice");
+      auto firstSlice = heldReads.front();
+      heldReads.clear();
+      holdReads = false;
+      signalQueue(firstSlice.first, firstSlice.second);
+      spin([&] { return ordered.received == ordered.expected.size() &&
+                       ordered.completed == 1; });
+      largeSource.reset();
+
       stage = "registered SEND chain exceeds one WR SGE count";
       ordered.expected.clear();
       ordered.received = ordered.completed = 0;
