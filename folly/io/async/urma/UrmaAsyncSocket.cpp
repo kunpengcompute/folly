@@ -493,6 +493,13 @@ struct UrmaAsyncSocket::Impl final : AsyncSocket::ConnectCallback,
       peerRead =
           peerHello.read && config.enable_read && UrmaInit::getMaxReadSize();
       peerSocketId = peerHello.socket;
+      if (!client) {
+        // Validate the peer before publishing our routing identity, but send
+        // HELLO before import: bonding may wait for the peer's import too.
+        sendHello();
+        if (!live())
+          return;
+      }
       res->peer = io->importPeer(peerId);
       if (!res->peer) {
         fail("URMA peer import failed errno=" + std::to_string(errno));
@@ -514,14 +521,6 @@ struct UrmaAsyncSocket::Impl final : AsyncSocket::ConnectCallback,
       }
       haveHello = true;
       handshake.erase(handshake.begin(), handshake.begin() + kHelloSize);
-      if (!client) {
-        // Do not give the peer our routing identity before its HELLO has been
-        // validated. Another socket can poll this owner's CQ before our next
-        // TCP callback, so TCP stream ordering alone is not sufficient.
-        sendHello();
-        if (!live())
-          return;
-      }
       if (client) {
         uint8_t ready[4];
         store32(ready, kReady);

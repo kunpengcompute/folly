@@ -41,6 +41,7 @@ std::unordered_map<urma_jfce_t*, std::deque<urma_jfc_t*>> notifications;
 size_t eventsRetrieved = 0, eventsAcknowledged = 0;
 bool failEventWait = false, failCqPoll = false, failCqRearm = false;
 std::function<void()> onRearm;
+std::function<void()> onImport;
 uint32_t nextQueue = 1;
 unsigned jfsCreated = 0, jfrCreated = 0, jfsDeleted = 0, jfrDeleted = 0;
 unsigned importsCreated = 0, importsDeleted = 0;
@@ -199,6 +200,7 @@ urma_status_t urma_unimport_seg(urma_target_seg_t* p) {
 }
 urma_target_jetty_t* urma_import_jfr(
     urma_context_t*, urma_rjfr_t* remote, urma_token_t*) {
+  if (onImport) onImport();
   auto p = new urma_target_jetty_t{};
   p->id = remote->jfr_id;
   ++importsCreated;

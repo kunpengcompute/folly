@@ -1264,18 +1264,29 @@ int main(int argc, char** argv) {
       hello.socket = UrmaIoContext::allocateSocketId();
       std::array<uint8_t, urma_detail::kHelloSize> encoded;
       urma_detail::encodeHello(encoded.data(), hello);
+      size_t got = 0;
+      bool helloBeforeImport = false;
+      onImport = [&] {
+        // A bonding import can wait for the remote import. The remote must
+        // already have our HELLO to enter it, even with fragmented input.
+        auto n = ::recv(raw, reply, sizeof(reply), MSG_DONTWAIT);
+        require(n == sizeof(reply), "peer import started before HELLO was sent");
+        got = n;
+        helloBeforeImport = true;
+      };
       for (size_t i = 0; i < encoded.size(); ++i) {
         require(
             ::send(raw, &encoded[i], 1, MSG_NOSIGNAL) == 1, "short HELLO send");
         evb.loopOnce(EVLOOP_NONBLOCK);
       }
-      size_t got = 0;
       for (int i = 0; i < 10000 && got != sizeof(reply); ++i) {
         evb.loopOnce(EVLOOP_NONBLOCK);
         auto n = ::recv(raw, reply + got, sizeof(reply) - got, MSG_DONTWAIT);
         if (n > 0)
           got += n;
       }
+      onImport = {};
+      require(helloBeforeImport, "handshake import hook not exercised");
       require(
           got == sizeof(reply) && urma_detail::decodeHello(reply, got, hello),
           "fragmented HELLO did not complete");
