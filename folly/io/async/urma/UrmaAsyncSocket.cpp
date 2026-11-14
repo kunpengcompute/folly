@@ -249,9 +249,9 @@ struct UrmaAsyncSocket::Impl final : AsyncSocket::ConnectCallback,
         if (Clock::now() < work->retryAt) break;
         auto slot = io->reserve(socket, true);
         if (slot == UrmaIoContext::kNoSlot) break;
+        auto cancelSlot = makeGuard([&] { io->cancel(slot); });
         auto* packet = io->buffer(slot, urma_detail::kHeaderSize, true);
         if (!packet) {
-          io->cancel(slot);
           io->waitForResources(socket);
           break;
         }
@@ -268,6 +268,7 @@ struct UrmaAsyncSocket::Impl final : AsyncSocket::ConnectCallback,
         wr.send.src.sge = &sge;
         wr.send.src.num_sge = 1;
         wr.user_ctx = reinterpret_cast<uintptr_t>(work.get());
+        cancelSlot.dismiss();
         auto st = io->post(slot, socket, wr, work);
         if (st == URMA_EAGAIN) break;
         if (st != URMA_SUCCESS) { broken = true; break; }
@@ -1095,7 +1096,7 @@ struct UrmaAsyncSocket::Impl final : AsyncSocket::ConnectCallback,
       }
     }
     if (!packet) {
-      packet = io->buffer(slot, sges[0].len, control);
+      packet = io->buffer(slot, sges[0].len, work->kind != SendKind::Data);
       if (!packet) {
         io->waitForResources(socketId);
         return false;

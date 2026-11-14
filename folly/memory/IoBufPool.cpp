@@ -70,7 +70,8 @@ Registry& registry() {
 thread_local std::shared_ptr<TLSBlockCache> localCache;
 }  // namespace
 std::unique_ptr<IOBuf> IoBufPool::createFromPoolShared(
-    const std::shared_ptr<urma_detail::MemoryPool>& pool, size_t capacity) {
+    const std::shared_ptr<urma_detail::MemoryPool>& pool, size_t capacity,
+    UrmaPoolSignal* waiter) {
   if (!capacity ||
       capacity > std::numeric_limits<size_t>::max() - sizeof(BlockLayout))
     return nullptr;
@@ -110,13 +111,13 @@ std::unique_ptr<IOBuf> IoBufPool::createFromPoolShared(
   if (!block) {
     const auto bytes =
         std::max(pool->config().tls_block_size, capacity + sizeof(BlockLayout));
-    auto storage = pool->allocate(bytes);
+    auto storage = pool->allocate(bytes, waiter);
     if (!storage) {
       // A miss is not proof of physical exhaustion: release reusable TLS first.
       for (size_t i = 0; i < limit; ++i)
         if (cache.blocks[i] && cache.blocks[i].use_count() == 1) cache.drop(i);
       reclaim(pool->identity(), false);  // current cache is locked and skipped
-      storage = pool->allocate(bytes);
+      storage = pool->allocate(bytes, waiter);
     }
     if (!storage) return nullptr;
     block = std::make_shared<IoBufBlock>(pool, std::move(storage));
@@ -136,6 +137,10 @@ std::unique_ptr<IOBuf> IoBufPool::createFromPoolShared(
 }
 bool IoBufPool::owns(const IOBuf& b) noexcept {
   return b.isManagedOne() && b.getFreeFn() == freeSlice;
+}
+urma_target_seg_t* IoBufPool::segment(const IOBuf& b) noexcept {
+  if (!owns(b)) return nullptr;
+  return (*static_cast<std::shared_ptr<IoBufBlock>*>(b.getUserData()))->storage.segment();
 }
 void IoBufPool::reclaim(const void* identity, bool all) noexcept {
   auto& r = registry();

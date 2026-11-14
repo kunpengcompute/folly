@@ -613,6 +613,14 @@ void readPressureCases() {
             "exhausted READ submitted DMA or exceeded pending limits");
     // The actual production READ/FREE deadline applies in both directions.
     spin([&] { return client->readErrors == 1 && peer.readErrors == 1; }, 32);
+    require(acceptedReadWrs == accepted && checkedFrees == frees &&
+                client->writeErrors == 1 && peer.writeErrors == 1 &&
+                UrmaInit::poolStats().exported_bytes != 0 &&
+                !client->socket->getAppBytesBuffered() && !peer.socket->getAppBytesBuffered(),
+            "timeout reused unconfirmed exports or retained queued writes");
+    // No emergency control storage: timeout cancels application work, but
+    // remote source leases survive until capacity returns and FREE is sent.
+    pressure.clear();
     spin([&] { return !a.snapshot().retired && !b.snapshot().retired &&
         !a.snapshot().inflight && !b.snapshot().inflight; });
     require(acceptedReadWrs == accepted && checkedFrees == frees + 2 &&
@@ -620,7 +628,7 @@ void readPressureCases() {
                 UrmaInit::poolStats().exported_bytes == 0 &&
                 !client->socket->getAppBytesBuffered() && !peer.socket->getAppBytesBuffered(),
             "timeout lost cancellation FREE or retained pending data");
-    client.reset(); acceptor.connections.clear(); pressure.clear();
+    client.reset(); acceptor.connections.clear();
     spin([&] { return a.snapshot().posted == c.rx_target && b.snapshot().posted == c.rx_target; });
     // Reuse the same owners after resources return: a fresh bidirectional READ.
     client = std::make_unique<Echo>(UrmaAsyncSocket::newSocket(&first, address), false);
@@ -658,8 +666,8 @@ void bufferPressureCases() {
     EventBase first, second;
     auto& a = UrmaIoContext::get(&first);
     auto& b = UrmaIoContext::get(&second);
-    require(UrmaInit::poolStats().allocated_bytes == 6 * 4096,
-            "idle owner allocated TX-depth data storage");
+    require(UrmaInit::poolStats().allocated_bytes == 4 * 4096,
+            "idle owner allocated TX or reserved control storage");
     TestListener sender, receiver;
     receiver.retainData = true;
     const auto id = a.attach(&sender), target = b.attach(&receiver);
@@ -688,31 +696,71 @@ void bufferPressureCases() {
       second.loopOnce(EVLOOP_NONBLOCK);
     require(b.snapshot().posted == 2, "last RX reference did not restore preposting");
     auto control = a.reserve(id, true);
-    auto* emergency = a.buffer(control, 24, true);
-    require(emergency, "exhausted pool could not send FREE");
-    auto blocked = a.reserve(id, true);
-    require(!a.buffer(blocked, 24, true), "emergency block borrowed by two WRs");
+    require(!a.buffer(control, 24, true), "full pool used unregistered/reserved control memory");
     a.cancel(control);
-    require(a.buffer(blocked, 24, true) == emergency, "cancel lost emergency block");
-    urma_detail::encodeHeader(emergency, {urma_detail::PacketKind::Free, target, 1});
-    sg.addr = reinterpret_cast<uint64_t>(emergency);
-    sg.len = 24;
-    sg.tseg = a.segment(blocked);
-    wr.opcode = URMA_OPC_SEND_IMM;
-    require(a.post(blocked, id, wr, {}) == URMA_SUCCESS, "emergency FREE post");
+    a.waitForResources(id);
+    pressure.pop_back();
+    const auto wakeDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!sender.wakes && std::chrono::steady_clock::now() < wakeDeadline)
+      first.loopOnce(EVLOOP_NONBLOCK);
+    require(sender.wakes && !a.snapshot().waiting, "returned capacity did not wake control waiter");
+    const auto allocated = UrmaInit::poolStats().allocated_bytes;
     control = a.reserve(id, true);
-    require(!a.buffer(control, 24, true), "in-flight FREE storage reused before CQE");
-    a.cancel(control);
+    auto* one = a.buffer(control, 24, true);
+    auto other = a.reserve(id, true);
+    auto* two = a.buffer(other, 24, true);
+    require(one && two && one != two && a.segment(control) == a.segment(other) &&
+                UrmaInit::poolStats().allocated_bytes == allocated + 4096 &&
+                UrmaInit::poolStats().tls_retained_bytes == 4096,
+            "small control messages did not share one registered TLS block");
+    bool metadataFailed = false;
+    auto failed = a.reserve(id, true);
+    failNextAllocation = true;
+    try { (void)a.buffer(failed, 24, true); }
+    catch (const std::bad_alloc&) { metadataFailed = true; }
+    failNextAllocation = false;
+    a.cancel(failed);
+    require(metadataFailed, "control metadata failure was treated as pool pressure");
+    // A known-unaccepted WR releases its slice; a retry gets valid storage.
+    urma_detail::encodeHeader(one, {urma_detail::PacketKind::Free, target, 1});
+    sg.addr = reinterpret_cast<uint64_t>(one);
+    sg.len = 24;
+    sg.tseg = a.segment(control);
+    wr.opcode = URMA_OPC_SEND_IMM;
+    postAgain = true;
+    require(a.post(control, id, wr, {}) == URMA_EAGAIN, "control submission retry fixture");
+    a.poll();
+    control = a.reserve(id, true);
+    one = a.buffer(control, 24, true);
+    require(one && one != two, "control retry overwrote another slice");
+    holdFreeCompletions = true;
+    for (auto item : {std::make_pair(control, one), std::make_pair(other, two)}) {
+      urma_detail::encodeHeader(item.second, {urma_detail::PacketKind::Free, target, item.first + 1});
+      sg.addr = reinterpret_cast<uint64_t>(item.second);
+      sg.tseg = a.segment(item.first);
+      require(a.post(item.first, id, wr, {}) == URMA_SUCCESS, "TLS FREE post");
+    }
+    std::array<uint8_t, 24> savedOne, savedTwo;
+    std::memcpy(savedOne.data(), one, 24); std::memcpy(savedTwo.data(), two, 24);
+    while (auto block = UrmaInit::poolAlloc(4096)) pressure.push_back(std::move(block));
+    UrmaInit::trimPool();
+    require(!UrmaInit::poolAlloc(4096) && !std::memcmp(one, savedOne.data(), 24) &&
+                !std::memcmp(two, savedTwo.data(), 24),
+            "pressure reclaimed or overwrote an in-flight control slice");
+    a.detach(id); // Completion storage outlives the connection listener.
+    holdFreeCompletions = false;
+    completeHeld(heldFreeCompletions);
     a.poll(); b.poll();
-    require(sender.completions == 2 && receiver.receives == 2,
-            "emergency completion did not preserve DATA/FREE");
+    require(sender.completions == 1 && receiver.receives == 3 &&
+                bool(UrmaInit::poolAlloc(4096)),
+            "late control completion did not release TLS storage or preserve DATA/FREE");
     pressure.clear();
-    a.detach(id); b.detach(target);
+    b.detach(target);
   }
   UrmaInit::fini();
   require(!UrmaInit::isInitialized() && !registrations,
           "pressure case retained registered storage");
-  std::cout << "PASS on-demand TX, emergency FREE, held RX and refill recovery\n";
+  std::cout << "PASS TLS control slices, pressure/retry, late completion, held RX and refill recovery\n";
 }
 void writeAdmissionCases() {
   UrmaConfig c;
@@ -1033,6 +1081,16 @@ int main(int argc, char** argv) {
       });
       urma_jfs_wr_t wr{};
       wr.opcode = URMA_OPC_SEND;
+      auto* control = a.buffer(slot, 24, true);
+      require(control, "unknown control acceptance fixture");
+      std::memset(control, 0x6a, 24);
+      urma_sge_t controlSge{};
+      controlSge.addr = reinterpret_cast<uintptr_t>(control);
+      controlSge.len = 24;
+      controlSge.tseg = a.segment(slot);
+      wr.send.src = {&controlSge, 1};
+      UrmaInit::trimPool();
+      const auto retained = UrmaInit::poolStats().allocated_bytes;
       unknownAcceptance = true;
       listener.allowFailure = true;
       listener.onFailure = [&] {
@@ -1051,8 +1109,10 @@ int main(int argc, char** argv) {
               listener.failures == 1,
           "ambiguous submission did not fail owner");
       a.detach(id);
+      UrmaInit::trimPool();
       require(
-          releasedHold == 0,
+          releasedHold == 0 && UrmaInit::poolStats().allocated_bytes == retained &&
+              control[0] == 0x6a && control[23] == 0x6a,
           "ambiguous WR released DMA references before teardown");
       UrmaIoContext::release(&first);
       require(
@@ -1686,9 +1746,13 @@ int main(int argc, char** argv) {
       ordered.received = ordered.completed = 0;
       const auto pullsBefore = checkedPulls;
       const auto readsBefore = owner.snapshot().reads;
+      holdPullReceives = true;
       ordered.socket->write(
           &ordered, ordered.expected.data(), ordered.expected.size());
       require(checkedPulls > pullsBefore, "source did not publish PULL");
+      spin([&] { return heldPullReceives.size() == 1 && !owner.snapshot().inflight; });
+      // Exhaust after TX completion, otherwise returning a TLS control block
+      // can itself supply the READ target and invalidate this pressure setup.
       std::vector<UrmaInit::Buffer> pressure;
       for (size_t bytes : {size_t(1024 * 1024), size_t(4096)}) {
         while (true) {
@@ -1698,6 +1762,8 @@ int main(int argc, char** argv) {
           pressure.push_back(std::move(buffer));
         }
       }
+      holdPullReceives = false;
+      completeHeld(heldPullReceives);
       spin([&] { return owner.snapshot().waiting != 0; });
       require(
           ordered.socket->good() && !ordered.completed && !ordered.received &&

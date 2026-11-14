@@ -313,6 +313,12 @@ bool UrmaInit::poolIOBufAllocationEnabled() {
 void UrmaInit::freePoolBuffer(void*, void* p) {
   delete static_cast<UrmaPoolBuffer*>(p);
 }
+std::unique_ptr<IOBuf> UrmaInit::createPoolSlice(
+    size_t size, UrmaPoolSignal* waiter) {
+  auto pool = std::atomic_load(&*publishedPool);
+  return pool ? IoBufPool::createFromPoolShared(
+                    pool, std::max(size, size_t(1)), waiter) : nullptr;
+}
 std::unique_ptr<IOBuf> UrmaInit::tryCreateIOBuf(size_t size) {
   if (!poolIOBufAllocationEnabled()) return nullptr;
   static thread_local bool active = false;

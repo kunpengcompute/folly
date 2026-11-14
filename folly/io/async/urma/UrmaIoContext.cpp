@@ -21,6 +21,7 @@
 #include <folly/io/async/EventHandler.h>
 #include <folly/io/async/urma/UrmaCleanup.h>
 #include <folly/io/async/urma/UrmaInit.h>
+#include <folly/memory/IoBufPool.h>
 
 namespace folly {
 namespace {
@@ -78,6 +79,7 @@ struct UrmaIoContext::Impl : EventHandler, AsyncTimeout {
     // Fixed owner storage: user_ctx points here until the terminal CQE.
     TxCompletionCtx completion;
     UrmaInit::Buffer buffer;
+    std::unique_ptr<IOBuf> controlBuffer;
     bool priority{false};
     bool reserved{false};
     bool submitted{false};
@@ -88,10 +90,6 @@ struct UrmaIoContext::Impl : EventHandler, AsyncTimeout {
     urma_jfc_t* cq{nullptr};
     urma_jfs_t* tx{nullptr};
     urma_jfr_t* rx{nullptr};
-    // One pool block guarantees a control SEND when ordinary allocation is
-    // exhausted. At most one WR borrows it until its terminal completion.
-    UrmaInit::Buffer control;
-    uint32_t controlSlot{kNoSlot};
     std::vector<UrmaInit::Buffer> receiveBuffers;
     std::vector<Slot> slots;
     bool counted{false};
@@ -142,7 +140,6 @@ struct UrmaIoContext::Impl : EventHandler, AsyncTimeout {
           return failed("delete_jfce", st);
         event = nullptr;
       }
-      control = {}; // Queues are gone; return the emergency block.
       if (ctx) {
         ctx = nullptr;
         UrmaInit::releaseContext();
@@ -250,11 +247,6 @@ struct UrmaIoContext::Impl : EventHandler, AsyncTimeout {
           throw std::runtime_error("URMA pool event registration failed");
         UrmaInit::subscribePool(poolSignal);
       }
-    }
-    if (!hw->control.memory) {
-      hw->control = UrmaInit::allocateBuffer(
-          urma_detail::kHeaderSize + urma_detail::kSegmentSize, poolSignal.get());
-      if (!hw->control.memory) return false;
     }
     if (!hw->event) {
       hw->event = urma_create_jfce(hw->ctx);
@@ -563,7 +555,7 @@ struct UrmaIoContext::Impl : EventHandler, AsyncTimeout {
           auto* listener = ctx->listener;
           const bool read = ctx->read;
           slot.buffer = {};
-          if (hw->controlSlot == ctx->index) hw->controlSlot = kNoSlot;
+          slot.controlBuffer.reset();
           slot.reserved = slot.submitted = false;
           freeSlots.push_back(ctx->index);
           c.user_ctx = ctx->user;
@@ -900,13 +892,13 @@ uint8_t* UrmaIoContext::buffer(uint32_t slot, size_t bytes, bool control) {
   auto& entry = hw.slots.at(slot);
   if (!entry.reserved || entry.submitted || !bytes || bytes > impl_->config.buffer_size)
     throw std::logic_error("invalid URMA send buffer request");
+  if (control) {
+    if (!entry.controlBuffer || entry.controlBuffer->capacity() < bytes)
+      entry.controlBuffer = UrmaInit::createPoolSlice(bytes, impl_->poolSignal.get());
+    return entry.controlBuffer ? entry.controlBuffer->writableData() : nullptr;
+  }
   if (!entry.buffer.memory)
     entry.buffer = UrmaInit::allocateBuffer(bytes, impl_->poolSignal.get());
-  if (!entry.buffer.memory && control && hw.controlSlot == kNoSlot &&
-      bytes <= urma_detail::kHeaderSize + urma_detail::kSegmentSize) {
-    hw.controlSlot = slot;
-    entry.buffer = hw.control;
-  }
   return static_cast<uint8_t*>(entry.buffer.memory);
 }
 void UrmaIoContext::waitForResources(uint64_t id) {
@@ -916,7 +908,9 @@ void UrmaIoContext::waitForResources(uint64_t id) {
   impl_->scheduleTimeout(1);
 }
 urma_target_seg_t* UrmaIoContext::segment(uint32_t slot) const {
-  return impl_->hw->slots.at(slot).buffer.segment;
+  const auto& entry = impl_->hw->slots.at(slot);
+  return entry.controlBuffer ? IoBufPool::segment(*entry.controlBuffer)
+                             : entry.buffer.segment;
 }
 void UrmaIoContext::cancel(uint32_t slot) {
   impl_->checkThread();
@@ -924,7 +918,6 @@ void UrmaIoContext::cancel(uint32_t slot) {
   if (!s.reserved || s.submitted)
     throw std::logic_error("invalid URMA slot cancellation");
   s = {};
-  if (impl_->hw->controlSlot == slot) impl_->hw->controlSlot = kNoSlot;
   impl_->freeSlots.push_back(slot);
 }
 urma_status_t UrmaIoContext::post(

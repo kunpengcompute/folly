@@ -55,6 +55,10 @@ class UrmaInit {
   // Explicit opt-in allocator. No hidden prefix; length=0, capacity>=size.
   static std::unique_ptr<IOBuf> createPoolBuffer(
       size_t size);
+  // Existing TLS allocator, also usable without process-wide interception.
+  // A pool miss returns null and arms waiter; metadata allocation may throw.
+  static std::unique_ptr<IOBuf> createPoolSlice(
+      size_t size, UrmaPoolSignal* waiter = nullptr);
   // Used by IOBuf::create only in explicitly enabled zero_copy mode.
   // Returns null only when interception is disabled; a pool miss throws.
   static std::unique_ptr<IOBuf> tryCreateIOBuf(size_t size);
