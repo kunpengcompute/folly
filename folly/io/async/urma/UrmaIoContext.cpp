@@ -184,7 +184,7 @@ struct UrmaIoContext::Impl : EventHandler, AsyncTimeout {
   struct PoolHandler : EventHandler {
     Impl& owner;
     PoolHandler(Impl& o) : EventHandler(o.evb, NetworkSocket(o.poolSignal->fd())), owner(o) {}
-    void handlerReady(uint16_t) noexcept override {
+    void handlerReady(uint16_t) noexcept override try {
       owner.poolSignal->consume();
       const auto ids = UrmaInit::revocableSegments();
       if (!ids.empty()) {
@@ -198,6 +198,8 @@ struct UrmaIoContext::Impl : EventHandler, AsyncTimeout {
         }
       }
       owner.timeoutExpired();
+    } catch (const std::bad_alloc&) {
+      owner.fail("URMA pool notification allocation failed");
     }
   };
   std::unique_ptr<PoolHandler> poolHandler;
@@ -506,7 +508,7 @@ struct UrmaIoContext::Impl : EventHandler, AsyncTimeout {
                       found == sockets.end() ? nullptr : &found->second);
     }
   }
-  void poll() {
+  void poll() try {
     checkThread();
     if (polling || broken || !initialized)
       return;
@@ -593,6 +595,9 @@ struct UrmaIoContext::Impl : EventHandler, AsyncTimeout {
       else
         cancelTimeout();
     }
+  } catch (const std::bad_alloc&) {
+    polling = waking = false;
+    fail("URMA completion metadata allocation failed");
   }
   void progressRetired() {
     if (retired.empty() || broken) return;
@@ -619,7 +624,7 @@ struct UrmaIoContext::Impl : EventHandler, AsyncTimeout {
       poll();
     }
   }
-  void timeoutExpired() noexcept override {
+  void timeoutExpired() noexcept override try {
     if (!initialized || broken) return;
     auto pending = std::move(pendingRx);
     pendingRx.clear();
@@ -633,6 +638,8 @@ struct UrmaIoContext::Impl : EventHandler, AsyncTimeout {
       }
     }
     poll();
+  } catch (const std::bad_alloc&) {
+    fail("URMA receive metadata allocation failed");
   }
 };
 

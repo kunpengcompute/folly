@@ -287,6 +287,19 @@ int main() {
     folly::UrmaInit::init(config);
     const auto registered = poolRegistrations;
     auto first = folly::UrmaInit::allocateBuffer(1);
+    for (bool lookup : {false, true}) {
+      threw = false;
+      const auto before = folly::UrmaInit::poolStats().allocated_bytes;
+      failNextAllocation = true;
+      try {
+        if (lookup) (void)folly::UrmaInit::holdReadExport(first.memory, 1);
+        else (void)folly::UrmaInit::allocateBuffer(1);
+      } catch (const std::bad_alloc&) { threw = true; }
+      failNextAllocation = false;
+      require(threw && folly::UrmaInit::poolStats().allocated_bytes == before &&
+                  !folly::UrmaInit::poolStats().exported_bytes,
+              "metadata failure was retried as capacity pressure or leaked a pin");
+    }
     std::vector<folly::UrmaInit::Buffer> rest;
     for (int i = 0; i < 15; ++i)
       rest.push_back(folly::UrmaInit::allocateBuffer(1));

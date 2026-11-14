@@ -485,6 +485,9 @@ UrmaPoolBuffer MemoryPool::allocate(size_t bytes, UrmaPoolSignal* waiter) {
       s.changed.notify_all();
     }
   } catch (const std::bad_alloc&) {
+    // Metadata allocation failure is not registered-capacity backpressure.
+    ++s.counters.allocation_failures;
+    throw;
   }
   ++s.counters.allocation_failures;
   // Serialize subscription with returns/publication; never block an IO owner.
@@ -508,11 +511,7 @@ UrmaPoolBuffer MemoryPool::lookup(const void* address, size_t length,
     if (it == r->blocks.begin()) return {};
     auto& b = std::prev(it)->second;
     if (!b.refs[0] || length > b.bytes - (offset - b.offset)) return {};
-    try {
-      return s.pin(r, &b, exported ? 2 : 1);
-    } catch (const std::bad_alloc&) {
-      return {};
-    }
+    return s.pin(r, &b, exported ? 2 : 1);
   }
   return {};
 }

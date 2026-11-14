@@ -87,11 +87,15 @@ std::unique_ptr<IOBuf> IoBufPool::createFromPoolShared(
   auto& cache = *localCache;
   std::lock_guard<std::mutex> lock(cache.mutex);
   const size_t limit = pool->config().tls_cache_blocks;
-  auto block = cache.blocks[cache.current];
+  // Only small requests share TLS blocks. Larger registered allocations must
+  // return to the public pool after their slices/DMA/export pins are released.
+  const bool cacheable =
+      capacity <= pool->config().tls_block_size - sizeof(BlockLayout);
+  auto block = cacheable ? cache.blocks[cache.current] : nullptr;
   if (block && (!pool->reusable(block->storage) ||
                 !block->layout->fits(capacity)))
     block.reset();
-  if (!block) {
+  if (!block && cacheable) {
     for (size_t i = 0; i < limit; ++i) {
       auto& b = cache.blocks[i];
       if (b && b.use_count() == 1 && b->layout->capacity >= capacity &&
@@ -116,7 +120,7 @@ std::unique_ptr<IOBuf> IoBufPool::createFromPoolShared(
     }
     if (!storage) return nullptr;
     block = std::make_shared<IoBufBlock>(pool, std::move(storage));
-    if (limit) {
+    if (limit && cacheable) {
       cache.current = (cache.current + 1) % limit;
       cache.drop(cache.current);
       cache.blocks[cache.current] = block;

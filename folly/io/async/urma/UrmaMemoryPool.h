@@ -26,6 +26,9 @@ struct UrmaPoolConfig {
   // Zero means pool_size. Set elastic=false to keep a fixed registered pool.
   size_t pool_max_size{512 * 1024 * 1024};
   bool elastic{true};
+  // Requests including slice metadata must fit this size to enter TLS.
+  // Retained capacity per thread is at most tls_cache_blocks times the pool's
+  // rounded allocation size for tls_block_size; live uncached users are extra.
   size_t tls_block_size{16384};
   size_t tls_cache_blocks{2};
   // Optional growth unit; pool_size remains the initial total capacity.

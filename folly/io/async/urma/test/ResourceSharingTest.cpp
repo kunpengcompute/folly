@@ -39,7 +39,7 @@ struct TestListener : UrmaIoContext::Listener {
 struct Echo : AsyncTransport::ReadCallback, AsyncTransport::WriteCallback {
   AsyncTransport::UniquePtr socket;
   std::string expected;
-  size_t received{0}, completed{0};
+  size_t received{0}, completed{0}, writeErrors{0};
   bool echo;
   bool allowWriteError{false};
   bool closeOnRead{false};
@@ -95,6 +95,7 @@ struct Echo : AsyncTransport::ReadCallback, AsyncTransport::WriteCallback {
   void writeErr(size_t, const AsyncSocketException&) noexcept override {
     if (!allowWriteError)
       std::abort();
+    ++writeErrors;
   }
 };
 struct Acceptor : AsyncServerSocket::AcceptCallback {
@@ -615,6 +616,7 @@ void readPressureCases() {
     spin([&] { return !a.snapshot().retired && !b.snapshot().retired &&
         !a.snapshot().inflight && !b.snapshot().inflight; });
     require(acceptedReadWrs == accepted && checkedFrees == frees + 2 &&
+                client->writeErrors == 1 && peer.writeErrors == 1 &&
                 UrmaInit::poolStats().exported_bytes == 0 &&
                 !client->socket->getAppBytesBuffered() && !peer.socket->getAppBytesBuffered(),
             "timeout lost cancellation FREE or retained pending data");
@@ -711,6 +713,103 @@ void bufferPressureCases() {
   require(!UrmaInit::isInitialized() && !registrations,
           "pressure case retained registered storage");
   std::cout << "PASS on-demand TX, emergency FREE, held RX and refill recovery\n";
+}
+void writeAdmissionCases() {
+  UrmaConfig c;
+  c.rx_depth = c.rx_target = 2;
+  c.tx_depth = 8;
+  c.max_pending_bytes = 32768;
+  c.registered_pool.zero_copy = c.registered_pool.elastic = false;
+  c.registered_pool.pool_size = c.registered_pool.pool_max_size = 256 * 1024;
+  UrmaInit::init(c);
+  {
+    EventBase first, second;
+    auto& owner = UrmaIoContext::get(&first);
+    auto spin = [&](auto done) {
+      const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+      while (!done() && std::chrono::steady_clock::now() < deadline) {
+        first.loopOnce(EVLOOP_NONBLOCK); second.loopOnce(EVLOOP_NONBLOCK);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+      require(done(), "SEND admission/pressure did not progress");
+    };
+    Acceptor acceptor(second);
+    SocketAddress address;
+    auto server = listenOnLoopback(second, acceptor, address, 8);
+    struct WriteResult : AsyncTransport::WriteCallback {
+      size_t ok{0}, errors{0};
+      void writeSuccess() noexcept override { ++ok; }
+      void writeErr(size_t n, const AsyncSocketException&) noexcept override {
+        require(n == 0, "unsubmitted pressure write reported partial success");
+        ++errors;
+      }
+    };
+    for (int scenario = 0; scenario < 4; ++scenario) {
+      auto client = std::make_unique<Echo>(UrmaAsyncSocket::newSocket(&first, address), false);
+      client->allowReadError = true;
+      spin([&] { return acceptor.connections.size() == 1 &&
+          static_cast<UrmaAsyncSocket*>(client->socket.get())->isUrmaReady() &&
+          static_cast<UrmaAsyncSocket*>(acceptor.connections[0]->socket.get())->isUrmaReady(); });
+      auto& peer = *acceptor.connections[0];
+      peer.echo = false; peer.allowReadError = true; peer.expected = "ab";
+      std::vector<UrmaPoolBuffer> pressure;
+      while (auto block = UrmaInit::poolAlloc(4096)) pressure.push_back(std::move(block));
+      std::array<char, 20000> bytes{};
+      bytes[0] = 'a'; bytes[1] = 'b';
+      auto input = IOBuf::wrapBuffer(bytes.data(), bytes.size());
+      input->trimEnd(bytes.size() - 2);
+      WriteResult data, empty, rejected;
+      if (scenario == 2) client->socket->setSendTimeout(50);
+      failNextAllocation = scenario == 3;
+      client->socket->writeChain(&data, std::move(input));
+      failNextAllocation = false;
+      if (scenario == 3) {
+        require(data.errors == 1 && !data.ok && !client->socket->good() &&
+                    !client->socket->getAllocatedBytesBuffered(),
+                "enqueue metadata failure escaped noexcept or changed accounting");
+      } else {
+        spin([&] { return owner.snapshot().waiting != 0; });
+        require(!data.ok && !data.errors && !peer.received,
+                "exhausted SEND copied to heap or completed without submission");
+        if (scenario == 0) {
+          auto extra = IOBuf::wrapBuffer(bytes.data(), bytes.size());
+          extra->trimEnd(bytes.size() - 1);
+          client->socket->writeChain(&rejected, std::move(extra));
+          require(rejected.errors == 1 && client->socket->good() &&
+                      client->socket->getAllocatedBytesBuffered() == bytes.size(),
+                  "short payload bypassed retained capacity bound");
+          size_t attempts = 0;
+          while (!empty.errors && attempts < 1024) {
+            ++attempts;
+            client->socket->writeChain(&empty, nullptr);
+          }
+          require(empty.errors == 1 && !empty.ok && attempts < 1024,
+                  "empty queued writes bypassed metadata bound/order");
+          pressure.clear();
+          spin([&] { return data.ok == 1 && peer.received == 2 &&
+              empty.ok + empty.errors == attempts; });
+          require(!data.errors && !client->socket->getAppBytesBuffered() &&
+                      !client->socket->getAllocatedBytesBuffered(),
+                  "resource notification retry duplicated a write or retained bytes");
+        } else {
+          if (scenario == 1) client->socket->closeNow();
+          spin([&] { return data.errors == 1; });
+          require(!data.ok && !client->socket->getAllocatedBytesBuffered() &&
+                      !owner.snapshot().waiting,
+                  "cancel/timeout did not remove SEND waiter and data");
+        }
+      }
+      client->socket->closeNow();
+      client.reset(); acceptor.connections.clear(); pressure.clear();
+      spin([&] { return !owner.snapshot().retired && !owner.snapshot().inflight; });
+      require(data.ok + data.errors == 1, "close repeated write callback");
+    }
+    server->stopAccepting(); server.reset();
+    UrmaIoContext::release(&first); UrmaIoContext::release(&second);
+  }
+  UrmaInit::fini();
+  require(!UrmaInit::isInitialized() && !registrations, "SEND pressure cleanup");
+  std::cout << "PASS bounded SEND bytes/capacity/tasks, notification retry, cancel/timeout and metadata failure\n";
 }
 int main(int argc, char** argv) {
   const bool readError = argc == 2 && !std::strcmp(argv[1], "--read-error");
@@ -1745,6 +1844,7 @@ int main(int argc, char** argv) {
               jfsCreated == jfsDeleted && jfrCreated == jfrDeleted,
           "final resource imbalance");
       bufferPressureCases();
+      writeAdmissionCases();
       elasticCases();
       revocationCases();
     }

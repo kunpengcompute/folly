@@ -1143,7 +1143,7 @@ struct UrmaAsyncSocket::Impl final : AsyncSocket::ConnectCallback,
     }
     return true;
   }
-  void flush() {
+  void flush() try {
     if (sending || state != State::Open || owner->getDestroyPending())
       return;
     sending = true;
@@ -1249,6 +1249,9 @@ struct UrmaAsyncSocket::Impl final : AsyncSocket::ConnectCallback,
       }
     }
     armTimer();
+  } catch (const std::bad_alloc&) {
+    sending = false;
+    fail("URMA send metadata allocation failed");
   }
   void deliver() {
     if (delivering || state != State::Open || owner->getDestroyPending())
@@ -1296,7 +1299,7 @@ struct UrmaAsyncSocket::Impl final : AsyncSocket::ConnectCallback,
       WriteCallback* cb,
       std::unique_ptr<IOBuf> data,
       WriteFlags flags,
-      std::vector<size_t> recordLengths = {}) {
+      std::vector<size_t> recordLengths = {}) try {
     if (!live() || writeShutdown || closeAfterWrites ||
         flags != WriteFlags::NONE) {
       if (cb)
@@ -1308,7 +1311,9 @@ struct UrmaAsyncSocket::Impl final : AsyncSocket::ConnectCallback,
       return;
     }
     const size_t n = data ? data->computeChainDataLength() : 0;
-    if (n > config.max_pending_bytes - pendingBytes) {
+    // Bound metadata as well as payload, including zero-length queued writes.
+    if (n > config.max_pending_bytes - pendingBytes ||
+        writes.size() >= std::max<size_t>(1, config.max_pending_bytes / sizeof(Write))) {
       if (cb)
         cb->writeErr(
             0,
@@ -1355,10 +1360,11 @@ struct UrmaAsyncSocket::Impl final : AsyncSocket::ConnectCallback,
         node = node->next();
       } while (node != data.get());
     }
-    pendingBytes += n;
-    queuedCapacity += capacity;
-    if (writes.empty())
-      lastWriteProgress = Clock::now();
+    if (capacity > config.max_pending_bytes - queuedCapacity) {
+      if (cb) cb->writeErr(0, AsyncSocketException(
+          AsyncSocketException::BAD_ARGS, "URMA pending capacity limit reached"));
+      return;
+    }
     auto write = std::make_shared<Write>();
     write->callback = cb;
     write->data = std::move(data);
@@ -1366,11 +1372,20 @@ struct UrmaAsyncSocket::Impl final : AsyncSocket::ConnectCallback,
     write->bytes = n;
     write->capacity = capacity;
     writes.push_back(std::move(write));
+    cb = nullptr; // The queue now owns completion, including failure below.
+    pendingBytes += n;
+    queuedCapacity += capacity;
+    if (writes.size() == 1)
+      lastWriteProgress = Clock::now();
     notifyBuffer();
     if (!live() || owner->getDestroyPending())
       return;
     flush();
     armTimer();
+  } catch (const std::bad_alloc&) {
+    if (cb) cb->writeErr(0, AsyncSocketException(
+        AsyncSocketException::INTERNAL_ERROR, "URMA write metadata allocation failed"));
+    fail("URMA write metadata allocation failed");
   }
   void timeoutExpired() noexcept override {
     DestructorGuard guard(owner);
@@ -1387,8 +1402,10 @@ struct UrmaAsyncSocket::Impl final : AsyncSocket::ConnectCallback,
       prepareHandshake();
       if (!live()) return;
     }
-    if (sendTimeout && !writes.empty() &&
-        now - lastWriteProgress >= std::chrono::milliseconds(sendTimeout)) {
+    // A caller may leave the framework timeout unset. Resource starvation
+    // must still have a bound, including SEND scratch/SQ waits with no READ.
+    if (!writes.empty() && now - lastWriteProgress >=
+        (sendTimeout ? std::chrono::milliseconds(sendTimeout) : kReadTimeout)) {
       fail("URMA send timeout");
       return;
     }

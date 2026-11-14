@@ -168,12 +168,12 @@ void largeBodiesStayRegistered() {
             full.registered_bytes == c.pool_size && calls == registrations,
         "large-body allocation exceeded total capacity or registered per request");
   bodies.clear();
-  p->trim();
+  check(p->stats().tls_retained_bytes == 0,
+        "large bodies entered the small-block TLS cache");
   check(p->stats().allocated_bytes != 0 &&
             clone->data()[0] == 1 && clone->data()[clone->length() - 1] == 1,
         "large clone/source contents or accounting released early");
   clone.reset();
-  p->trim();
   const auto held = p->stats().allocated_bytes;
   check(held != 0 && !p->shutdown(0ms), "DMA/export-pinned large block released");
   dma = {};
@@ -184,6 +184,77 @@ void largeBodiesStayRegistered() {
         "large-body final return failed to reclaim registration");
   std::cout << "PASS ten concurrent 8 MiB bodies, total capacity, "
                "clone/DMA/export lifetime and single registration\n";
+}
+void tlsCacheBoundaries() {
+  auto c = config();
+  c.pool_size = c.pool_max_size = 256 * 1024;
+  // The configured size need not be a class: account the rounded 16 KiB.
+  c.tls_block_size = 13000;
+  auto p = std::make_shared<urma_detail::MemoryPool>(nullptr, c);
+  check(p->warm(0ms), "TLS boundary warm");
+  auto small = IoBufPool::createFromPoolShared(p, 100);
+  auto pin = p->lookup(small->data(), 100, false);
+  const auto metadata = reinterpret_cast<uintptr_t>(small->data()) -
+      reinterpret_cast<uintptr_t>(pin.data());
+  const auto rounded = pin.capacity();
+  pin = {}; small.reset();
+  auto atLimit = IoBufPool::createFromPoolShared(p, c.tls_block_size - metadata);
+  check(atLimit && p->stats().tls_retained_bytes <= c.tls_cache_blocks * rounded,
+        "small TLS boundary exceeded rounded retained capacity");
+  atLimit.reset();
+  const auto retained = p->stats().tls_retained_bytes;
+  const auto allocated = p->stats().allocated_bytes;
+  for (size_t size : {c.tls_block_size - metadata + 1, size_t(64 * 1024)}) {
+    auto large = IoBufPool::createFromPoolShared(p, size);
+    check(large && IoBufPool::owns(*large) &&
+              p->stats().tls_retained_bytes == retained,
+          "large request entered or evicted small TLS cache");
+    large.reset();
+    check(p->stats().allocated_bytes == allocated,
+          "uncached large block needed trim or another allocation to return");
+  }
+  // Evict cache ownership while a clone, DMA and remote READ still use it.
+  small = IoBufPool::createFromPoolShared(p, 100);
+  std::memset(small->writableData(), 0x7a, 100);
+  small->append(100);
+  auto clone = small->cloneOne();
+  auto* address = small->data();
+  auto dma = p->lookup(address, 100, false);
+  auto remote = p->lookup(address, 100, true);
+  small.reset();
+  std::thread evict([&] { IoBufPool::reclaim(p->identity(), true); });
+  evict.join();
+  check(!p->stats().tls_retained_bytes && clone->data()[99] == 0x7a,
+        "cross-thread eviction invalidated live slices");
+  clone.reset(); dma = {};
+  check(p->stats().allocated_bytes && address[99] == 0x7a,
+        "eviction released remote READ storage before FREE");
+  remote = {};
+  check(!p->stats().allocated_bytes, "evicted block did not return after final pin");
+  // A different allocating thread can reclaim an idle cache while its owner
+  // thread remains alive. No dependence on trim, shutdown or thread exit.
+  auto cached = IoBufPool::createFromPoolShared(p, 100);
+  cached.reset();
+  std::vector<UrmaPoolBuffer> held;
+  while (auto b = p->allocate(4096)) held.push_back(std::move(b));
+  bool reused = false;
+  std::thread borrower([&] {
+    auto b = IoBufPool::createFromPoolShared(p, c.tls_block_size);
+    reused = bool(b);
+  });
+  borrower.join();
+  check(reused && !p->stats().tls_retained_bytes,
+        "cross-thread pressure did not reclaim idle small TLS storage");
+  held.clear();
+  std::unique_ptr<IOBuf> late;
+  std::thread producer([&] { late = IoBufPool::createFromPoolShared(p, 64000); });
+  producer.join();
+  check(late && p->stats().allocated_bytes && !p->stats().tls_retained_bytes,
+        "thread exit released live uncached large storage");
+  late.reset();
+  check(!p->stats().allocated_bytes && p->shutdown(2s) && registered == 0,
+        "late large return did not release pool");
+  std::cout << "PASS bounded small TLS, uncached large return, cross-thread reclaim and pinned eviction\n";
 }
 void resourceNotifications() {
   using namespace urma_detail;
@@ -327,6 +398,7 @@ int main(int argc, char** argv) {
     rxUsesPoolHardLimit();
     alignedTlsSlices();
     largeBodiesStayRegistered();
+    tlsCacheBoundaries();
     resourceNotifications();
     largeExtents();
     check(argc == 2, "shipped config fixture argument missing");
