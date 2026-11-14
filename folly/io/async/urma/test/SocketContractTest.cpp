@@ -34,7 +34,7 @@ struct Endpoint : AsyncTransport::ReadCallback,
   std::deque<Completion> completions;
   std::array<uint8_t, 16384> buffer{};
   size_t sent{0}, received{0}, callbacks{0}, errors{0};
-  size_t eofs{0}, bytesAtEof{0};
+  size_t eofs{0}, bytesAtEof{0}, readCallbacks{0};
   unsigned seed{0};
   bool movable{true}, closing{false};
   std::function<void()> afterRead, afterWrite, onGetBuffer;
@@ -83,10 +83,12 @@ struct Endpoint : AsyncTransport::ReadCallback,
     received += n;
   }
   void readDataAvailable(size_t n) noexcept override {
+    ++readCallbacks;
     checkBytes(buffer.data(), n);
     if (auto action = std::exchange(afterRead, {})) action();
   }
   void readBufferAvailable(std::unique_ptr<IOBuf> b) noexcept override {
+    ++readCallbacks;
     auto* p = b.get();
     do {
       checkBytes(p->data(), p->length());
@@ -283,7 +285,7 @@ void boundaryContract(EventBase& evb, Endpoint& client, Endpoint& server,
     return;
   }
   holdDataCompletions = true;
-  server.movable = mode == "eof_movable";
+  server.movable = mode == "eof_movable" || mode == "delivery_batch";
   if (mode == "eof_paused") server.socket->setReadCB(nullptr);
   for (size_t i = 0; i < 80; ++i) client.send(300, 19);
   pump(evb, [&] { return client.callbacks == 80 && heldData.size() == 80; },
@@ -294,8 +296,18 @@ void boundaryContract(EventBase& evb, Endpoint& client, Endpoint& server,
   require(!server.eofs && !server.errors && !server.received,
           "EOF overtook the held tail DATA");
   holdDataCompletions = false;
-  completeHeldReverse(heldData);
+  if (mode == "delivery_batch") completeHeld(heldData);
+  else completeHeldReverse(heldData);
   owner.poll();
+  if (mode == "delivery_close") {
+    require(!server.received && !server.eofs,
+            "application delivery ran inside CQ dispatch");
+    server.socket->closeNow();
+    for (int i = 0; i < 32; ++i) evb.loopOnce(EVLOOP_NONBLOCK);
+    require(!server.readCallbacks && server.eofs == 1 && !server.errors,
+            "queued delivery survived close or duplicated EOF");
+    return;
+  }
   if (mode == "eof_paused") {
     require(!server.eofs && !server.received, "paused reader lost its tail");
     server.socket->setReadCB(&server);
@@ -304,6 +316,9 @@ void boundaryContract(EventBase& evb, Endpoint& client, Endpoint& server,
   require(server.received == 24000 && server.bytesAtEof == 24000 &&
               !server.errors && !client.errors,
           "normal EOF lost or corrupted tail DATA");
+  if (mode == "delivery_batch")
+    require(server.readCallbacks == 1,
+            "ready DATA prefix was delivered one CQE at a time");
   // Receiving FIN must not close our own write side.
   client.seed = 73;
   server.send(32, 73);

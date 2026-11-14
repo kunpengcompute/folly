@@ -19,7 +19,8 @@ foreach(mode read-error rx-timeout revoke-abort close-read close-read-unknown rn
 endforeach()
 foreach(mode callback_read callback_read_movable callback_write callback_close
     callback_unregister callback_replace eof_tail eof_movable eof_paused
-    eof_read_budget eof_read_reject eof_truncated eof_duplicate eof_missing_tail)
+    eof_read_budget eof_read_reject eof_truncated eof_duplicate eof_missing_tail
+    delivery_batch delivery_close)
   add_test(NAME URMA.Socket.${mode} COMMAND UrmaSocketContractTest ${mode})
   set_tests_properties(URMA.Socket.${mode} PROPERTIES TIMEOUT 45 LABELS "URMA")
 endforeach()

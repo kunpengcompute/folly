@@ -56,6 +56,7 @@ struct UrmaAsyncSocket::Impl final : AsyncSocket::ConnectCallback,
                                      AsyncTransport::ReadCallback,
                                      AsyncTransport::WriteCallback,
                                      UrmaIoContext::Listener,
+                                     EventBase::LoopCallback,
                                      AsyncTimeout {
   enum class State { Connecting, Handshake, Open, Closed, Error };
   using SendKind = urma_detail::PacketKind;
@@ -314,6 +315,7 @@ struct UrmaAsyncSocket::Impl final : AsyncSocket::ConnectCallback,
         config(UrmaInit::getConfig()),
         socketId(UrmaIoContext::allocateSocketId()) {}
   ~Impl() override {
+    cancelLoopCallback();
     cancelTimeout();
     cleanup();
     if (std::getenv("FOLLY_URMA_LOG_STATS"))
@@ -844,8 +846,15 @@ struct UrmaAsyncSocket::Impl final : AsyncSocket::ConnectCallback,
       recordSince = Clock::now();
       bytesRead += data->length();
       reads.append(std::move(data));
-      deliver();
     }
+    // Deliver the ready prefix together after draining completion records.
+    // Do not wait for missing data or delay READ submission and FREE handling.
+    if (reader && !reads.empty() && !isLoopCallbackScheduled())
+      evb->runInLoop(this);
+  }
+  void runLoopCallback() noexcept override {
+    DestructorGuard guard(owner);
+    deliver();
   }
   void completeRead(Read& work) {
     auto it = records.find(work.sequence);
@@ -949,18 +958,26 @@ struct UrmaAsyncSocket::Impl final : AsyncSocket::ConnectCallback,
         return;
       }
       admittedSequence = h.sequence;
-      if (records.empty())
-        recordSince = Clock::now();
-      records.emplace(
-          h.sequence,
-          Record{
-              h.kind,
-              h.kind == Kind::Pull ? urma_detail::load64(data->data() + 8) : 0,
-              length,
-              std::move(data),
-              false,
-              h.kind == SendKind::Data});
-      recordBytes += length;
+      if (h.kind == Kind::Data && records.empty() &&
+          h.sequence == receiveSequence + 1) {
+        // Already ordered DATA needs no temporary reorder-map allocation.
+        ++receiveSequence;
+        bytesRead += length;
+        reads.append(std::move(data));
+      } else {
+        if (records.empty())
+          recordSince = Clock::now();
+        records.emplace(
+            h.sequence,
+            Record{
+                h.kind,
+                h.kind == Kind::Pull ? urma_detail::load64(data->data() + 8) : 0,
+                length,
+                std::move(data),
+                false,
+                h.kind == SendKind::Data});
+        recordBytes += length;
+      }
       drainRecords();
     }
     if (live() && !owner->getDestroyPending())
@@ -1454,6 +1471,7 @@ struct UrmaAsyncSocket::Impl final : AsyncSocket::ConnectCallback,
     const bool graceful = !error && state == State::Open && writes.empty() &&
         sendSequence != UINT64_MAX;
     state = error ? State::Error : State::Closed;
+    cancelLoopCallback();
     cancelTimeout();
     tcp->setReadCB(nullptr);
     if (graceful) {
