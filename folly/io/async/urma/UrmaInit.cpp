@@ -204,6 +204,22 @@ void* UrmaInit::poolAlloc(size_t size) {
     auto& pool = g_pools[tier][s];
     std::lock_guard<std::mutex> lock(pool.mtx);
     if (pool.head) {
+      // 问题 06:free list 节点合法性校验(腐败即丢弃该 shard,避免 SIGSEGV)
+      char* ptr = reinterpret_cast<char*>(pool.head);
+      char* tier_base = g_tier_base[tier];
+      size_t tier_count = g_tier_count[tier];
+      size_t stride = TIER_STRIDES[tier];
+      bool valid = (tier_base != nullptr &&
+                    ptr >= tier_base &&
+                    ptr < tier_base + tier_count * stride &&
+                    (static_cast<size_t>(ptr - tier_base) % stride == 0));
+      if (!valid) {
+        XLOG(ERR) << "UrmaInit: poolAlloc corrupted free-list, tier=" << tier
+                  << " shard=" << s << " ptr=" << static_cast<void*>(ptr)
+                  << " — discarding shard";
+        pool.head = nullptr;
+        continue;
+      }
       void* buf = pool.head;
       pool.head = pool.head->next;
       return buf;
@@ -243,6 +259,15 @@ void UrmaInit::init(const UrmaConfig& config) {
     return;
   }
   s_config = config;
+
+  // 问题 03:max_water 跟随 rx_depth(原硬编码 256,导致 --rx_buf_num 无效)
+  s_config.max_water = s_config.rx_depth;
+  if (s_config.min_water > s_config.max_water) {
+    s_config.min_water = s_config.max_water;
+  }
+  if (s_config.batch_post > s_config.max_water) {
+    s_config.batch_post = s_config.max_water;
+  }
 
   // 环境变量覆盖:FC 流控 / 保序重排(默认均关,close_loop 场景净开销)
   if (const char* e = getenv("URMA_FC_ENABLE")) {

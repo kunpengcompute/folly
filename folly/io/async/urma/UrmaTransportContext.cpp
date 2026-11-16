@@ -314,11 +314,17 @@ bool UrmaTransportContext::initRxBufPool(EvbJfr* jfr, uint32_t max_bufs) {
     jfr->rx_bufs[i].wr.src.num_sge = 1;
     jfr->rx_bufs[i].wr.user_ctx = i;
     jfr->rx_bufs[i].wr.next = nullptr;
-    jfr->rx_bufs[i].ctx.ctx = this;
-    jfr->rx_bufs[i].ctx.jfr = jfr;
-    jfr->rx_bufs[i].ctx.slot = i;
+    // 问题 5.1:shared_ptr 保活 RxSlotCtx,独立于 jfr 析构
+    jfr->rx_bufs[i].ctx = std::make_shared<RxSlotCtx>();
+    jfr->rx_bufs[i].ctx->ctx = this;
+    jfr->rx_bufs[i].ctx->jfr = jfr;
+    jfr->rx_bufs[i].ctx->slot = i;
+    jfr->rx_bufs[i].ctx->alive = alive_;
+    jfr->rx_bufs[i].ctx->recycle = jfr->recycle.get();
+    jfr->rx_bufs[i].ctx->held_count = &jfr->held_count;
   }
-  uint32_t to_post = jfr->watermark.min_water;
+  // 问题 03:一次预投满 max_water(原只预投 min_water,CQE 收割后才补投)
+  uint32_t to_post = jfr->watermark.max_water;
   for (uint32_t i = 0; i < to_post; ++i) {
     if (!postRecvWr(jfr, i)) {
       XLOG(ERR) << "UrmaTransportContext: initial postRecvWr failed at " << i;
@@ -393,6 +399,36 @@ uint32_t UrmaTransportContext::postRecvWrBatchCount(EvbJfr* jfr,
     if (nodes[i] == bad_wr) return i;
   }
   return 0;
+}
+
+// ── 问题 01:SqWaiter 等待队列(same-thread,I2 无锁) ──
+void UrmaTransportContext::addIoSqWaiter(SqWaiter* w) noexcept {
+  if (!w) return;
+  w->active = true;
+  io_waiters_.push_back(w);
+}
+
+void UrmaTransportContext::removeIoSqWaiter(SqWaiter* w) noexcept {
+  if (!w) return;
+  // 标记摘除,pop 时跳过(避免 deque 迭代器失效)
+  w->active = false;
+}
+
+void UrmaTransportContext::wakeOneIoSqWaiter() noexcept {
+  // 一次循环填满配额 budget = sq_depth + 1
+  // (原 1 配额↔1 唤醒形成 1 WR/CQE 串行瓶颈,40k 积压排空超 RPC 超时)
+  uint32_t budget = io_jfs_.sq_depth + 1;
+  uint32_t woken = 0;
+  while (!io_waiters_.empty() && woken < budget) {
+    SqWaiter* w = io_waiters_.front();
+    io_waiters_.pop_front();
+    if (!w || !w->active) continue;  // 已摘除的僵尸等待者
+    w->active = false;
+    if (auto* sock = w->sock) {
+      sock->retryWrite();  // 同线程直调 → handlePendingWrites
+    }
+    ++woken;
+  }
 }
 
 // ── RX slot 回收(I2 豁免:deleter 任意线程) ──
@@ -662,10 +698,13 @@ void UrmaTransportContext::pollAndDispatchTxOnly(urma_jfc_t* tx_jfc,
         uint64_t socket_id = tx_ctx->socket_id;
         uint16_t msg_id = tx_ctx->msg_id;
         urma_status_t status = cr[i].status;
+        // 问题 06:按链长等量归还(delete 前读出 read_wr_cnt)
+        uint32_t wr_cnt = tx_ctx->read_wr_cnt;
+        if (wr_cnt == 0) wr_cnt = 1;  // 防御:未设置时退化为单配额
         if (is_fc) {
-          releaseFcSq();
+          releaseFcSqN(wr_cnt);
         } else {
-          releaseIoSq();
+          releaseIoSqN(wr_cnt);
         }
         delete tx_ctx;
         // 路由表查 socket(same-thread 直调,置空协议判空)
@@ -686,6 +725,10 @@ void UrmaTransportContext::pollAndDispatchTxOnly(urma_jfc_t* tx_jfc,
         delete tx_ctx;
       }
     }
+  }
+  // 问题 01:TX CQE 归还配额后唤醒等待者(仅 IO JFS,FC JFS 无等待队列)
+  if (!is_fc && !io_waiters_.empty()) {
+    wakeOneIoSqWaiter();
   }
 }
 
@@ -795,7 +838,7 @@ void UrmaTransportContext::handleRecvCqe(bool is_fc, const urma_cr_t& cr) {
         return;
       }
       bool owned = sock->onIoMessageReceived(recv_buf, recv_len,
-                                              &jfr->rx_bufs[slot].ctx);
+                                              jfr->rx_bufs[slot].ctx.get());
       if (!owned) {
         recycleRxSlot(jfr, slot);
       }
@@ -936,6 +979,9 @@ UrmaTransportContext::UrmaTransportContext(EventBase* evb,
 }
 
 UrmaTransportContext::~UrmaTransportContext() {
+  // 问题 5.1:先置 alive=false,IOBuf deleter 短路返回(不访问已析构的 jfr 成员)
+  // shared_ptr 保活 atomic 对象,deleter 持有 alive 副本仍可安全 load
+  alive_->store(false, std::memory_order_release);
   if (repost_timer_) {
     repost_timer_->disarm();
     repost_timer_.reset();

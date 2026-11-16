@@ -23,6 +23,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <vector>
 
@@ -54,6 +55,19 @@ struct RxSlotCtx {
   UrmaTransportContext* ctx{nullptr};
   EvbJfr* jfr{nullptr};
   uint32_t slot{0};
+  // 问题 5.1:UAF 防护 —— IOBuf deleter 可能在 EventBase 析构后执行,
+  // 此时 ctx/jfr 已悬垂。alive 标志由 shared_ptr 保活,deleter 检查后短路;
+  // recycle/held_count 是裸指针,alive=true 时才安全访问
+  std::shared_ptr<std::atomic<bool>> alive;
+  UrmaRecycleStack* recycle{nullptr};
+  std::atomic<uint32_t>* held_count{nullptr};
+};
+
+// 问题 01:SQ 配额等待者(same-thread,I2 无锁)
+// sendChain 抢不到配额时登记,配额归还时 wakeOneIoSqWaiter 唤醒重试
+struct SqWaiter {
+  UrmaAsyncSocket* sock{nullptr};
+  bool active{false};
 };
 
 // ── 四件套元数据结构(去原子,same-thread 访问) ──
@@ -97,7 +111,8 @@ struct EvbJfr {
     void* data = nullptr;
     urma_sge_t sge = {};
     urma_jfr_wr_t wr = {};
-    RxSlotCtx ctx;  // 全局 RxSlotCtx(deleter 上下文,常驻稳定存储)
+    // 问题 5.1:shared_ptr 保活 RxSlotCtx,独立于 jfr 析构
+    std::shared_ptr<RxSlotCtx> ctx;
   };
   std::vector<RxBuf> rx_bufs;
   uint32_t recv_posted = 0;       // same-thread(I2)
@@ -208,6 +223,15 @@ class UrmaTransportContext {
     return false;
   }
   void releaseIoSq() noexcept { --io_jfs_.sq_inflight; }
+  // 问题 06:WR 链按 frag_count 批量申请/归还(原只记 1 个 → SQ 真实溢出 → SIGSEGV)
+  bool tryAcquireIoSqN(uint32_t n) noexcept {
+    if (io_jfs_.sq_inflight + n <= io_jfs_.sq_depth) {
+      io_jfs_.sq_inflight += n;
+      return true;
+    }
+    return false;
+  }
+  void releaseIoSqN(uint32_t n) noexcept { io_jfs_.sq_inflight -= n; }
   bool tryAcquireFcSq() noexcept {
     if (fc_jfs_.sq_inflight < fc_jfs_.sq_depth) {
       ++fc_jfs_.sq_inflight;
@@ -216,6 +240,21 @@ class UrmaTransportContext {
     return false;
   }
   void releaseFcSq() noexcept { --fc_jfs_.sq_inflight; }
+  // 问题 06:FC WR 链批量申请/归还
+  bool tryAcquireFcSqN(uint32_t n) noexcept {
+    if (fc_jfs_.sq_inflight + n <= fc_jfs_.sq_depth) {
+      fc_jfs_.sq_inflight += n;
+      return true;
+    }
+    return false;
+  }
+  void releaseFcSqN(uint32_t n) noexcept { fc_jfs_.sq_inflight -= n; }
+
+  // 问题 01:SqWaiter 等待队列(same-thread,I2)
+  void addIoSqWaiter(SqWaiter* w) noexcept;
+  void removeIoSqWaiter(SqWaiter* w) noexcept;
+  void wakeOneIoSqWaiter() noexcept;
+  uint32_t ioSqWaiterCount() const noexcept { return io_waiters_.size(); }
 
   // ── credit_pool(same-thread,I2) ──
   void recharge() noexcept { ++io_jfr_.credit_idle; }
@@ -272,6 +311,11 @@ class UrmaTransportContext {
   EventBase* evb_;
   bool valid_{false};
 
+  // 问题 5.1:UAF 防护 —— IOBuf deleter 可能在 EventBase 析构后执行,
+  // shared_ptr<atomic<bool>> 独立存活,析构时置 false,deleter 短路返回
+  using AliveFlag = std::shared_ptr<std::atomic<bool>>;
+  AliveFlag alive_{std::make_shared<std::atomic<bool>>(true)};
+
   // 四件套(独占,I1)
   EvbJfs io_jfs_;
   EvbJfs fc_jfs_;
@@ -314,6 +358,9 @@ class UrmaTransportContext {
   // 路由表(进程级,16 分片)
   UrmaRouteTable route_table_;
   UrmaRouteTable fc_route_table_;
+
+  // 问题 01:SqWaiter 等待队列(same-thread,I2)
+  std::deque<SqWaiter*> io_waiters_;
 
   // per-EVB registry
   static EventBaseLocal<std::unique_ptr<UrmaTransportContext>>& registry();

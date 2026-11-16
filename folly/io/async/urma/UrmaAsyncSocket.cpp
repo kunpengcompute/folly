@@ -20,6 +20,7 @@
 #include <cstring>
 #include <thread>
 #include <utility>
+#include <unistd.h>  // 问题 02:close()
 
 #include <folly/io/async/urma/UrmaCqHandler.h>
 #include <folly/io/async/urma/UrmaHandshake.h>
@@ -174,6 +175,13 @@ void UrmaAsyncSocket::onHandshakeReady() {
   }
 
   state_ = State::kOpen;
+
+  // 问题 02:握手完成后关闭 TCP fd(原只 unregisterHandler 摘 epoll,fd 泄漏)
+  // fallbackToTcp 路径已在 line 343 将 tcp_fd_ 置 -1,此处不会双重 close
+  if (tcp_fd_ >= 0) {
+    ::close(tcp_fd_);
+    tcp_fd_ = -1;
+  }
 
   handlePendingWrites();
 
@@ -634,7 +642,8 @@ urma_status_t UrmaAsyncSocket::sendChain(WriteCallback* cb,
 
     // SDD-URMA-EVBEXCLUSIVE-001: 独占 JFS,sq_inflight 由 ctx_->tryAcquireIoSq() 管理
     if (!shared_->tryAcquireIoSq()) {
-      // SQ 满 → EAGAIN
+      // 问题 01:SQ 满 → 登记等待者,配额归还时 wakeOneIoSqWaiter 唤醒重试
+      shared_->addIoSqWaiter(&io_sq_waiter_);
       return URMA_EAGAIN;
     }
 
@@ -698,6 +707,9 @@ void UrmaAsyncSocket::handlePendingWrites() noexcept {
                                   pw->big_group);
     if (ret == URMA_EAGAIN) {
       pw->buf = std::move(chain);
+      // 问题 01:重试仍 EAGAIN → 重新登记等待者
+      // (原缺陷:被 pop 后不重登记就永久丢失唤醒资格)
+      shared_->addIoSqWaiter(&io_sq_waiter_);
       // SDD-URMA-EVBEXCLUSIVE-001: TX CQE 由 pollAndDispatch 统一收割(I3)
       return;
     }
@@ -707,6 +719,8 @@ void UrmaAsyncSocket::handlePendingWrites() noexcept {
       pending_write_head_ = std::move(pending_write_head_->next);
       if (!pending_write_head_) {
         pending_write_tail_ = nullptr;
+        // 问题 01:队列排空 → 摘除等待者(消除僵尸)
+        shared_->removeIoSqWaiter(&io_sq_waiter_);
       }
 //                  << " big_deferred=" << big_deferred
 //                  << " pending_big=" << pending_big_msg_.size();
@@ -718,6 +732,7 @@ void UrmaAsyncSocket::handlePendingWrites() noexcept {
       pending_write_head_ = std::move(pending_write_head_->next);
       if (!pending_write_head_) {
         pending_write_tail_ = nullptr;
+        shared_->removeIoSqWaiter(&io_sq_waiter_);
       }
     }
   }
@@ -987,8 +1002,10 @@ bool UrmaAsyncSocket::startRead(uint16_t msg_id, const PullMemFragDesc* frags,
     XLOG(ERR) << "startRead: IO JFS not available";
     return false;
   }
-  if (!shared_->tryAcquireIoSq()) {
-    XLOG(WARN) << "startRead: SQ full, msg_id=" << msg_id;
+  // 问题 06:WR 链按 frag_count 申请配额(原 tryAcquireIoSq 只记 1 个 → SQ 真实溢出)
+  if (!shared_->tryAcquireIoSqN(frag_count)) {
+    XLOG(WARN) << "startRead: SQ full (need=" << frag_count
+               << "), msg_id=" << msg_id;
     return false;
   }
 
@@ -1044,7 +1061,13 @@ bool UrmaAsyncSocket::startRead(uint16_t msg_id, const PullMemFragDesc* frags,
   if (st != URMA_SUCCESS) {
     XLOG(ERR) << "startRead: post WR chain failed status=" << st
               << " msg_id=" << msg_id;
-    shared_->releaseIoSq();
+    // 问题 06:按链长归还配额
+    shared_->releaseIoSqN(frag_count);
+    // 问题 06:不立即释放 dst 块 —— bad_wr 之前的 WR 可能已被硬件接受并 DMA,
+    // 立即释放会覆盖空闲块 FreeNode.next → 后续 poolAlloc SIGSEGV。
+    // 挂 pending_read_buf_ 延迟回收(下次 startRead/destroyUrmaResources 覆盖时释放)
+    pending_read_buf_ = std::move(head);
+    pending_read_sge_ = sge_arr;
     delete tx_ctx;
     return false;
   }
@@ -1484,7 +1507,17 @@ std::unique_ptr<IOBuf> UrmaAsyncSocket::buildOwnedDataFrame(
       data_ptr, data_len,
       [](void*, void* ud) {
         auto* rc = static_cast<RxSlotCtx*>(ud);
-        UrmaTransportContext::releaseHeldSlot(rc->ctx, rc->jfr, rc->slot);
+        // 问题 5.1:UAF 防护 —— alive 标志判断 context 是否存活
+        // EventBase 析构后 ctx/jfr 悬垂,但 alive 由 shared_ptr 保活可安全 load
+        if (!rc->alive || !rc->alive->load(std::memory_order_acquire)) {
+          return;  // context 已析构,短路(slot 不回收,进程退出内核回收)
+        }
+        if (rc->recycle) {
+          rc->recycle->push(rc->slot);
+        }
+        if (rc->held_count) {
+          rc->held_count->fetch_sub(1, std::memory_order_acq_rel);
+        }
       },
       ctx);
 }
@@ -1807,8 +1840,16 @@ void UrmaAsyncSocket::destroyUrmaResources() {
   resources_destroyed_ = true;
   DCHECK(!evb_ || evb_->inRunningEventBaseThread());
 
+  // 问题 02:兜底 close tcp_fd_(握手未完成就销毁的路径)
+  if (tcp_fd_ >= 0) {
+    ::close(tcp_fd_);
+    tcp_fd_ = -1;
+  }
+
   // SDD-URMA-EVBEXCLUSIVE-001: 路由摘表 + sock 置空(置空协议)
   if (shared_) {
+    // 问题 01:析构时摘除等待者(消除僵尸)
+    shared_->removeIoSqWaiter(&io_sq_waiter_);
     shared_->unregisterSocket(socket_id_.toUint64());
     shared_->unregisterFcSocket(socket_id_.toUint64());
   }

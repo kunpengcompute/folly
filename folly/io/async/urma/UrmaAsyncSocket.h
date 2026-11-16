@@ -158,6 +158,10 @@ class UrmaAsyncSocket : public AsyncTransport {
   // TX completion(由 UrmaCqHandler TX 模式调用)
   void pollTx() noexcept;
   void retryWrite() noexcept;
+  // 问题 01:供唤醒侧判断 pending 队列是否还有待发请求
+  bool hasPendingWrite() const noexcept {
+    return pending_write_head_ != nullptr;
+  }
 
   // Phase 5: 处理其他连接 pollTx 收割到的本连接 READ CQE
   // JFS 池化后多连接共享 JFS,pollTx 可能收割到其他连接 post 的 READ CQE,
@@ -381,6 +385,8 @@ class UrmaAsyncSocket : public AsyncTransport {
   };
   std::unique_ptr<PendingWrite> pending_write_head_;
   PendingWrite* pending_write_tail_{nullptr};
+  // 问题 01:SqWaiter 等待者(配额归还时被 wakeOneIoSqWaiter 唤醒)
+  SqWaiter io_sq_waiter_{this, false};
 
   // ── 单边 READ 状态 ──
   static constexpr uint64_t kCtrlUserCtx = 0xFFFFFFFFFFFFFFFFULL;
