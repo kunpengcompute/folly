@@ -146,6 +146,7 @@ struct UrmaAsyncSocket::Impl final : AsyncSocket::ConnectCallback,
   unsigned handshakeWrites{0};
   bool haveHello{false}, haveReady{false}, peerRead{false}, client{false};
   urma_detail::Hello peerHello;
+  uint64_t initialReadAddress{0};
   bool sending{false}, delivering{false};
   bool writeShutdown{false}, closeAfterWrites{false};
   size_t txActive{0}, readActive{0};
@@ -427,6 +428,7 @@ struct UrmaAsyncSocket::Impl final : AsyncSocket::ConnectCallback,
       std::memcpy(hello.segmentEid.data(), segment->ubva.eid.raw, 16);
       hello.segmentUasid = segment->ubva.uasid;
       hello.segmentAddress = segment->ubva.va;
+      initialReadAddress = hello.segmentAddress;
       hello.segmentLength = segment->len;
       hello.segmentToken = segment->token_id;
     }
@@ -670,7 +672,7 @@ struct UrmaAsyncSocket::Impl final : AsyncSocket::ConnectCallback,
     return segments.find(address, length);
   }
   bool announceSegment(const UrmaPoolBuffer& exported) {
-    try { return segments.prepare(exported, io->initialReadSegment()->ubva.va); }
+    try { return segments.prepare(exported, initialReadAddress); }
     catch (const std::exception& e) { fail(e.what()); return false; }
   }
   void revokeSegments(const std::vector<uint64_t>& ids) override {
@@ -709,8 +711,24 @@ struct UrmaAsyncSocket::Impl final : AsyncSocket::ConnectCallback,
       skip -= node->length();
       node = node->next();
     }
+    const size_t prefix = node->length() - skip;
+    auto* body = node->next();
+    // Join a small prefix in owned headroom without copying the READ body.
+    if (prefix <= kHeadroom && prefix < work->bytes &&
+        body != work->write->data.get() && !body->isSharedOne() &&
+        body->length() && body->headroom() >= prefix &&
+        UrmaInit::ownsPoolBuffer(*body)) {
+      const size_t bytes = prefix + std::min(work->bytes - prefix, body->length());
+      auto* source = body->writableData() - prefix;
+      resources->exported = UrmaInit::holdReadExport(source, bytes);
+      if (resources->exported) {
+        std::memmove(source, node->data() + skip, prefix);
+        work->bytes = bytes;
+        resources->source = {source, resources->exported.segment(), bytes, {}};
+      }
+    }
     const size_t directBytes = std::min(work->bytes, node->length() - skip);
-    if (UrmaInit::ownsPoolBuffer(*node)) {
+    if (!resources->source.memory && UrmaInit::ownsPoolBuffer(*node)) {
       resources->exported =
           UrmaInit::holdReadExport(node->data() + skip, directBytes);
       if (resources->exported) {
@@ -876,6 +894,8 @@ struct UrmaAsyncSocket::Impl final : AsyncSocket::ConnectCallback,
     it->second.data = std::move(data);
     it->second.ready = true;
     drainRecords();
+    if (!readActive && records.empty())
+      deliver();
   }
   void poll() {
     if (io && live())

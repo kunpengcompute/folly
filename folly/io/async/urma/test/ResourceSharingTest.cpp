@@ -1623,6 +1623,52 @@ int main(int argc, char** argv) {
                        ordered.completed == 1; });
       largeSource.reset();
 
+      stage = "READ prefixes and body headroom ownership";
+      for (int mode = 0; mode < 3; ++mode) {
+        ordered.expected.clear();
+        ordered.received = ordered.completed = 0;
+        IOBufQueue prefixed;
+        std::vector<std::unique_ptr<IOBuf>> shared;
+        for (int i = 0; i < 2; ++i) {
+          std::string prefix(18, char('h' + i)), body(8192, char('x' + i));
+          ordered.expected += prefix + body;
+          prefixed.append(IOBuf::copyBuffer(prefix));
+          auto data = IOBuf::copyBuffer(body.data(), body.size(), mode == 2 ? 8 : 128);
+          std::memset(data->writableBuffer(), 0x6d, data->headroom());
+          if (mode == 1) shared.push_back(data->cloneOne());
+          prefixed.append(std::move(data));
+        }
+        const auto before =
+            static_cast<UrmaAsyncSocket*>(ordered.socket.get())->getUrmaStats();
+        const auto pulls = checkedPulls;
+        const size_t expectedReads = mode == 0 ? 2 : 4;
+        holdReads = postAgain = true;
+        ordered.socket->writeChain(&ordered, prefixed.move());
+        spin([&] { return heldReads.size() == expectedReads; });
+        const auto submitted =
+            static_cast<UrmaAsyncSocket*>(ordered.socket.get())->getUrmaStats();
+        require(checkedPulls == pulls + expectedReads &&
+                    submitted.directReadBytes - before.directReadBytes == 16420 &&
+                    submitted.directSendBytes == before.directSendBytes &&
+                    submitted.copiedReadBytes == before.copiedReadBytes &&
+                    !ordered.received && !ordered.completed,
+                "READ prefix joining changed ownership, copied the body or completed early");
+        for (size_t i = heldReads.size(); i > 1; --i)
+          signalQueue(heldReads[i - 1].first, heldReads[i - 1].second);
+        for (int i = 0; i < 32; ++i) evb.loopOnce(EVLOOP_NONBLOCK);
+        require(!ordered.received && !ordered.completed,
+                "later prefixed READ bypassed an earlier READ");
+        auto first = heldReads.front();
+        heldReads.clear();
+        holdReads = false;
+        signalQueue(first.first, first.second);
+        spin([&] { return ordered.received == ordered.expected.size() &&
+                         ordered.completed == 1; });
+        for (const auto& data : shared)
+          for (size_t i = 0; i < data->headroom(); ++i)
+            require(data->buffer()[i] == 0x6d, "READ modified shared headroom");
+      }
+
       stage = "registered SEND chain exceeds one WR SGE count";
       ordered.expected.clear();
       ordered.received = ordered.completed = 0;

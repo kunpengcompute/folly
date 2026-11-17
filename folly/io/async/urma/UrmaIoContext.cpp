@@ -203,6 +203,7 @@ struct UrmaIoContext::Impl : EventHandler, AsyncTimeout {
   // Each entry owns one SQ slot and one READ context, including while a
   // known-unaccepted suffix waits for retry. Never wait to fill a batch.
   std::deque<uint32_t> pendingReads;
+  bool readBlocked{false};
   std::shared_ptr<ReadBudget> readBudget{new ReadBudget};
   struct SegmentEntry {
     std::weak_ptr<ImportedSegment> segment;
@@ -423,8 +424,10 @@ struct UrmaIoContext::Impl : EventHandler, AsyncTimeout {
         hw->slots[batch[i - 1]].submitted = false;
         pendingReads.push_front(batch[i - 1]);
       }
-      if (status == URMA_EAGAIN)
+      if (status == URMA_EAGAIN) {
+        readBlocked = true;
         return; // Keep the suffix; CQ progress or the existing timer retries.
+      }
       if (status != URMA_SUCCESS) {
         fail(("URMA READ batch submit failed: " + std::to_string(status))
                  .c_str());
@@ -508,9 +511,11 @@ struct UrmaIoContext::Impl : EventHandler, AsyncTimeout {
     progressRetired();
     retryReceives();
     while (!broken) {
-      // READs admitted by the previous CQ batch are posted together. A
-      // successful admission need not wait for an older READ's completion.
-      flushReads();
+      // Flush the remaining READs without retrying an early EAGAIN before
+      // polling for new completions. The timer also retries an idle suffix.
+      if (!readBlocked)
+        flushReads();
+      readBlocked = false;
       if (broken)
         break;
       urma_cr_t cr[32]{};
@@ -522,6 +527,11 @@ struct UrmaIoContext::Impl : EventHandler, AsyncTimeout {
       if (!n)
         break;
       for (int i = 0; i < n && !broken; ++i) {
+        // Overlap READ DMA with further CQ dispatch, after callbacks finish.
+        if (!readBlocked && pendingReads.size() >= 2) {
+          flushReads();
+          if (broken) break;
+        }
         auto c = cr[i];
         ++completions;
         if (c.flag.bs.s_r) {
