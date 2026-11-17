@@ -38,8 +38,9 @@ std::unordered_map<uint32_t, urma_jfr_t*> receivers;
 std::unordered_map<urma_jfr_t*, std::deque<Receive>> posted;
 std::unordered_map<urma_jfc_t*, std::deque<urma_cr_t>> ready;
 std::unordered_map<urma_jfce_t*, std::deque<urma_jfc_t*>> notifications;
-size_t eventsRetrieved = 0, eventsAcknowledged = 0;
+size_t eventsRetrieved = 0, eventsAcknowledged = 0, cqPolls = 0;
 bool failEventWait = false, failCqPoll = false, failCqRearm = false;
+bool suppressEventSignals = false;
 std::function<void()> onRearm;
 std::function<void()> onImport;
 uint32_t nextQueue = 1;
@@ -59,6 +60,8 @@ uint64_t rejectSequence = 0;
 using Completions = std::vector<std::pair<urma_jfc_t*, urma_cr_t>>;
 Completions heldFreeCompletions;
 bool reorderData = false, holdDataCompletions = false;
+bool holdDataSends = false;
+Completions heldDataSends;
 bool holdReads = false, holdPullReceives = false;
 int rejectReadAfter = -1;
 bool blockReadPosts = false, unknownReadBoundary = false;
@@ -79,6 +82,7 @@ uint64_t lastCompletionContext = 0;
 Completions heldFrees;
 void signalQueue(urma_jfc_t* cq, urma_cr_t cr) {
   ready[cq].push_back(cr);
+  if (suppressEventSignals) return;
   notifications[cq->jfc_cfg.jfce].push_back(cq);
   uint64_t value = 1;
   auto n = ::write(cq->jfc_cfg.jfce->fd, &value, sizeof(value));
@@ -129,6 +133,9 @@ urma_status_t urma_delete_jfc(urma_jfc_t* p) {
   return URMA_SUCCESS;
 }
 urma_jfs_t* urma_create_jfs(urma_context_t*, urma_jfs_cfg_t* cfg) {
+  require(cfg->max_sge == folly::UrmaInit::getConfig().max_send_sge &&
+              cfg->max_sge <= deviceSendSges,
+          "JFS SGE configuration differs from the effective device limit");
   if (inject("jfs"))
     return nullptr;
   auto p = new urma_jfs_t{};
@@ -238,7 +245,7 @@ static urma_status_t postOne(
     return URMA_EAGAIN;
   }
   lastCompletionContext = wr->user_ctx;
-  bool pull = false, free = false;
+  bool pull = false, free = false, data = false;
   urma_cr_t tx{};
   tx.user_ctx = wr->user_ctx;
   tx.status = URMA_CR_SUCCESS;
@@ -255,6 +262,7 @@ static urma_status_t postOne(
     free = folly::urma_detail::decodeHeader(
                reinterpret_cast<const uint8_t*>(first.addr), first.len, control) &&
         control.kind == folly::urma_detail::PacketKind::Free;
+    data = control.kind == folly::urma_detail::PacketKind::Data;
     const bool rejectRecord = rejectSequence && control.sequence == rejectSequence &&
         (control.kind == folly::urma_detail::PacketKind::Data ||
          control.kind == folly::urma_detail::PacketKind::Pull);
@@ -350,7 +358,9 @@ static urma_status_t postOne(
       }
     }
   }
-  if (holdReads && wr->opcode == URMA_OPC_READ) {
+  if (holdDataSends && data) {
+    heldDataSends.emplace_back(jfs->jfs_cfg.jfc, tx);
+  } else if (holdReads && wr->opcode == URMA_OPC_READ) {
     heldReads.emplace_back(jfs->jfs_cfg.jfc, tx);
   } else if (holdFreeCompletions && free) {
     heldFreeCompletions.emplace_back(jfs->jfs_cfg.jfc, tx);
@@ -394,6 +404,7 @@ urma_status_t urma_post_jfs_wr(
   return URMA_SUCCESS;
 }
 int urma_poll_jfc(urma_jfc_t* p, int count, urma_cr_t* cr) {
+  ++cqPolls;
   if (std::exchange(failCqPoll, false)) return -1;
   int n = 0;
   auto& q = ready[p];
@@ -417,6 +428,11 @@ int urma_wait_jfc(urma_jfce_t* p, uint32_t count, int, urma_jfc_t** queues) {
   const auto n = std::min<size_t>(count, pending.size());
   for (size_t i = 0; i < n; ++i) {
     queues[i] = pending.front(); pending.pop_front();
+  }
+  if (!pending.empty()) {
+    uint64_t one = 1;
+    require(::write(p->fd, &one, sizeof(one)) == sizeof(one),
+            "pending notifications lost level-triggered readiness");
   }
   eventsRetrieved += n;
   return n;

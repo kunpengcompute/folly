@@ -14,7 +14,7 @@ struct UrmaConfig {
   uint32_t rx_target{256};
   uint32_t tx_depth{1024};
   uint32_t buffer_size{4096};  // Clamped to the CTP SEND limit of 4 KiB.
-  uint32_t max_send_sge{4};
+  uint32_t max_send_sge{0};  // 0 uses the device limit; nonzero caps it.
   uint32_t handshake_timeout_ms{5000};
   // A continuous registered range above this threshold may use READ.
   bool enable_read{true};

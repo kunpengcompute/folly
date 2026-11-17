@@ -236,6 +236,80 @@ void feedEnd(Endpoint& server, uint64_t sequence, bool eof = true) {
   }
   if (eof) cb->readEOF();
 }
+void timerContract(EventBase& evb, Endpoint& client, Endpoint& server) {
+  auto runFor = [&](auto duration) {
+    auto end = std::chrono::steady_clock::now() + duration;
+    do {
+      evb.loopOnce(EVLOOP_NONBLOCK);
+      std::this_thread::sleep_for(100us);
+    } while (std::chrono::steady_clock::now() < end);
+  };
+  // Warm timer reuse must preserve completion and then become fully idle.
+  for (int i = 0; i < 8; ++i) {
+    client.send(32, 19);
+    pump(evb, [&] { return client.callbacks == size_t(i + 1) &&
+        server.received == size_t(i + 1) * 32; }, "warm timer DATA progress");
+  }
+  runFor(40ms);
+  auto polls = cqPolls;
+  runFor(25ms);
+  require(cqPolls == polls, "idle transport kept polling after its final check");
+
+  // Reverse DATA must not postpone a stalled write's deadline. Hold the
+  // hardware completion beyond timeout and verify it cannot notify twice.
+  client.socket->setSendTimeout(25);
+  holdDataSends = true;
+  client.send(32, 19);
+  holdDataSends = false;
+  require(heldDataSends.size() == 1, "missing held DATA completion");
+  pump(evb, [&] { return server.received == 9 * 32; }, "stalled DATA receive");
+  const auto deadline = std::chrono::steady_clock::now() + 200ms;
+  while (!client.errors && std::chrono::steady_clock::now() < deadline) {
+    server.send(32, 73);
+    runFor(1ms);
+  }
+  require(client.transport().error() && client.callbacks == 8 &&
+              client.completions.back().calls == 1 && client.received,
+          "reverse DATA postponed timeout or completed the stalled write");
+  auto& owner = UrmaIoContext::get(&evb);
+  require(owner.snapshot().inflight, "timeout released a submitted DATA slot");
+  completeHeld(heldDataSends);
+  pump(evb, [&] { return !owner.snapshot().inflight; }, "late DATA completion");
+  require(client.callbacks == 8 && client.completions.back().calls == 1,
+          "late DATA completion notified a timed-out write twice");
+}
+void watchdogContract(EventBase& evb, Endpoint& client, Endpoint& server) {
+  // Settle the handshake so it cannot provide an unrelated poll timer.
+  const auto settled = std::chrono::steady_clock::now() + 40ms;
+  while (std::chrono::steady_clock::now() < settled) {
+    evb.loopOnce(EVLOOP_NONBLOCK);
+    std::this_thread::sleep_for(100us);
+  }
+  suppressEventSignals = true;
+  client.send(32, 19);
+  pump(evb, [&] { return client.callbacks == 1 && server.received == 32; },
+       "socket watchdog did not recover a lost CQ notification");
+  require(!client.errors && !server.errors, "lost event caused transport failure");
+
+  holdDataSends = true;
+  client.send(32, 19);
+  holdDataSends = false;
+  pump(evb, [&] { return server.received == 64; }, "held DATA receive");
+  require(heldDataSends.size() == 1, "missing post-close completion");
+  client.closing = server.closing = true;
+  client.socket->closeNow();
+  server.socket->closeNow();
+  auto& owner = UrmaIoContext::get(&evb);
+  require(owner.snapshot().inflight, "close released an outstanding DMA slot");
+  const auto calls = client.completions.back().calls;
+  // Both socket timers are gone and this CQE has no event notification.
+  completeHeld(heldDataSends);
+  pump(evb, [&] { return !owner.snapshot().inflight; },
+       "owner watchdog did not take over after socket close");
+  suppressEventSignals = false;
+  require(calls == 1 && client.completions.back().calls == calls,
+          "post-close completion duplicated the write callback");
+}
 void boundaryContract(EventBase& evb, Endpoint& client, Endpoint& server,
                       const std::string& mode) {
   client.closing = server.closing = true;
@@ -285,7 +359,8 @@ void boundaryContract(EventBase& evb, Endpoint& client, Endpoint& server,
     return;
   }
   holdDataCompletions = true;
-  server.movable = mode == "eof_movable" || mode == "delivery_batch";
+  server.movable = mode == "eof_movable" || mode == "delivery_batch" ||
+      mode == "delivery_event";
   if (mode == "eof_paused") server.socket->setReadCB(nullptr);
   for (size_t i = 0; i < 80; ++i) client.send(300, 19);
   pump(evb, [&] { return client.callbacks == 80 && heldData.size() == 80; },
@@ -296,9 +371,20 @@ void boundaryContract(EventBase& evb, Endpoint& client, Endpoint& server,
   require(!server.eofs && !server.errors && !server.received,
           "EOF overtook the held tail DATA");
   holdDataCompletions = false;
-  if (mode == "delivery_batch") completeHeld(heldData);
+  if (mode == "delivery_batch" || mode == "delivery_event") completeHeld(heldData);
   else completeHeldReverse(heldData);
-  owner.poll();
+  if (mode == "delivery_event") {
+    bool rearmed = false;
+    onRearm = [&] {
+      require(server.received == 24000 && server.readCallbacks == 1,
+              "CQ event rearmed before delivering the whole ready prefix");
+      rearmed = true;
+    };
+    evb.loopOnce(EVLOOP_NONBLOCK);
+    require(rearmed, "completed DATA did not trigger the CQ event");
+  } else {
+    owner.poll();
+  }
   if (mode == "delivery_close") {
     require(!server.received && !server.eofs,
             "application delivery ran inside CQ dispatch");
@@ -316,7 +402,7 @@ void boundaryContract(EventBase& evb, Endpoint& client, Endpoint& server,
   require(server.received == 24000 && server.bytesAtEof == 24000 &&
               !server.errors && !client.errors,
           "normal EOF lost or corrupted tail DATA");
-  if (mode == "delivery_batch")
+  if (mode == "delivery_batch" || mode == "delivery_event")
     require(server.readCallbacks == 1,
             "ready DATA prefix was delivered one CQE at a time");
   // Receiving FIN must not close our own write side.
@@ -346,7 +432,11 @@ int main(int argc, char** argv) {
             accepted.peers[0]->transport().isUrmaReady(); }, "handshake");
         auto& server = *accepted.peers[0];
         client.seed = 73; server.seed = 19;
-        if (mode.rfind("callback_", 0) == 0)
+        if (mode == "timer_progress")
+          timerContract(evb, client, server);
+        else if (mode == "timer_watchdog")
+          watchdogContract(evb, client, server);
+        else if (mode.rfind("callback_", 0) == 0)
           callbackReentry(evb, client, server, mode);
         else boundaryContract(evb, client, server, mode);
         client.closing = server.closing = true;

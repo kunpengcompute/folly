@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <memory>
 #include <folly/io/IOBuf.h>
+#include <folly/io/async/EventBase.h>
 #include <folly/io/async/urma/UrmaInit.h>
 #include <folly/io/async/urma/UrmaProtocol.h>
 #include <folly/io/async/urma/UrmaSegmentState.h>
@@ -92,11 +93,19 @@ class UrmaIoContext {
   uint8_t* buffer(uint32_t, size_t bytes, bool control = false);
   urma_target_seg_t* segment(uint32_t) const;
   void cancel(uint32_t);
+  // Build a SEND directly in its reserved slot. The returned WR has room for
+  // max_send_sge source entries and remains owned by the slot until completion.
+  urma_jfs_wr_t& prepareSend(uint32_t);
   // READs admitted during CQ dispatch are chained at the next poll boundary,
   // with one completion and one slot per WR. Success transfers ownership;
   // the owner retries a known-unaccepted suffix without duplicating its prefix.
-  urma_status_t post(uint32_t, uint64_t, urma_jfs_wr_t&, std::shared_ptr<void>);
+  // Skip the owner poll timer only when the caller provides its own watchdog.
+  urma_status_t post(uint32_t, uint64_t, urma_jfs_wr_t&, std::shared_ptr<void>,
+                     bool schedulePoll = true);
   void poll();
+  // During a CQ event, deliver its ready prefix after polling, before rearm.
+  // The callback's existing intrusive hook also cancels delivery on close.
+  void scheduleRead(EventBase::LoopCallback*);
   Snapshot snapshot() const;
   bool hasDeferredReceives(uint64_t socket) const;
 

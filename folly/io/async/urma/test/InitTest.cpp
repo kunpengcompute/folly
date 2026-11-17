@@ -1,6 +1,7 @@
 /* Copyright (c) Huawei Technologies Co., Ltd. 2026. Licensed under Apache-2.0.
  */
 #include <cstdlib>
+#include <algorithm>
 #include <atomic>
 #include <cstring>
 #include <iostream>
@@ -18,6 +19,7 @@ enum class Failure { None, Devices, Query, Eids, Context };
 Failure failure = Failure::None;
 bool borrowedLibrary = false;
 int initializes = 0, finalizes = 0, devices = 0, eids = 0, contexts = 0;
+uint32_t deviceSendSges = 4;
 urma_device_t device{};
 urma_device_t* deviceList[]{&device};
 urma_eid_info_t eid{};
@@ -98,7 +100,7 @@ urma_status_t urma_query_device(urma_device_t*, urma_device_attr_t* attr) {
   attr->dev_cap.trans_mode = URMA_TM_RM;
   attr->dev_cap.max_jfr_depth = 4096;
   attr->dev_cap.max_jfs_depth = 4096;
-  attr->dev_cap.max_jfs_sge = 4;
+  attr->dev_cap.max_jfs_sge = deviceSendSges;
   attr->dev_cap.max_jfc_depth = 8193;
   attr->dev_cap.max_msg_size = 65536;
   attr->dev_cap.max_read_size = 1024 * 1024;
@@ -217,6 +219,30 @@ int main() {
                 << borrowed << '\n';
     }
     std::cout << "11 initialization cases passed\n";
+    for (uint32_t maximum : {1, 4, 13, 255}) {
+      deviceSendSges = maximum;
+      for (uint32_t requested : {0, 3, 255}) {
+        reset();
+        config.max_send_sge = requested;
+        folly::UrmaInit::init(config);
+        require(folly::UrmaInit::getConfig().max_send_sge ==
+                    (requested ? std::min(requested, maximum) : maximum),
+                "SEND SGE limit did not follow device capability/config cap");
+        folly::UrmaInit::fini();
+      }
+    }
+    config.max_send_sge = 0;
+    for (uint32_t maximum : {0, 256}) {
+      reset();
+      deviceSendSges = maximum;
+      bool rejected = false;
+      try { folly::UrmaInit::init(config); }
+      catch (const std::invalid_argument&) { rejected = true; }
+      require(rejected && !devices && !eids && !contexts && finalizes == 1,
+              "unrepresentable device SGE limit leaked SDK resources");
+    }
+    deviceSendSges = 4;
+    std::cout << "PASS device SEND SGE limits, explicit caps and rollback\n";
     reset();
     folly::UrmaInit::init(config);
     {
@@ -281,6 +307,11 @@ int main() {
       require(folly::UrmaInit::ownsPoolBuffer(*buffer) &&
                   bool(folly::UrmaInit::lookupSegment(buffer->buffer(), buffer->capacity())),
               "reinitialized producer used a stale or unregistered pool");
+      auto block = folly::UrmaInit::poolAlloc(4096);
+      require(block && block.segment() == folly::UrmaInit::poolSegment(*buffer) &&
+                  bool(folly::UrmaInit::holdReadExport(block.data(), block.capacity())),
+              "reinitialized socket allocation/export used a stale pool");
+      block = {};
       buffer.reset();
       folly::UrmaInit::fini();
       require(!folly::UrmaInit::isInitialized(), "reinitialized TLS retained registration");

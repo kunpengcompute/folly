@@ -12,6 +12,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <mutex>
 #include <stdexcept>
 #include <type_traits>
@@ -85,8 +86,9 @@ void UrmaInit::init(const UrmaConfig& requested) {
   urma_detail::MemoryPool::validate(config.registered_pool);
   if (!config.offer_window || config.offer_window > 1024 ||
       !config.read_window || config.read_window > 1024 ||
-      !config.registered_pool.enabled || !config.max_send_sge ||
-      config.max_send_sge > 4 || !config.tx_depth || config.tx_depth > 4096 ||
+      !config.registered_pool.enabled ||
+      config.max_send_sge > std::numeric_limits<uint8_t>::max() ||
+      !config.tx_depth || config.tx_depth > 4096 ||
       config.rx_depth > 65536 || config.rx_target > 65536 ||
       config.buffer_size <= 128 || config.buffer_size > 65536 ||
       !config.handshake_timeout_ms || config.max_pending_bytes < config.buffer_size)
@@ -139,11 +141,12 @@ void UrmaInit::init(const UrmaConfig& requested) {
         : attr.dev_cap.max_jfr_depth;
     effective.tx_depth =
         std::min(effective.tx_depth, attr.dev_cap.max_jfs_depth);
-    effective.max_send_sge = std::min<uint32_t>(
-        4,
-        std::min<uint32_t>(effective.max_send_sge, attr.dev_cap.max_jfs_sge));
-    if (!effective.max_send_sge)
-      throw std::invalid_argument("URMA device has no SEND SGE capacity");
+    effective.max_send_sge = effective.max_send_sge
+        ? std::min(effective.max_send_sge, attr.dev_cap.max_jfs_sge)
+        : attr.dev_cap.max_jfs_sge;
+    if (!effective.max_send_sge ||
+        effective.max_send_sge > std::numeric_limits<uint8_t>::max())
+      throw std::invalid_argument("URMA device SEND SGE capacity is not representable");
     // Aggregated CTP SEND supports 4 KiB even when max_msg_size also advertises
     // the larger RTP limit. Larger application writes use one-sided READ.
     effective.buffer_size =
@@ -240,7 +243,7 @@ void UrmaInit::releaseContext() {
 }
 UrmaPoolBuffer UrmaInit::poolAlloc(size_t size,
                                   UrmaPoolSignal* waiter) {
-  auto pool = std::atomic_load(&*publishedPool);
+  const auto& pool = ioBufPool();
   if (!pool) return {};
   auto buffer = pool->allocate(size, waiter);
   if (!buffer) {
@@ -281,11 +284,11 @@ void UrmaInit::subscribePool(const std::shared_ptr<UrmaPoolSignal>& signal) {
   pool->subscribe(signal);
 }
 UrmaPoolBuffer UrmaInit::lookupSegment(const void* addr, size_t length) {
-  auto pool = std::atomic_load(&*publishedPool);
+  const auto& pool = ioBufPool();
   return pool ? (pool)->lookup(addr, length, false) : UrmaPoolBuffer{};
 }
 UrmaPoolBuffer UrmaInit::holdReadExport(const void* addr, size_t length) {
-  auto pool = std::atomic_load(&*publishedPool);
+  const auto& pool = ioBufPool();
   return pool ? (pool)->lookup(addr, length, true) : UrmaPoolBuffer{};
 }
 void UrmaInit::retirePoolBuffer(const UrmaPoolBuffer& buffer) {

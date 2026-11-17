@@ -71,7 +71,7 @@ struct UrmaIoContext::Impl : EventHandler, AsyncTimeout {
     bool read{false};
     bool* readObserved{nullptr};
     urma_jfs_wr_t work{};
-    std::array<urma_sge_t, 4> source{};
+    std::vector<urma_sge_t> source;
     urma_sge_t destination{};
     std::shared_ptr<void> hold;
   };
@@ -93,7 +93,7 @@ struct UrmaIoContext::Impl : EventHandler, AsyncTimeout {
     std::vector<UrmaInit::Buffer> receiveBuffers;
     std::vector<Slot> slots;
     bool counted{false};
-    bool ack() {
+    bool ack(bool drain = true) {
       if (!event) return true;
       urma_jfc_t* queues[1];
       while (true) {
@@ -102,6 +102,8 @@ struct UrmaIoContext::Impl : EventHandler, AsyncTimeout {
         if (!n) return true;
         uint32_t count[1] = {1};
         urma_ack_jfc(queues, count, 1);
+        // Remaining notifications keep the level-triggered event readable.
+        if (!drain) return true;
       }
     }
     bool tryCleanup() noexcept override {
@@ -213,6 +215,11 @@ struct UrmaIoContext::Impl : EventHandler, AsyncTimeout {
   uint64_t sends{0}, receives{0}, reads{0}, completions{0};
   uint64_t readConnections{0}, dataConnections{0};
   bool polling{false}, waking{false}, notifyingFailure{false}, broken{false};
+  bool handlingEvent{false};
+  using ReadyReads = boost::intrusive::list<
+      EventBase::LoopCallback, boost::intrusive::constant_time_size<false>>;
+  ReadyReads readyReads;
+  uint32_t timerInterval{0};
 
   explicit Impl(EventBase* e)
       : EventHandler(e),
@@ -227,6 +234,13 @@ struct UrmaIoContext::Impl : EventHandler, AsyncTimeout {
     poolHandler.reset();
     urma_detail::cleanupOrDefer(std::move(hw));
   }
+  void armTimer(uint32_t interval) {
+    // Keep the earlier poll/retry deadline instead of rearming for each WR.
+    if (!isScheduled() || interval < timerInterval) {
+      scheduleTimeout(interval);
+      timerInterval = interval;
+    }
+  }
   void checkThread() const {
     if (!evb->isInEventBaseThread())
       throw std::logic_error("URMA owner thread mismatch");
@@ -240,6 +254,8 @@ struct UrmaIoContext::Impl : EventHandler, AsyncTimeout {
       hw->ctx = UrmaInit::acquireContext();
       if (!hw->ctx) throw std::runtime_error("URMA context unavailable");
       hw->slots.resize(config.tx_depth);
+      for (auto& slot : hw->slots)
+        slot.completion.source.resize(config.max_send_sge);
       for (uint32_t i = config.tx_depth; i; --i) freeSlots.push_back(i - 1);
       hw->receiveBuffers.resize(rxTarget);
       if (!poolHandler) {
@@ -591,9 +607,9 @@ struct UrmaIoContext::Impl : EventHandler, AsyncTimeout {
     if (!broken) {
       if (!deferredRx.empty() || !pendingReads.empty() || !pendingRx.empty() || !waiters.empty() ||
           !freeWaiters.empty())
-        scheduleTimeout(1);
+        armTimer(1);
       else if (freeSlots.size() != hw->slots.size() || !retired.empty())
-        scheduleTimeout(10);
+        armTimer(10);
       else
         cancelTimeout();
     }
@@ -612,18 +628,39 @@ struct UrmaIoContext::Impl : EventHandler, AsyncTimeout {
       if (hold->progress()) retired.erase(id);
     }
   }
+  void deliverReadyReads() {
+    // Callbacks may close another queued socket or poll reentrantly. Unlink
+    // before calling, and leave newly queued work for the following pass.
+    ReadyReads ready;
+    ready.swap(readyReads);
+    while (!ready.empty()) {
+      auto& callback = ready.front();
+      ready.pop_front();
+      callback.runLoopCallback();
+    }
+  }
   void handlerReady(uint16_t) noexcept override {
-    if (!hw->ack()) {
+    handlingEvent = true;
+    auto reset = makeGuard([&] { handlingEvent = false; });
+    if (!hw->ack(false)) {
       fail("URMA shared CQ event wait failed");
       return;
     }
     poll();
+    deliverReadyReads();
     if (!broken) {
       if (urma_rearm_jfc(hw->cq, false) != URMA_SUCCESS) {
         fail("URMA shared CQ rearm failed");
         return;
       }
       poll();
+      deliverReadyReads();
+    }
+    // Reentrant application work must not indefinitely extend this handler.
+    while (!readyReads.empty()) {
+      auto& callback = readyReads.front();
+      readyReads.pop_front();
+      evb->runInLoop(&callback, false, nullptr);
     }
   }
   void timeoutExpired() noexcept override try {
@@ -670,6 +707,7 @@ void UrmaIoContext::release(EventBase* evb) {
     throw std::logic_error("URMA owner still has sockets");
   if (ctx &&
       ((*ctx)->impl_->polling || (*ctx)->impl_->waking ||
+       (*ctx)->impl_->handlingEvent ||
        (*ctx)->impl_->notifyingFailure))
     throw std::logic_error("URMA owner is dispatching callbacks");
   contexts.erase(*evb);
@@ -724,8 +762,10 @@ void UrmaIoContext::detach(uint64_t id) {
       receiver->adopt(slot.completion.user, true, false);
     cancel(index); // Not accepted by the SDK: no DMA can reference this hold.
   }
+  bool submitted = false;
   for (auto& slot : impl_->hw->slots)
     if (slot.submitted && slot.completion.socket == id) {
+      submitted = true;
       auto& c = slot.completion;
       c.listener = receiver && receiver->adopt(c.user, c.read, true)
           ? receiver : nullptr;
@@ -733,13 +773,16 @@ void UrmaIoContext::detach(uint64_t id) {
     }
   impl_->sockets.erase(found);
   impl_->cancelPreparation();
-  if (!impl_->deferredRx.empty() && !impl_->broken) impl_->scheduleTimeout(1);
+  // The detached socket can no longer poll on timeout. Keep that fallback
+  // while its submitted WRs still retain DMA resources.
+  if ((submitted || !impl_->deferredRx.empty()) && !impl_->broken)
+    impl_->armTimer(1);
 }
 void UrmaIoContext::retire(
     uint64_t id, std::shared_ptr<Retired> callback) {
   impl_->checkThread();
   impl_->retired.emplace(id, std::move(callback));
-  if (!impl_->broken) impl_->scheduleTimeout(1);
+  if (!impl_->broken) impl_->armTimer(1);
 }
 const urma_jfr_id_t& UrmaIoContext::endpoint() const {
   return impl_->hw->rx->jfr_id;
@@ -915,7 +958,7 @@ void UrmaIoContext::waitForResources(uint64_t id) {
   impl_->checkThread();
   impl_->poolSignal->arm();
   impl_->wait(id);
-  impl_->scheduleTimeout(1);
+  impl_->armTimer(1);
 }
 urma_target_seg_t* UrmaIoContext::segment(uint32_t slot) const {
   const auto& entry = impl_->hw->slots.at(slot);
@@ -927,14 +970,28 @@ void UrmaIoContext::cancel(uint32_t slot) {
   auto& s = impl_->hw->slots.at(slot);
   if (!s.reserved || s.submitted)
     throw std::logic_error("invalid URMA slot cancellation");
+  auto source = std::move(s.completion.source);
   s = {};
+  s.completion.source = std::move(source);
   impl_->freeSlots.push_back(slot);
+}
+urma_jfs_wr_t& UrmaIoContext::prepareSend(uint32_t index) {
+  impl_->checkThread();
+  auto& slot = impl_->hw->slots.at(index);
+  if (!slot.reserved || slot.submitted)
+    throw std::logic_error("invalid URMA send preparation");
+  auto& ctx = slot.completion;
+  ctx.work = {};
+  std::fill(ctx.source.begin(), ctx.source.end(), urma_sge_t{});
+  ctx.work.send.src.sge = ctx.source.data();
+  return ctx.work;
 }
 urma_status_t UrmaIoContext::post(
     uint32_t index,
     uint64_t id,
     urma_jfs_wr_t& wr,
-    std::shared_ptr<void> hold) {
+    std::shared_ptr<void> hold,
+    bool schedulePoll) {
   impl_->checkThread();
   auto& slot = impl_->hw->slots.at(index);
   auto found = impl_->sockets.find(id);
@@ -943,7 +1000,7 @@ urma_status_t UrmaIoContext::post(
       (found == impl_->sockets.end() && retired == impl_->retired.end()))
     throw std::logic_error("invalid URMA slot submission");
   auto* ctx = &slot.completion;
-  *ctx = {};
+  // Every live field is replaced below; completion has already moved out hold.
   ctx->socket = id;
   ctx->user = wr.user_ctx;
   ctx->index = index;
@@ -951,15 +1008,16 @@ urma_status_t UrmaIoContext::post(
                                               : retired->second.get();
   ctx->read = wr.opcode == URMA_OPC_READ;
   ctx->readObserved = found != impl_->sockets.end() ? &found->second.read : nullptr;
-  ctx->work = wr;
+  if (!ctx->read && wr.send.src.num_sge > ctx->source.size())
+    throw std::logic_error("URMA SEND SGE count exceeds stable context");
+  if (&wr != &ctx->work)
+    ctx->work = wr;
   if (ctx->read) {
     ctx->source[0] = wr.rw.src.sge[0];
     ctx->destination = wr.rw.dst.sge[0];
     ctx->work.rw.src.sge = ctx->source.data();
     ctx->work.rw.dst.sge = &ctx->destination;
-  } else if (wr.send.src.sge) {
-    if (wr.send.src.num_sge > ctx->source.size())
-      throw std::logic_error("URMA SEND SGE count exceeds stable context");
+  } else if (wr.send.src.sge && wr.send.src.sge != ctx->source.data()) {
     std::copy_n(wr.send.src.sge, wr.send.src.num_sge, ctx->source.begin());
     ctx->work.send.src.sge = ctx->source.data();
   }
@@ -970,7 +1028,7 @@ urma_status_t UrmaIoContext::post(
     if (impl_->polling || !impl_->pendingReads.empty()) {
       impl_->pendingReads.push_back(index);
       if (!impl_->polling)
-        impl_->scheduleTimeout(1);
+        impl_->armTimer(1);
       // Ownership has transferred to the owner, even before hardware accepts
       // this READ. It retries known-unaccepted WRs and cancels them on detach.
       return URMA_SUCCESS;
@@ -984,7 +1042,7 @@ urma_status_t UrmaIoContext::post(
     const bool priority = slot.priority;
     cancel(index);
     impl_->wait(id, priority);
-    impl_->scheduleTimeout(1);
+    impl_->armTimer(1);
   } else if (st != URMA_SUCCESS) {
     // Acceptance is unknown. Retain all DMA references until owner teardown.
     impl_->fail("URMA shared submit failed or acceptance unknown");
@@ -993,12 +1051,19 @@ urma_status_t UrmaIoContext::post(
       ++impl_->reads;
     else
       ++impl_->sends;
-    impl_->scheduleTimeout(10);
+    if (schedulePoll) impl_->armTimer(10);
   }
   return st;
 }
 void UrmaIoContext::poll() {
   impl_->poll();
+}
+void UrmaIoContext::scheduleRead(EventBase::LoopCallback* callback) {
+  impl_->checkThread();
+  if (impl_->handlingEvent)
+    impl_->readyReads.push_back(*callback);
+  else
+    impl_->evb->runInLoop(callback, false, nullptr);
 }
 bool UrmaIoContext::hasDeferredReceives(uint64_t id) const {
   impl_->checkThread();

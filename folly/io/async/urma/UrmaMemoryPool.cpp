@@ -247,15 +247,16 @@ struct MemoryPool::State : std::enable_shared_from_this<State> {
     *it = std::move(regions.back());
     regions.pop_back();
   }
-  UrmaPoolBuffer pin(const std::shared_ptr<Region>& r, Block* b, size_t kind) {
+  UrmaPoolBuffer pin(Region& r, Block* b, size_t kind) {
     struct Pin final : MemoryPin {
       std::shared_ptr<State> state;
-      std::shared_ptr<Region> region;
+      // State owns the region until all block/segment pins are returned.
+      Region* region;
       Block* block;
       size_t kind;
-      Pin(std::shared_ptr<State> s, std::shared_ptr<Region> r, Block* b,
+      Pin(std::shared_ptr<State> s, Region* r, Block* b,
           size_t k)
-          : state(std::move(s)), region(std::move(r)), block(b), kind(k) {}
+          : state(std::move(s)), region(r), block(b), kind(k) {}
       bool reusable(const void* owner) const noexcept override {
         return state.get() == owner &&
             !state->stopping.load(std::memory_order_acquire) &&
@@ -292,18 +293,19 @@ struct MemoryPool::State : std::enable_shared_from_this<State> {
         // growth explicitly; its timed pass still performs idle shrink.
       }
     };
-    auto p = std::make_shared<Pin>(shared_from_this(), r, b, kind);
-    p->data = static_cast<char*>(r->base) + (b ? b->offset : 0);
-    p->bytes = b ? b->bytes : r->bytes;
-    p->segment = r->segment;
-    p->id = r->id;
+    auto p = std::make_shared<Pin>(shared_from_this(), &r, b, kind);
+    p->data = static_cast<char*>(r.base) + (b ? b->offset : 0);
+    p->bytes = b ? b->bytes : r.bytes;
+    p->segment = r.segment;
+    p->id = r.id;
     if (b) {
       unlink(*b);
-      if (!b->busy()) ++r->activeBlocks;
+      if (!b->busy()) ++r.activeBlocks;
       ++b->refs[kind];
     } else
-      ++r->holds;
-    r->idle = Clock::now();
+      ++r.holds;
+    // An occupied block cannot be idle. Its final return timestamps the region.
+    if (!b) r.idle = Clock::now();
     return UrmaPoolBuffer(std::move(p));
   }
   // Called only by the elastic worker or UrmaInit's deferred cleanup worker.
@@ -478,14 +480,11 @@ UrmaPoolBuffer MemoryPool::allocate(size_t bytes, UrmaPoolSignal* waiter) {
       b = s.carve(capacity, tier);
     }
     if (b) {
-      for (auto& r : s.regions)
-        if (r.get() == b->region) {
-          auto result = s.pin(r, b, 0);
-          if (tier != State::unused) s.buckets[tier].requested = false;
-          else if (s.requestedLarge == capacity) s.requestedLarge = 0;
-          ++s.counters.fast_allocations;
-          return result;
-        }
+      auto result = s.pin(*b->region, b, 0);
+      if (tier != State::unused) s.buckets[tier].requested = false;
+      else if (s.requestedLarge == capacity) s.requestedLarge = 0;
+      ++s.counters.fast_allocations;
+      return result;
     }
     if (s.config.elastic && s.worker.joinable()) {
       if (tier != State::unused) s.buckets[tier].requested = true;
@@ -519,7 +518,7 @@ UrmaPoolBuffer MemoryPool::lookup(const void* address, size_t length,
     if (it == r->blocks.begin()) return {};
     auto& b = std::prev(it)->second;
     if (!b.refs[0] || length > b.bytes - (offset - b.offset)) return {};
-    return s.pin(r, &b, exported ? 2 : 1);
+    return s.pin(*r, &b, exported ? 2 : 1);
   }
   return {};
 }
@@ -528,7 +527,7 @@ UrmaPoolBuffer MemoryPool::initialSegment() {
   std::lock_guard<std::mutex> lock(s.mutex);
   if (!s.stopping)
     for (auto& r : s.regions)
-      if (r->initial && !r->retiring) return s.pin(r, nullptr, 0);
+      if (r->initial && !r->retiring) return s.pin(*r, nullptr, 0);
   return {};
 }
 UrmaPoolBuffer MemoryPool::holdSegment(uint64_t id) {
@@ -537,7 +536,7 @@ UrmaPoolBuffer MemoryPool::holdSegment(uint64_t id) {
   if (!s.stopping)
     for (auto& r : s.regions)
       if (r->id == id && !r->building && !r->retiring)
-        return s.pin(r, nullptr, 0);
+        return s.pin(*r, nullptr, 0);
   return {};
 }
 std::vector<uint64_t> MemoryPool::revocableSegments() const {

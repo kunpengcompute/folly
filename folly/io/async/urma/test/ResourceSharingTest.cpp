@@ -883,6 +883,7 @@ int main(int argc, char** argv) {
     config.rx_depth = 128;
     config.rx_target = 4;
     config.tx_depth = 2;
+    deviceSendSges = 13;
     UrmaInit::init(config);
     for (const char* step : {"event", "cq", "jfr", "jfs"}) {
       EventBase evb;
@@ -979,6 +980,7 @@ int main(int argc, char** argv) {
       // Reuse owner-owned contexts beyond the old 16-bit generation range;
       // the original full-width user value must still reach the listener.
       uint64_t completionAddress = 0;
+      urma_sge_t* completionSges = nullptr;
       TestListener receiver;
       auto receiverId = b.attach(&receiver);
       for (uint64_t i = 1; i <= 65538; ++i) {
@@ -1000,8 +1002,33 @@ int main(int argc, char** argv) {
         send.send.src.sge = &sg;
         send.send.src.num_sge = 1;
         send.user_ctx = UINT64_MAX;
+        // Reuse one context across READ, external SEND and prepared SEND SGEs.
+        std::array<uint8_t, 25> readBack{};
+        urma_sge_t destination{};
+        auto* request = &send;
+        const bool read = i % 4 == 1;
+        if (read) {
+          send.opcode = URMA_OPC_READ;
+          destination.addr = reinterpret_cast<uintptr_t>(readBack.data());
+          destination.len = readBack.size();
+          send.rw.src = {&sg, 1};
+          send.rw.dst = {&destination, 1};
+        } else if (i % 4 == 2) {
+          auto& prepared = a.prepareSend(index);
+          auto* parts = prepared.send.src.sge;
+          if (!completionSges) completionSges = parts;
+          require(parts == completionSges,
+                  "slot reuse reallocated its stable SGE storage");
+          prepared = send;
+          parts[0] = parts[1] = sg;
+          parts[0].len = 24;
+          parts[1].addr += 24;
+          parts[1].len = 1;
+          prepared.send.src = {parts, 2};
+          request = &prepared;
+        }
         require(
-            a.post(index, id, send, {}) == URMA_SUCCESS,
+            a.post(index, id, *request, {}) == URMA_SUCCESS,
             "sequential WR submit");
         if (!completionAddress)
           completionAddress = lastCompletionContext;
@@ -1012,6 +1039,10 @@ int main(int argc, char** argv) {
           a.detach(id); // The terminal CQE must not call a dead socket.
         a.poll();
         b.poll();
+        if (read)
+          require(
+              urma_detail::load64(readBack.data() + 16) == i && readBack[24] == 0,
+              "reused completion context corrupted READ destination");
       }
       require(
           listener.completions == 65537 && listener.lastUser == UINT64_MAX,
@@ -1230,6 +1261,33 @@ int main(int argc, char** argv) {
       UrmaIoContext::release(&evb);
       require(released == 1 && eventsRetrieved == eventsAcknowledged,
               "event cleanup failed to acknowledge or release exactly once");
+    }
+    // Consume one live notification per handler. Cleanup must still drain
+    // and acknowledge notifications that remain when the owner is released.
+    for (unsigned liveEvents : {0, 3, 8}) {
+      EventBase evb;
+      auto& owner = UrmaIoContext::get(&evb);
+      TestListener listener;
+      auto id = owner.attach(&listener);
+      auto* cq = receivers.at(owner.endpoint().id)->jfr_cfg.jfc;
+      auto* event = cq->jfc_cfg.jfce;
+      const auto before = eventsRetrieved;
+      for (int i = 0; i < 8; ++i) notifications[event].push_back(cq);
+      uint64_t count = 8;
+      require(::write(event->fd, &count, sizeof(count)) == sizeof(count),
+              "notification backlog setup failed");
+      for (unsigned i = 0; i < liveEvents; ++i) {
+        evb.loopOnce(EVLOOP_NONBLOCK);
+        require(eventsRetrieved == before + i + 1,
+                "live handler drained more than one notification");
+      }
+      require(notifications[event].size() == 8 - liveEvents,
+              "pending interrupt was lost");
+      owner.detach(id);
+      UrmaIoContext::release(&evb);
+      require(eventsRetrieved == before + 8 &&
+                  eventsRetrieved == eventsAcknowledged,
+              "cleanup lost or double-acknowledged pending notifications");
     }
     for (int invalidKind : {0, 1, 2}) {
       EventBase evb;
@@ -1671,23 +1729,55 @@ int main(int argc, char** argv) {
             require(data->buffer()[i] == 0x6d, "READ modified shared headroom");
       }
 
+      stage = "device-limit SEND with managed and externally wrapped registered buffers";
+      for (bool external : {false, true}) {
+        ordered.expected.clear();
+        ordered.received = ordered.completed = 0;
+        IOBufQueue fragments;
+        std::vector<UrmaPoolBuffer> storage;
+        for (uint32_t i = 1; i < UrmaInit::getConfig().max_send_sge; ++i) {
+          std::string part(100, char('a' + i));
+          ordered.expected += part;
+          if (external) {
+            auto block = UrmaInit::poolAlloc(part.size());
+            require(bool(block), "external registered fragment allocation");
+            std::memcpy(block.data(), part.data(), part.size());
+            fragments.append(IOBuf::wrapBuffer(block.data(), part.size()));
+            storage.push_back(std::move(block));
+          } else fragments.append(IOBuf::copyBuffer(part));
+        }
+        const auto before =
+            static_cast<UrmaAsyncSocket*>(ordered.socket.get())->getUrmaStats();
+        ordered.socket->writeChain(&ordered, fragments.move());
+        require(lastDataSges == UrmaInit::getConfig().max_send_sge,
+                "registered fragments did not use the full device SGE limit");
+        storage.clear(); // Local DMA pins must retain wrapped buffers until CQE.
+        spin([&] { return ordered.received == ordered.expected.size() &&
+                         ordered.completed == 1; });
+        const auto after =
+            static_cast<UrmaAsyncSocket*>(ordered.socket.get())->getUrmaStats();
+        require(after.directSendBytes - before.directSendBytes == ordered.expected.size() &&
+                    after.copiedSendBytes == before.copiedSendBytes,
+                "device-limit registered SEND copied its payload");
+      }
+
       stage = "registered SEND chain exceeds one WR SGE count";
       ordered.expected.clear();
       ordered.received = ordered.completed = 0;
       IOBufQueue chain;
-      for (int i = 0; i < 4; ++i) {
-        std::string part(900, char('a' + i));
+      for (uint32_t i = 0; i < UrmaInit::getConfig().max_send_sge; ++i) {
+        std::string part(100, char('a' + i));
         ordered.expected += part;
         chain.append(IOBuf::copyBuffer(part));
       }
       const auto sendStatsBefore =
           static_cast<UrmaAsyncSocket*>(ordered.socket.get())->getUrmaStats();
       ordered.socket->writeChain(&ordered, chain.move());
-      spin([&] { return ordered.received == 3600 && ordered.completed == 1; });
+      spin([&] { return ordered.received == ordered.expected.size() && ordered.completed == 1; });
       const auto sendStats =
           static_cast<UrmaAsyncSocket*>(ordered.socket.get())->getUrmaStats();
       require(
-          sendStats.copiedSendBytes - sendStatsBefore.copiedSendBytes == 3600 &&
+          sendStats.copiedSendBytes - sendStatsBefore.copiedSendBytes == ordered.expected.size() &&
               sendStats.directSendBytes == sendStatsBefore.directSendBytes,
           "fragmented SEND must copy-coalesce instead of splitting at the SGE limit");
 

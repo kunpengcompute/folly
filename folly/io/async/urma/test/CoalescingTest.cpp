@@ -59,7 +59,8 @@ extern "C" urma_status_t urma_post_jfs_wr(
     return result;
   for (auto* p = wr; p; p = p->next) {
     require(p->opcode == URMA_OPC_SEND, "expected the SEND coalescing path");
-    require(p->send.src.num_sge && p->send.src.num_sge <= 4,
+    require(p->send.src.num_sge &&
+                p->send.src.num_sge <= UrmaInit::getConfig().max_send_sge,
             "invalid SEND SGE count");
     std::vector<unsigned char> packet;
     for (uint32_t i = 0; i < p->send.src.num_sge; ++i) {
