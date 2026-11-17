@@ -1074,34 +1074,42 @@ struct UrmaAsyncSocket::Impl final : AsyncSocket::ConnectCallback,
     uint32_t count = 1;
     work->pins = {};
     bool direct = false;
+    auto segmentFor = [&](const IOBuf& buffer, const void* address,
+                          size_t bytes, uint32_t index) {
+      if (auto* segment = UrmaInit::poolSegment(buffer)) return segment;
+      work->pins[index] = UrmaInit::lookupSegment(address, bytes);
+      return work->pins[index].segment();
+    };
     if (work->kind == SendKind::Data) {
       const auto* node = work->write->data.get();
       if (!node->isChained() && !node->isSharedOne() && !work->offset &&
           work->bytes == work->write->bytes &&
           node->headroom() >= urma_detail::kHeaderSize) {
         auto* header = const_cast<uint8_t*>(node->data()) - urma_detail::kHeaderSize;
-        auto pin = UrmaInit::lookupSegment(header, payload + urma_detail::kHeaderSize);
-        if (pin) {
+        auto* segment = segmentFor(*node, header, payload + urma_detail::kHeaderSize, 0);
+        if (segment) {
           packet = header;
           sges[0].addr = reinterpret_cast<uint64_t>(packet);
-          sges[0].tseg = pin.segment();
-          work->pins[0] = std::move(pin);
+          sges[0].tseg = segment;
           direct = true;
         }
       }
       if (!direct) {
-        io::Cursor cursor(node);
+        struct SendCursor : io::Cursor {
+          using io::Cursor::Cursor;
+          const IOBuf& buffer() const { return *crtBuf_; }
+        };
+        SendCursor cursor(node);
         cursor.skip(work->offset);
         size_t remaining = payload;
         while (remaining && count < config.max_send_sge) {
           auto bytes = cursor.peekBytes();
           const size_t n = std::min(remaining, bytes.size());
-          auto pin = UrmaInit::lookupSegment(bytes.data(), n);
-          if (!pin) break;
-          work->pins[count - 1] = std::move(pin);
+          auto* segment = segmentFor(cursor.buffer(), bytes.data(), n, count - 1);
+          if (!segment) break;
           sges[count].addr = reinterpret_cast<uint64_t>(bytes.data());
           sges[count].len = n;
-          sges[count].tseg = work->pins[count - 1].segment();
+          sges[count].tseg = segment;
           ++count;
           cursor.skip(n);
           remaining -= n;

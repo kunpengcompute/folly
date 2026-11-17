@@ -51,6 +51,7 @@ struct MemoryPin {
   urma_target_seg_t* segment{nullptr};
   uint64_t id{0};
   virtual ~MemoryPin() = default;
+  virtual bool reusable(const void* owner) const noexcept = 0;
 };
 struct MemoryPool::State : std::enable_shared_from_this<State> {
   static constexpr size_t unused = std::numeric_limits<size_t>::max();
@@ -70,7 +71,8 @@ struct MemoryPool::State : std::enable_shared_from_this<State> {
     void* base{nullptr};
     urma_target_seg_t* segment{nullptr};
     std::map<size_t, Block> blocks;
-    bool initial{false}, building{true}, retiring{false};
+    bool initial{false}, building{true};
+    std::atomic<bool> retiring{false};
     int error{0};
     Clock::time_point idle{Clock::now()}, retry{};
     bool busy() const { return holds || activeBlocks; }
@@ -92,7 +94,8 @@ struct MemoryPool::State : std::enable_shared_from_this<State> {
   std::thread worker;
   size_t requestedLarge{0};
   size_t registered{0}, reserved{0}, nextId{1};
-  bool stopping{false}, done{false};
+  std::atomic<bool> stopping{false};
+  bool done{false};
   UrmaPoolStats counters;
   Clock::time_point growthRetry{}, cacheTrim{};
   void notify() noexcept {
@@ -253,6 +256,11 @@ struct MemoryPool::State : std::enable_shared_from_this<State> {
       Pin(std::shared_ptr<State> s, std::shared_ptr<Region> r, Block* b,
           size_t k)
           : state(std::move(s)), region(std::move(r)), block(b), kind(k) {}
+      bool reusable(const void* owner) const noexcept override {
+        return state.get() == owner &&
+            !state->stopping.load(std::memory_order_acquire) &&
+            !region->retiring.load(std::memory_order_acquire);
+      }
       ~Pin() override {
         std::lock_guard<std::mutex> lock(state->mutex);
         bool returnedBlock = false;
@@ -617,12 +625,13 @@ void MemoryPool::setCached(const UrmaPoolBuffer& buffer, bool cached) {
     }
 }
 bool MemoryPool::reusable(const UrmaPoolBuffer& buffer, bool recycle) const {
+  if (!recycle)
+    return buffer.pin_ && buffer.pin_->reusable(state_.get());
   std::lock_guard<std::mutex> lock(state_->mutex);
   if (!state_->stopping)
     for (auto& r : state_->regions)
       if (r->id == buffer.regionId() && r->segment == buffer.segment()) {
         if (r->retiring) return false;
-        if (!recycle) return true;
         const auto offset = static_cast<const char*>(buffer.data()) -
                             static_cast<const char*>(r->base);
         auto it = r->blocks.find(offset);

@@ -705,6 +705,16 @@ void bufferPressureCases() {
       first.loopOnce(EVLOOP_NONBLOCK);
     require(sender.wakes && !a.snapshot().waiting, "returned capacity did not wake control waiter");
     const auto allocated = UrmaInit::poolStats().allocated_bytes;
+    // A fresh TLS block still needs heap metadata; existing slices do not.
+    bool metadataFailed = false;
+    auto failed = a.reserve(id, true);
+    failNextAllocation = true;
+    try { (void)a.buffer(failed, 24, true); }
+    catch (const std::bad_alloc&) { metadataFailed = true; }
+    failNextAllocation = false;
+    a.cancel(failed);
+    require(metadataFailed && UrmaInit::poolStats().allocated_bytes == allocated,
+            "control metadata failure was hidden or leaked a pool block");
     control = a.reserve(id, true);
     auto* one = a.buffer(control, 24, true);
     auto other = a.reserve(id, true);
@@ -713,14 +723,6 @@ void bufferPressureCases() {
                 UrmaInit::poolStats().allocated_bytes == allocated + 4096 &&
                 UrmaInit::poolStats().tls_retained_bytes == 4096,
             "small control messages did not share one registered TLS block");
-    bool metadataFailed = false;
-    auto failed = a.reserve(id, true);
-    failNextAllocation = true;
-    try { (void)a.buffer(failed, 24, true); }
-    catch (const std::bad_alloc&) { metadataFailed = true; }
-    failNextAllocation = false;
-    a.cancel(failed);
-    require(metadataFailed, "control metadata failure was treated as pool pressure");
     // A known-unaccepted WR releases its slice; a retry gets valid storage.
     urma_detail::encodeHeader(one, {urma_detail::PacketKind::Free, target, 1});
     sg.addr = reinterpret_cast<uint64_t>(one);
@@ -1702,6 +1704,44 @@ int main(int argc, char** argv) {
       spin([&] { return ordered.received == 1000 && ordered.completed == 1; });
       require(static_cast<UrmaAsyncSocket*>(ordered.socket.get())->getUrmaStats().directSendBytes
                   == directBefore.directSendBytes + 1000, "in-place SEND copied payload");
+
+      stage = "owned SEND survives close until late TX completion";
+      {
+        const auto accepted = acceptor.connections.size();
+        Echo pending(UrmaAsyncSocket::newSocket(&evb, address), false);
+        pending.allowWriteError = pending.allowReadError = true;
+        spin([&] { return acceptor.connections.size() == accepted + 1 &&
+            static_cast<UrmaAsyncSocket*>(pending.socket.get())->isUrmaReady(); });
+        auto source = UrmaInit::createPoolBuffer(1024);
+        require(bool(source), "owned SEND source allocation");
+        source->advance(urma_detail::kHeaderSize);
+        source->append(1000);
+        std::memset(source->writableData(), 's', 1000);
+        auto* addressInFlight = source->data();
+        pending.socket->writeChain(&pending, std::move(source));
+        Completions late;
+        for (auto& q : ready)
+          for (auto it = q.second.begin(); it != q.second.end();)
+            if (!it->flag.bs.s_r && it->user_ctx == lastCompletionContext) {
+              late.emplace_back(q.first, *it);
+              it = q.second.erase(it);
+            } else ++it;
+        require(late.size() == 1 && !pending.completed, "SEND completed before held CQE");
+        pending.socket->closeNow();
+        acceptor.connections.back()->socket->closeNow();
+        owner.poll();
+        require(!pending.completed && pending.writeErrors == 1 &&
+                    bool(UrmaInit::lookupSegment(addressInFlight, 1000)),
+                "close released owned SEND before DMA completion");
+        for (size_t i = 0; i < 1000; ++i)
+          require(addressInFlight[i] == 's', "close overwrote in-flight SEND storage");
+        completeHeld(late);
+        owner.poll();
+        require(!UrmaInit::lookupSegment(addressInFlight, 1000) &&
+                    !pending.completed && pending.writeErrors == 1,
+                "late SEND completion retained its IOBuf or repeated the callback");
+        acceptor.connections.pop_back();
+      }
 
       ordered.expected.assign(5000, 'r');
       ordered.received = ordered.completed = 0;

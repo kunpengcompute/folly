@@ -29,6 +29,17 @@ std::atomic<bool> poolIOBufEnabled{false};
 // Keep unresolved registrations alive even during static destruction.
 folly::Indestructible<std::shared_ptr<urma_detail::MemoryPool>> memoryPool;
 folly::Indestructible<std::shared_ptr<urma_detail::MemoryPool>> publishedPool;
+std::atomic<uint64_t> poolEpoch{1};
+const std::shared_ptr<urma_detail::MemoryPool>& ioBufPool() {
+  static thread_local uint64_t epoch = 0;
+  static thread_local std::shared_ptr<urma_detail::MemoryPool> pool;
+  const auto current = poolEpoch.load(std::memory_order_acquire);
+  if (epoch != current) {
+    pool = std::atomic_load(&*publishedPool);
+    epoch = current;
+  }
+  return pool;
+}
 bool shutdownRequested = false;
 struct PoolContextCleanup final : urma_detail::CleanupTask {
   bool tryCleanup() noexcept override {
@@ -37,6 +48,7 @@ struct PoolContextCleanup final : urma_detail::CleanupTask {
     if (owners) return failed("wait-pool-context-owners", 0);
     std::atomic_store(&*publishedPool,
                       std::shared_ptr<urma_detail::MemoryPool>{});
+    poolEpoch.fetch_add(1, std::memory_order_release);
     poolIOBufEnabled.store(false, std::memory_order_release);
     if (*memoryPool) {
       if (!(*memoryPool)->shutdown(std::chrono::milliseconds(0)))
@@ -181,6 +193,7 @@ void UrmaInit::init(const UrmaConfig& requested) {
     if (!(*memoryPool)->warm(std::chrono::seconds(5)))
       throw std::runtime_error("URMA soft capacity unavailable at startup");
     std::atomic_store(&*publishedPool, *memoryPool);
+    poolEpoch.fetch_add(1, std::memory_order_release);
     poolIOBufEnabled.store(
         settings.registered_pool.enabled && settings.registered_pool.zero_copy,
         std::memory_order_release);
@@ -315,7 +328,7 @@ void UrmaInit::freePoolBuffer(void*, void* p) {
 }
 std::unique_ptr<IOBuf> UrmaInit::createPoolSlice(
     size_t size, UrmaPoolSignal* waiter) {
-  auto pool = std::atomic_load(&*publishedPool);
+  const auto& pool = ioBufPool();
   return pool ? IoBufPool::createFromPoolShared(
                     pool, std::max(size, size_t(1)), waiter) : nullptr;
 }
@@ -327,7 +340,7 @@ std::unique_ptr<IOBuf> UrmaInit::tryCreateIOBuf(size_t size) {
   auto reset = makeGuard([&] { active = false; });
   // The synchronous caller owns retry policy. Never block completion/reclaim
   // on an EventBase or disguise a pool miss as successful heap allocation.
-  auto pool = std::atomic_load(&*publishedPool);
+  const auto& pool = ioBufPool();
   auto result = pool ? IoBufPool::createFromPoolShared(pool, std::max(size, size_t(1))) : nullptr;
   if (!result) throw std::bad_alloc();
   return result;
@@ -335,6 +348,11 @@ std::unique_ptr<IOBuf> UrmaInit::tryCreateIOBuf(size_t size) {
 bool UrmaInit::ownsPoolBuffer(const IOBuf& buffer) {
   return (buffer.isManagedOne() && buffer.getFreeFn() == UrmaInit::freePoolBuffer) ||
          IoBufPool::owns(buffer);
+}
+urma_target_seg_t* UrmaInit::poolSegment(const IOBuf& buffer) {
+  if (buffer.isManagedOne() && buffer.getFreeFn() == UrmaInit::freePoolBuffer)
+    return static_cast<UrmaPoolBuffer*>(buffer.getUserData())->segment();
+  return IoBufPool::segment(buffer);
 }
 std::unique_ptr<IOBuf> UrmaInit::takePoolBuffer(UrmaPoolBuffer buffer,
                                                 size_t length) {

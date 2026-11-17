@@ -10,6 +10,8 @@
 #include <limits>
 #include <mutex>
 #include <vector>
+#include <boost/intrusive_ptr.hpp>
+#include <boost/smart_ptr/intrusive_ref_counter.hpp>
 namespace folly {
 namespace {
 // These bytes are local metadata, never a transport prefix. All offsets below
@@ -26,7 +28,7 @@ struct alignas(std::max_align_t) BlockLayout {
     return pad <= remaining && bytes <= remaining - pad;
   }
 };
-struct IoBufBlock {
+struct IoBufBlock : boost::intrusive_ref_counter<IoBufBlock> {
   std::shared_ptr<urma_detail::MemoryPool> pool;
   UrmaPoolBuffer storage;
   BlockLayout* layout;
@@ -40,12 +42,12 @@ struct IoBufBlock {
   }
 };
 void freeSlice(void*, void* cookie) noexcept {
-  delete static_cast<std::shared_ptr<IoBufBlock>*>(cookie);
+  intrusive_ptr_release(static_cast<IoBufBlock*>(cookie));
 }
 struct TLSBlockCache {
   std::mutex mutex;
   std::shared_ptr<urma_detail::MemoryPool> pool;
-  std::array<std::shared_ptr<IoBufBlock>, 16> blocks{};
+  std::array<boost::intrusive_ptr<IoBufBlock>, 16> blocks{};
   size_t current{0};
   explicit TLSBlockCache(std::shared_ptr<urma_detail::MemoryPool> p)
       : pool(std::move(p)) {}
@@ -99,7 +101,7 @@ std::unique_ptr<IOBuf> IoBufPool::createFromPoolShared(
   if (!block && cacheable) {
     for (size_t i = 0; i < limit; ++i) {
       auto& b = cache.blocks[i];
-      if (b && b.use_count() == 1 && b->layout->capacity >= capacity &&
+      if (b && b->use_count() == 1 && b->layout->capacity >= capacity &&
           pool->reusable(b->storage, true)) {
         b->layout->used = 0;
         block = b;
@@ -115,12 +117,12 @@ std::unique_ptr<IOBuf> IoBufPool::createFromPoolShared(
     if (!storage) {
       // A miss is not proof of physical exhaustion: release reusable TLS first.
       for (size_t i = 0; i < limit; ++i)
-        if (cache.blocks[i] && cache.blocks[i].use_count() == 1) cache.drop(i);
+        if (cache.blocks[i] && cache.blocks[i]->use_count() == 1) cache.drop(i);
       reclaim(pool->identity(), false);  // current cache is locked and skipped
       storage = pool->allocate(bytes, waiter);
     }
     if (!storage) return nullptr;
-    block = std::make_shared<IoBufBlock>(pool, std::move(storage));
+    block = boost::intrusive_ptr<IoBufBlock>(new IoBufBlock(pool, std::move(storage)));
     if (limit && cacheable) {
       cache.current = (cache.current + 1) % limit;
       cache.drop(cache.current);
@@ -128,19 +130,20 @@ std::unique_ptr<IOBuf> IoBufPool::createFromPoolShared(
       pool->setCached(block->storage, true);
     }
   }
-  auto cookie = std::make_unique<std::shared_ptr<IoBufBlock>>(block);
   const auto offset = block->layout->used + block->layout->padding();
   // Reserve this non-overlapping slice even if IOBuf metadata allocation fails.
   block->layout->used = offset + capacity;
+  // takeOwnership invokes freeSlice on failure as well as on final release.
+  intrusive_ptr_add_ref(block.get());
   return IOBuf::takeOwnership(block->payload() + offset, capacity, 0, freeSlice,
-                              cookie.release());
+                              block.get());
 }
 bool IoBufPool::owns(const IOBuf& b) noexcept {
   return b.isManagedOne() && b.getFreeFn() == freeSlice;
 }
 urma_target_seg_t* IoBufPool::segment(const IOBuf& b) noexcept {
   if (!owns(b)) return nullptr;
-  return (*static_cast<std::shared_ptr<IoBufBlock>*>(b.getUserData()))->storage.segment();
+  return static_cast<IoBufBlock*>(b.getUserData())->storage.segment();
 }
 void IoBufPool::reclaim(const void* identity, bool all) noexcept {
   auto& r = registry();
@@ -152,7 +155,7 @@ void IoBufPool::reclaim(const void* identity, bool all) noexcept {
     std::unique_lock<std::mutex> held(cache->mutex, std::try_to_lock);
     if (!held) continue;
     for (size_t i = 0; i < cache->blocks.size(); ++i)
-      if (cache->blocks[i] && (all || cache->blocks[i].use_count() == 1))
+      if (cache->blocks[i] && (all || cache->blocks[i]->use_count() == 1))
         cache->drop(i);
   }
 }

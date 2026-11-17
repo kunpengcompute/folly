@@ -65,6 +65,8 @@ class UrmaInit {
   static bool poolIOBufAllocationEnabled();
   static void freePoolBuffer(void*, void*);
   static bool ownsPoolBuffer(const IOBuf& buffer);
+  // Borrowed registration, valid while the owning IOBuf (or clone) is retained.
+  static urma_target_seg_t* poolSegment(const IOBuf& buffer);
   // Retains the allocation until the last IOBuf/clone is destroyed. Capacity
   // is the whole block; length alone identifies the initialized bytes.
   static std::unique_ptr<IOBuf> takePoolBuffer(UrmaPoolBuffer buffer,

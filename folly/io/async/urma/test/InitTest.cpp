@@ -274,6 +274,17 @@ int main() {
     folly::UrmaInit::fini();
     require(!folly::UrmaInit::isInitialized(), "strict IOBuf test leaked pool");
     std::cout << "PASS registered create/reserve/unshare/coalesce, explicit exhaustion and retry\n";
+    // The same producer thread must stop using a retired pool after reinit.
+    for (int round = 0; round < 3; ++round) {
+      folly::UrmaInit::init(config);
+      auto buffer = folly::IOBuf::create(64);
+      require(folly::UrmaInit::ownsPoolBuffer(*buffer) &&
+                  bool(folly::UrmaInit::lookupSegment(buffer->buffer(), buffer->capacity())),
+              "reinitialized producer used a stale or unregistered pool");
+      buffer.reset();
+      folly::UrmaInit::fini();
+      require(!folly::UrmaInit::isInitialized(), "reinitialized TLS retained registration");
+    }
     reset();
     failPoolRegistration = true;
     bool registrationRejected = false;
