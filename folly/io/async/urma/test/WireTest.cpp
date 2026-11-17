@@ -125,7 +125,7 @@ int main() {
   end = encodeEnd(0);
   require(!decodeEnd(end.data(), end.size(), boundary));
   encodeHello(hello.data(), local);
-  store16(hello.data() + 6, 7);
+  store16(hello.data() + 6, 0);
   require(!decodeHello(hello.data(), hello.size(), decoded));
   std::cout
       << "PASS H24/PULL40/FREE24/SEGMENT64/READY24 and HELLO102: exact wire, full uint64 IDs, versions, READ ranges\n";

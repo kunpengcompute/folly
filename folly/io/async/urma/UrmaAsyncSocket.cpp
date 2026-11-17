@@ -898,7 +898,7 @@ struct UrmaAsyncSocket::Impl final : AsyncSocket::ConnectCallback,
         (receiveEnd && h.sequence >= receiveEnd)) return true;
     size_t length = bytes;
     if (h.kind == SendKind::Pull) {
-      if (c.opcode != URMA_CR_OPC_SEND_WITH_IMM || !peerRead || bytes != 16 ||
+      if (c.opcode != URMA_CR_OPC_SEND || !peerRead || bytes != 16 ||
           load32(payload + 4)) return true;
       length = load32(payload);
       if (!findReadSegment(urma_detail::load64(payload + 8), length)) return true;
@@ -937,7 +937,7 @@ struct UrmaAsyncSocket::Impl final : AsyncSocket::ConnectCallback,
     } else {
       size_t length = data->length();
       if (h.kind == Kind::Pull) {
-        if (c.opcode != URMA_CR_OPC_SEND_WITH_IMM || !peerRead || length != 16 ||
+        if (c.opcode != URMA_CR_OPC_SEND || !peerRead || length != 16 ||
             load32(data->data() + 4)) {
           fail("invalid URMA PULL40");
           return;
@@ -1120,7 +1120,8 @@ struct UrmaAsyncSocket::Impl final : AsyncSocket::ConnectCallback,
     urma_detail::encodeHeader(packet, {work->kind, peerSocketId, work->sequence});
     urma_jfs_wr_t wr{};
     wr.opcode =
-        (work->kind == SendKind::Data || work->kind == SendKind::Segment)
+        (work->kind == SendKind::Data || work->kind == SendKind::Pull ||
+         work->kind == SendKind::Segment)
             ? URMA_OPC_SEND : URMA_OPC_SEND_IMM;
     wr.tjetty = UrmaIoContext::handle(work->resources->peer);
     wr.flag.bs.place_order = URMA_STRONG_ORDER;

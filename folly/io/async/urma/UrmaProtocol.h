@@ -11,8 +11,8 @@ constexpr size_t kHeaderSize = 24;
 constexpr size_t kPullSize = 40;
 constexpr size_t kHelloSize = 102;
 constexpr size_t kSegmentSize = 40;
-constexpr uint16_t kHelloVersion = 8;
-constexpr uint8_t kWireVersion = 5;
+constexpr uint16_t kHelloVersion = 1;
+constexpr uint8_t kWireVersion = 1;
 constexpr uint32_t kMagic = 0x55524d41;
 enum class PacketKind : uint8_t {
   Data = 0, Pull = 1, Free = 2, Segment = 3, SegmentReady = 4,

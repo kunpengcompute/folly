@@ -69,7 +69,7 @@ extern "C" urma_status_t urma_query_device(urma_device_t* d,urma_device_attr_t* 
 extern "C" urma_status_t urma_post_jfs_wr(urma_jfs_t* j,urma_jfs_wr_t* w,urma_jfs_wr_t** b){
   bool read=w->opcode==URMA_OPC_READ;
   auto* packet = read ? nullptr : reinterpret_cast<unsigned char*>(w->send.src.sge[0].addr);
-  bool pull=w->opcode==URMA_OPC_SEND_IMM&&packet[6]==uint8_t(folly::urma_detail::PacketKind::Pull);
+  bool pull=w->opcode==URMA_OPC_SEND&&packet[6]==uint8_t(folly::urma_detail::PacketKind::Pull);
   bool free=w->opcode==URMA_OPC_SEND_IMM&&packet[6]==uint8_t(folly::urma_detail::PacketKind::Free);
   bool revoke=!read&&packet[6]==uint8_t(folly::urma_detail::PacketKind::SegmentRevoke);
   bool ack=!read&&packet[6]==uint8_t(folly::urma_detail::PacketKind::SegmentRevoked);

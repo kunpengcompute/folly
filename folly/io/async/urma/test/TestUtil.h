@@ -295,9 +295,9 @@ static urma_status_t postOne(
       }
       if (pull) {
         require(
-            sg.len == 40 && wr->opcode == URMA_OPC_SEND_IMM &&
+            sg.len == 40 && wr->opcode == URMA_OPC_SEND &&
                 !wr->send.imm_data && folly::urma_detail::load64(packet + 32),
-            "PULL40 must carry its address in the registered payload");
+            "PULL40 must use SEND with its address in the registered payload");
         ++checkedPulls;
       }
       if (header.kind == Kind::Free) {
