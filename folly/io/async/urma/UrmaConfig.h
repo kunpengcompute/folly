@@ -25,11 +25,12 @@ struct UrmaConfig {
   uint32_t read_window{1024};
   // Maximum unacknowledged READ descriptions on one connection.
   uint32_t offer_window{1024};
-  // Bound queued data without reserving this amount up front. Covers ten
-  // outstanding 8 MiB RPCs, including framing, for existing benchmark callers.
+  // Per-connection admission/receive bounds, not an up-front reservation.
   uint32_t max_pending_bytes{128 * 1024 * 1024};
   UrmaPoolConfig registered_pool;
 };
+// Shared by JSON overlays and direct C++ initialization, before SDK calls.
+void validateUrmaConfig(const UrmaConfig& config);
 // Load a strict JSON overlay; absent fields retain base values. Throws on
 // errors.
 UrmaConfig loadUrmaConfigFile(const std::string& path,

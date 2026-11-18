@@ -428,8 +428,11 @@ void MemoryPool::validate(const UrmaPoolConfig& c) {
   if (!c.enabled) return;
   const auto page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
   const size_t hard = c.pool_max_size ? c.pool_max_size : c.pool_size;
-  if (!page || !c.pool_size || c.pool_size % page || hard % page ||
-      c.pool_size > hard || !c.region_bytes || c.region_bytes % page ||
+  if (!page || !c.pool_size || c.pool_size % page)
+    throw std::invalid_argument("registered_pool.pool_size must be positive and page-aligned");
+  if (hard < c.pool_size || hard % page)
+    throw std::invalid_argument("registered_pool.pool_max_size must be page-aligned and >= pool_size (0 uses pool_size)");
+  if (!c.region_bytes || c.region_bytes % page ||
       c.classes.empty() || c.classes.size() > 64 || !c.retry_ms || !c.idle_ms ||
       c.tls_cache_blocks > 16 || c.tls_block_size < 4096)
     throw std::invalid_argument(

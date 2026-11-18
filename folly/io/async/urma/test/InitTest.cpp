@@ -20,6 +20,7 @@ Failure failure = Failure::None;
 bool borrowedLibrary = false;
 int initializes = 0, finalizes = 0, devices = 0, eids = 0, contexts = 0;
 uint32_t deviceSendSges = 4;
+uint32_t deviceRxDepth = 4096, deviceTxDepth = 4096, deviceCqDepth = 8193;
 urma_device_t device{};
 urma_device_t* deviceList[]{&device};
 urma_eid_info_t eid{};
@@ -98,10 +99,10 @@ urma_status_t urma_query_device(urma_device_t*, urma_device_attr_t* attr) {
   }
   *attr = {};
   attr->dev_cap.trans_mode = URMA_TM_RM;
-  attr->dev_cap.max_jfr_depth = 4096;
-  attr->dev_cap.max_jfs_depth = 4096;
+  attr->dev_cap.max_jfr_depth = deviceRxDepth;
+  attr->dev_cap.max_jfs_depth = deviceTxDepth;
   attr->dev_cap.max_jfs_sge = deviceSendSges;
-  attr->dev_cap.max_jfc_depth = 8193;
+  attr->dev_cap.max_jfc_depth = deviceCqDepth;
   attr->dev_cap.max_msg_size = 65536;
   attr->dev_cap.max_read_size = 1024 * 1024;
   return URMA_SUCCESS;
@@ -243,6 +244,30 @@ int main() {
     }
     deviceSendSges = 4;
     std::cout << "PASS device SEND SGE limits, explicit caps and rollback\n";
+    deviceCqDepth = 2305;
+    reset();
+    folly::UrmaInit::init(config);
+    require(folly::UrmaInit::getConfig().rx_depth == 1280,
+            "automatic RX ignored shared CQ capacity");
+    folly::UrmaInit::fini();
+    for (int stage = 0; stage < 3; ++stage) {
+      auto requested = config;
+      if (stage == 0) requested.rx_depth = 2000;
+      if (stage == 1) deviceRxDepth = 128;
+      if (stage == 2) deviceTxDepth = 512;
+      reset();
+      bool rejected = false;
+      try { folly::UrmaInit::init(requested); }
+      catch (const std::invalid_argument& e) {
+        const char* field = stage == 0 ? "rx_depth" : stage == 1 ? "rx_target" : "tx_depth";
+        rejected = std::string(e.what()).find(field) != std::string::npos;
+      }
+      require(rejected && !devices && !contexts && finalizes == 1,
+              "device limit rejection was silent or leaked SDK resources");
+      deviceRxDepth = deviceTxDepth = 4096;
+    }
+    deviceCqDepth = 8193;
+    std::cout << "PASS automatic CQ sizing, explicit device limits and rollback\n";
     reset();
     folly::UrmaInit::init(config);
     {

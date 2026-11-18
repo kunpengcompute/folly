@@ -1,31 +1,71 @@
 # URMA 传输
 
-小包使用 SEND/RECV，大包使用 READ。TCP 负责握手、连接状态和结束序号。
+URMA 通过 TCP 建链，小包使用 SEND/RECV，大包使用 READ。接收端按发送顺序交付数据。
 
-## 注册内存
+## 配置
 
-`UrmaInit` 初始化进程注册池，默认 256 MiB，按需扩容至 512 MiB。IOBuf 使用池内存切片；RX 和 READ 目标持有独占块，最后一个引用释放后归还。外部堆缓冲通过注册池复制发送。各用途共用容量，超过最大档位的申请按页对齐切分空闲段。开启池化 IOBuf 后，分配和扩容只返回注册内存；同步分配不足抛出 `std::bad_alloc`，socket 内部异步等待归还或扩容。
+构建 Folly 时启用 `FOLLY_USE_URMA=ON`。应用通过 `UrmaConfig` 配置传输。也可以将 `FOLLY_URMA_CONFIG` 指向 [urma.json](urma.json)，文件中的字段会在 `UrmaInit::init()` 时覆盖对应的 C++ 配置。未知字段、重复字段或值不合法会导致初始化失败。
 
-增长段通过 `holdSegment()` 保留租约，`revocableSegments()` 列出已排空的撤销候选；全部租约释放后才注销。`SegmentState` 管理段通告、导入和撤销状态。
+| 字段 | 默认值 | 取值与用途 |
+|---|---:|---|
+| `dev_name` | 由应用指定 | URMA 设备名。fbthrift 服务端须指定设备。 |
+| `rx_depth` | 0 | 每个 EventBase 的接收队列（JFR）最多可容纳的接收请求数。0 表示自动选择。手动设置时可填 1–65536，超过设备可用深度会导致初始化失败。 |
+| `rx_target` | 256 | 每个 EventBase 预投的接收缓冲块数，取值为 1 至实际接收队列深度。每块默认 4 KiB。 |
+| `tx_depth` | 1024 | 每个 EventBase 的发送队列深度，取值为 1–4096，且不能超过设备支持的深度。 |
+| `handshake_timeout_ms` | 5000 | 建链超时，1–60000 毫秒。客户端从发起 TCP 连接计时，服务端从识别协议计时。 |
+| `max_pending_bytes` | 134217728 | 每连接的积压上限，按默认缓冲大小可设为 4096–4294967295 字节。发送和接收分别计限，须容纳单次完整写入。 |
+| `registered_pool.pool_size` | 268435456 | 初始注册池容量，单位为字节，取页大小的正整数倍。 |
+| `registered_pool.pool_max_size` | 536870912 | 注册池容量上限，按页对齐且不小于初始容量。0 表示使用初始容量作为上限。默认配置下，有效上限至少为 16 KiB。 |
 
-TLS 只缓存含切片元数据后不超过 `tls_block_size` 的申请，默认每线程最多保留两个 16 KiB 块；自定义大小按池档位取整。大块不进入 TLS 缓存，IOBuf、DMA 和远端 READ 的有效引用结束后归还公共池。
+使用默认配置（`rx_depth=0`、`rx_target=256`）时，库根据设备能力和发送队列深度确定接收队列容量，每个 EventBase 预投 256 块接收缓冲。收发共用的完成队列（JFC）由库自动创建，无需配置其深度。
 
-## 共享队列
+## 内存与收发
 
-每个 EventBase 一套 JFS/JFR，TX/RX 共用 JFC/JFCE。连接表、SQ 槽位和等待队列由所属线程管理。TX 完成上下文持有 WR 资源，RX 按连接 ID 路由。CQ 读至空，RX 逐个补投，FREE 优先；资源暂时不足时等待并重试。
+注册池由进程内所有连接共享。启用池化的 IOBuf 后，同步分配无法满足时抛出 `std::bad_alloc`。已被 socket 接纳的写入会等待内存归还或扩容。外部传入的普通堆缓冲需要复制到注册内存。
 
-默认 JFS 深度 1024，JFR 深度取设备上限，`rx_target=256` 控制每个 EventBase 的预投块数。TX 缓冲按需申请，控制消息复用注册 IOBuf/TLS 切片，由槽位持有到完成或成功销毁 JFS。满池时 FREE 也可等待，未获远端确认的内存继续保留。JFR 槽及时补投；RX 内存受注册池总上限约束。
+同一 EventBase 上的连接共用一套发送和接收队列。大消息可拆成多个并发 READ，单次大小受设备、双方协商和内存池档位限制。收到 EOF 前会先交付已完整接收的数据。关闭连接后，仍在被本地硬件或对端使用的内存会保留到访问结束。
 
-发送入队同时限制数据长度、持有容量和写任务数量，沿用 `max_pending_bytes`。已接纳的工作等待资源通知恢复；未设置发送超时时，无写进展的默认期限为 30 秒。同步序列化分配失败交给调用方处理，不自动重放请求；元数据分配失败不作为池容量不足重试。
+## 用 Folly 收发一条消息
 
-## 数据顺序与关闭
+[EchoTest.cpp](test/EchoTest.cpp) 是一个只使用 Folly 公开接口的双机示例。客户端发送 `ping`，服务端原样回复，客户端逐字节核对后关闭连接。
 
-DATA 携带数据，PULL 使用普通 SEND，正文携带完整源地址和长度，FREE 释放远端读取责任。READ 可链式提交，每条 WR 产生 CQE；多个 READ 并发完成，由软件按业务序号交付。部分提交只重试未接受的后缀。单次 READ 以最大档位（默认 16 MiB）封顶，并受硬件、协商和可分配容量限制；更大消息拆成多个 READ，注册源块按偏移直接引用。源端待确认 READ 在进程内最多 65536 项，目的端 READ/FREE 在每个 EventBase 最多 1024 项，约束上下文数量而非用途内存额度。HELLO 格式和数据协议版本均为 1。
+两端分别在创建 socket 前初始化一次。C++ 配置类型是 `folly::UrmaConfig`。下面的 `deviceName` 是本机的 URMA 设备名。
 
-TCP FIN 前发送最终序号，接收端交付完整前缀后报告 EOF。关闭后继续处理在途 WR、FREE 和段撤销；未获远端释放确认的源块和段租约继续持有。
+```cpp
+folly::UrmaConfig config;
+config.dev_name = deviceName;
+folly::UrmaInit::init(config);
+```
 
-## 配置与测试
+要从文件配置，可在启动进程前设置 `FOLLY_URMA_CONFIG`。例如，将 `{"rx_target": 128}` 保存为 `urma.json`，再执行 `export FOLLY_URMA_CONFIG="$PWD/urma.json"`。同一段初始化代码就会使用 128 块预投缓冲，设备名仍取自 `config.dev_name`。两台机器分别读取各自的文件。
 
-应用可构造 `UrmaConfig` 或调用 `loadUrmaConfigFile()`，配置示例见 `urma.json`。
+服务端使用 `AsyncServerSocket` 监听 TCP 端口，在 `connectionAccepted()` 中将已接受的 `AsyncSocket` 移交给 `UrmaAsyncSocket`。客户端调用 `UrmaAsyncSocket::newSocket(&evb, address)`。两端用 `setReadCB()` 接收数据，用 `write()` 或 `writeChain()` 发送，由 `EventBase` 推进握手和收发。回调对象需活到操作结束，socket 和 EventBase 销毁后调用 `UrmaInit::fini()`。
 
-启用 `FOLLY_BUILD_URMA_TESTS`，运行 `ctest -L URMA --output-on-failure`。双机收发入口为 `UrmaCoalescingTest` 和 `UrmaReadTest`，参数见 `--help`。
+在装好 URMA SDK 的编译机上，从 Folly 仓库根目录构建示例。
+
+```bash
+cmake -S . -B build -DBUILD_SHARED_LIBS=ON -DFOLLY_USE_URMA=ON -DFOLLY_BUILD_URMA_TESTS=ON
+cmake --build build --target UrmaEchoTest
+```
+
+示例程序生成在 `build/folly/io/async/urma/test/UrmaEchoTest`。
+
+将 `UrmaEchoTest` 和它依赖的共享库部署到两端。下面用 `192.0.2.10` 代表服务端地址，启动时替换为实际地址和各自的设备名。在可执行文件所在目录，先启动服务端。
+
+```bash
+./UrmaEchoTest server 192.0.2.10 32181 udmac1d1e2
+```
+
+看到 `LISTEN` 后，在客户端运行。成功时两端分别输出 `PASS server` 和 `PASS client`。
+
+```bash
+./UrmaEchoTest client 192.0.2.10 32181 udmac1d1e2
+```
+
+## 单元测试
+
+使用相同的 CMake 选项编译测试，在构建目录运行。
+
+```bash
+ctest -L URMA --output-on-failure
+```

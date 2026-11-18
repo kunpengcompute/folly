@@ -422,25 +422,67 @@ int main(int argc, char** argv) {
                             "fc_max_water", "rx_spare_blocks",
                             "io_free_rx_reserve", "credit_target",
                             "credit_refill_low", "credit_grant_cap",
-                            "idle_timeout_ms", "owner_pending_bytes"}) {
+                            "idle_timeout_ms", "owner_pending_bytes", "version",
+                            "buffer_size", "enable_read", "read_threshold",
+                            "read_window", "offer_window", "max_send_sge"}) {
       std::ofstream out(path);
-      out << "{\"version\":3,\"" << key << "\":1}";
+      out << "{\"" << key << "\":1}";
       out.close();
       bool rejected = false;
       try { (void)loadUrmaConfigFile(path, base); }
       catch (const std::invalid_argument&) { rejected = true; }
       check(rejected, "removed shared/credit configuration was accepted");
     }
-    for (const char* pool : {"{\"budgets\":{}}",
+    for (const char* pool : {"{\"budgets\":{}}", "{\"tls_block_size\":4096}",
+                             "{\"tls_cache_blocks\":0}", "{\"zero_copy\":false}",
                              "{\"classes\":[{\"bytes\":4096,\"reserve\":{}}]}"}) {
       std::ofstream out(path);
-      out << "{\"version\":3,\"registered_pool\":" << pool << "}";
+      out << "{\"registered_pool\":" << pool << "}";
       out.close();
       bool rejected = false;
       try { (void)loadUrmaConfigFile(path, base); }
       catch (const std::invalid_argument&) { rejected = true; }
       check(rejected, "obsolete purpose isolation accepted");
     }
+    struct BadNumber { const char* name; uint32_t UrmaConfig::*member; uint32_t value; };
+    for (auto bad : {BadNumber{"rx_depth", &UrmaConfig::rx_depth, 65537},
+                     BadNumber{"rx_target", &UrmaConfig::rx_target, 0},
+                     BadNumber{"tx_depth", &UrmaConfig::tx_depth, 0},
+                     BadNumber{"tx_depth", &UrmaConfig::tx_depth, 4097},
+                     BadNumber{"handshake_timeout_ms", &UrmaConfig::handshake_timeout_ms, 0},
+                     BadNumber{"handshake_timeout_ms", &UrmaConfig::handshake_timeout_ms, 60001},
+                     BadNumber{"max_pending_bytes", &UrmaConfig::max_pending_bytes, 4095}}) {
+      auto direct = base;
+      direct.*bad.member = bad.value;
+      auto rejects = [&](auto action) {
+        try { action(); } catch (const std::invalid_argument& e) {
+          return std::string(e.what()).find(bad.name) != std::string::npos;
+        }
+        return false;
+      };
+      check(rejects([&] { validateUrmaConfig(direct); }), "C++ invalid field not diagnosed");
+      std::ofstream out(path);
+      out << "{\"" << bad.name << "\":" << bad.value << "}";
+      out.close();
+      check(rejects([&] { loadUrmaConfigFile(path, base); }), "JSON/C++ validation differs");
+    }
+    for (const char* json : {"{\"rx_depth\":4,\"rx_target\":5}",
+                             "{\"tx_depth\":1,\"tx_depth\":2}",
+                             "{\"tx_depth\":1.5}", "{\"tx_depth\":true}",
+                             "{\"tx_depth\":-1}", "{\"tx_depth\":4294967296}",
+                             "{\"registered_pool\":{\"pool_size\":0}}",
+                             "{\"registered_pool\":{\"pool_size\":65537}}",
+                             "{\"registered_pool\":{\"pool_max_size\":65536}}"}) {
+      std::ofstream out(path); out << json; out.close();
+      bool rejected = false;
+      try { loadUrmaConfigFile(path, base); }
+      catch (const std::invalid_argument&) { rejected = true; }
+      check(rejected, "invalid type, duplicate, or dependent limits accepted");
+    }
+    { std::ofstream out(path); out << "{}"; }
+    check(loadUrmaConfigFile(path, base).dev_name == base.dev_name,
+          "empty overlay lost caller defaults");
+    std::cout << "PASS versionless config, public fields, ranges and JSON/C++ parity\n";
     using namespace urma_detail;
     auto c = config();
     auto bad = c;

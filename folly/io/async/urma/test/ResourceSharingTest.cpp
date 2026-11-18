@@ -142,6 +142,23 @@ void elasticCases(bool pressureTimeout = false) {
     auto id = preparing.attach(&listener);
     require(!preparing.prepare() && preparing.snapshot().posted == 0,
             "new IO owner did not wait for exhausted registered memory");
+    struct Detector : AsyncTransport::ReadCallback {
+      void getReadBuffer(void**, size_t*) override { std::abort(); }
+      void readDataAvailable(size_t) noexcept override { std::abort(); }
+      void readEOF() noexcept override { std::abort(); }
+      void readErr(const AsyncSocketException&) noexcept override { std::abort(); }
+    } detector;
+    int pair[2];
+    require(!::socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, pair),
+            "pending handshake socketpair");
+    auto peerGuard = makeGuard([&] { ::close(pair[1]); });
+    auto tcp = AsyncSocket::newSocket(&second, NetworkSocket::fromFd(pair[0]));
+    auto* control = tcp.get();
+    tcp->setReadCB(&detector);
+    auto handshake = std::make_unique<UrmaAsyncSocket>(
+        std::move(tcp), std::chrono::steady_clock::now(),
+        std::vector<uint8_t>{'U', 'R', 'M', 'A'});
+    require(!control->getReadCallback(), "pending handshake retained the detector");
     pauseRegistration = false;
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
     while (!preparing.prepare() && std::chrono::steady_clock::now() < deadline)
@@ -149,6 +166,11 @@ void elasticCases(bool pressureTimeout = false) {
     require(preparing.prepare() && preparing.snapshot().posted == 8 &&
             UrmaInit::poolStats().registered_bytes > p.pool_size,
             "new IO owner did not complete preposts after growth");
+    while (!control->getReadCallback() && std::chrono::steady_clock::now() < deadline)
+      second.loopOnce(EVLOOP_NONBLOCK);
+    require(control->getReadCallback() && control->getReadCallback() != &detector,
+            "handshake did not resume with its own reader");
+    handshake.reset();
     preparing.detach(id);
     UrmaIoContext::release(&second);
     occupied.clear();
@@ -1521,6 +1543,28 @@ int main(int argc, char** argv) {
       require(accepted->isUrmaReady(), "split TCP ACK not accepted");
       ::close(raw);
       acceptor.connections.clear();
+      // A mixed listener may already own part or all of HELLO. Any bytes
+      // still buffered by AsyncSocket must follow that prefix exactly once.
+      for (size_t prefixSize : {size_t{13}, encoded.size()}) {
+        int pair[2];
+        require(!::socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, pair),
+                "prefix handshake socketpair");
+        auto tcp = AsyncSocket::newSocket(&evb, NetworkSocket::fromFd(pair[0]));
+        auto tail = IOBuf::copyBuffer(ack, sizeof(ack));
+        if (prefixSize < encoded.size()) {
+          auto rest = IOBuf::copyBuffer(
+              encoded.data() + prefixSize, encoded.size() - prefixSize);
+          rest->appendToChain(std::move(tail));
+          tail = std::move(rest);
+        }
+        tcp->setPreReceivedData(std::move(tail));
+        UrmaAsyncSocket socket(std::move(tcp), std::chrono::steady_clock::now(),
+                               {encoded.begin(), encoded.begin() + prefixSize});
+        for (int i = 0; i < 1000 && !socket.isUrmaReady(); ++i)
+          evb.loopOnce(EVLOOP_NONBLOCK);
+        require(socket.isUrmaReady(), "HELLO prefix or buffered tail lost");
+        ::close(pair[1]);
+      }
       std::vector<std::unique_ptr<Echo>> clients;
       for (int i = 0; i < 96; ++i)
         clients.emplace_back(

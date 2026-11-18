@@ -1,21 +1,11 @@
 {
-  "version": 3,
   "rx_depth": 0,
+  "rx_target": 256,
   "tx_depth": 1024,
-  "buffer_size": 4096,
-  "enable_read": true,
-  "read_threshold": 4352,
-  "read_window": 1024,
-  "offer_window": 1024,
   "handshake_timeout_ms": 5000,
+  "max_pending_bytes": 134217728,
   "registered_pool": {
-    "enabled": true,
-    "zero_copy": true,
     "pool_size": 268435456,
-    "pool_max_size": 536870912,
-    "elastic": true,
-    "tls_block_size": 16384,
-    "tls_cache_blocks": 2
-  },
-  "rx_target": 256
+    "pool_max_size": 536870912
+  }
 }

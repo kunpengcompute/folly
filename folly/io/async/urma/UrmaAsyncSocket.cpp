@@ -397,13 +397,22 @@ struct UrmaAsyncSocket::Impl final : AsyncSocket::ConnectCallback,
   void start() {
     DestructorGuard guard(owner);
     state = State::Handshake;
-    started = Clock::now();
     prepareHandshake();
     armTimer();
   }
   void prepareHandshake() {
-    if (resourcesReady || !live() || !createResources()) return;
+    if (resourcesReady || !live()) return;
+    if (!createResources()) {
+      // A protocol detector may still be the reader. Pause until preparation
+      // succeeds, before the detector's lifetime ends.
+      tcp->setReadCB(nullptr);
+      return;
+    }
     resourcesReady = true;
+    if (!handshake.empty()) {
+      processHandshake();
+      if (!live()) return;
+    }
     tcp->setReadCB(this);
     if (client) sendHello();
   }
@@ -476,6 +485,9 @@ struct UrmaAsyncSocket::Impl final : AsyncSocket::ConnectCallback,
       return;
     }
     handshake.insert(handshake.end(), tcpBuffer.begin(), tcpBuffer.begin() + n);
+    processHandshake();
+  }
+  void processHandshake() {
     if (!haveHello && handshake.size() >= 10 &&
         (load32(handshake.data()) != urma_detail::kMagic ||
          urma_detail::load16(handshake.data() + 4) != kHelloSize ||
@@ -1608,8 +1620,20 @@ UrmaAsyncSocket::UrmaAsyncSocket(EventBase* e, const SocketAddress& address)
 UrmaAsyncSocket::UrmaAsyncSocket(EventBase* e, int fd)
     : UrmaAsyncSocket(AsyncSocket::newSocket(e, NetworkSocket(fd))) {}
 UrmaAsyncSocket::UrmaAsyncSocket(AsyncSocket::UniquePtr acceptedSocket)
+    : UrmaAsyncSocket(std::move(acceptedSocket), Clock::now()) {}
+UrmaAsyncSocket::UrmaAsyncSocket(AsyncSocket::UniquePtr acceptedSocket,
+                               Clock::time_point handshakeStarted)
+    : UrmaAsyncSocket(std::move(acceptedSocket), handshakeStarted, {}) {}
+UrmaAsyncSocket::UrmaAsyncSocket(AsyncSocket::UniquePtr acceptedSocket,
+                                 Clock::time_point handshakeStarted,
+                                 std::vector<uint8_t> helloPrefix)
     : impl_(std::make_unique<Impl>(this, acceptedSocket->getEventBase())) {
+  if (helloPrefix.size() > kHelloSize) {
+    throw std::invalid_argument("URMA prefix exceeds HELLO size");
+  }
   impl_->tcp = std::move(acceptedSocket);
+  impl_->started = handshakeStarted;
+  impl_->handshake = std::move(helloPrefix);
   impl_->start();
 }
 UrmaAsyncSocket::~UrmaAsyncSocket() {

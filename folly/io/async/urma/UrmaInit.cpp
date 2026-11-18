@@ -83,16 +83,7 @@ void UrmaInit::init(const UrmaConfig& requested) {
   const char* path = std::getenv("FOLLY_URMA_CONFIG");
   const UrmaConfig config =
       path ? loadUrmaConfigFile(path, requested) : requested;
-  urma_detail::MemoryPool::validate(config.registered_pool);
-  if (!config.offer_window || config.offer_window > 1024 ||
-      !config.read_window || config.read_window > 1024 ||
-      !config.registered_pool.enabled ||
-      config.max_send_sge > std::numeric_limits<uint8_t>::max() ||
-      !config.tx_depth || config.tx_depth > 4096 ||
-      config.rx_depth > 65536 || config.rx_target > 65536 ||
-      config.buffer_size <= 128 || config.buffer_size > 65536 ||
-      !config.handshake_timeout_ms || config.max_pending_bytes < config.buffer_size)
-    throw std::invalid_argument("invalid URMA configuration");
+  validateUrmaConfig(config);
   // Copy the allocating string before acquiring SDK resources. Publishing the
   // effective configuration below is a non-throwing move.
   UrmaConfig effective = config;
@@ -136,11 +127,19 @@ void UrmaInit::init(const UrmaConfig& requested) {
   urma_eid_t eid{};
   if (device && urma_query_device(device, &attr) == URMA_SUCCESS &&
       (attr.dev_cap.trans_mode & URMA_TM_RM)) {
-    effective.rx_depth = effective.rx_depth
-        ? std::min(effective.rx_depth, attr.dev_cap.max_jfr_depth)
-        : attr.dev_cap.max_jfr_depth;
-    effective.tx_depth =
-        std::min(effective.tx_depth, attr.dev_cap.max_jfs_depth);
+    auto deviceLimit = [](const char* field, uint32_t requested, uint32_t maximum) {
+      if (!maximum || requested > maximum)
+        throw std::invalid_argument(std::string(field) + "=" +
+            std::to_string(requested) + " exceeds device capacity " + std::to_string(maximum));
+    };
+    deviceLimit("tx_depth", config.tx_depth, attr.dev_cap.max_jfs_depth);
+    if (attr.dev_cap.max_jfc_depth <= config.tx_depth + 1)
+      throw std::invalid_argument("tx_depth leaves no JFC capacity for RX");
+    const auto rxLimit = std::min<uint32_t>(65536,
+        std::min(attr.dev_cap.max_jfr_depth, attr.dev_cap.max_jfc_depth - config.tx_depth - 1));
+    if (config.rx_depth) deviceLimit("rx_depth", config.rx_depth, rxLimit);
+    effective.rx_depth = config.rx_depth ? config.rx_depth : rxLimit;
+    deviceLimit("rx_target", config.rx_target, effective.rx_depth);
     effective.max_send_sge = effective.max_send_sge
         ? std::min(effective.max_send_sge, attr.dev_cap.max_jfs_sge)
         : attr.dev_cap.max_jfs_sge;

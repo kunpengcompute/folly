@@ -15,6 +15,12 @@ class UrmaAsyncSocket : public AsyncTransport, public UrmaRecordWriter {
   UrmaAsyncSocket(EventBase* evb, const SocketAddress& address);
   UrmaAsyncSocket(EventBase* evb, int acceptedFd);
   explicit UrmaAsyncSocket(AsyncSocket::UniquePtr acceptedSocket);
+  UrmaAsyncSocket(AsyncSocket::UniquePtr acceptedSocket,
+                 std::chrono::steady_clock::time_point handshakeStarted);
+  // Bytes already consumed by a protocol detector, up to one HELLO.
+  UrmaAsyncSocket(AsyncSocket::UniquePtr acceptedSocket,
+                  std::chrono::steady_clock::time_point handshakeStarted,
+                  std::vector<uint8_t> helloPrefix);
   // Keep the legacy factory usable in a conditional with
   // AsyncSocket::newSocket. Both branches can convert to the AsyncTransport
   // owning pointer.

@@ -30,14 +30,28 @@ void number(const dynamic& obj, const char* key, T& out) {
     out = static_cast<T>(v->getInt());
   }
 }
-void boolean(const dynamic& obj, const char* key, bool& out) {
-  if (auto* v = obj.get_ptr(key)) {
-    if (!v->isBool())
-      throw std::invalid_argument(std::string(key) + " must be boolean");
-    out = v->getBool();
-  }
+void range(const char* field, uint64_t value, uint64_t low, uint64_t high) {
+  if (value < low || value > high)
+    throw std::invalid_argument(std::string(field) + "=" + std::to_string(value) +
+        " must be in [" + std::to_string(low) + ", " + std::to_string(high) + "]");
 }
 }  // namespace
+void validateUrmaConfig(const UrmaConfig& c) {
+  range("rx_depth", c.rx_depth, 0, 65536);
+  range("rx_target", c.rx_target, 1, c.rx_depth ? c.rx_depth : 65536);
+  range("tx_depth", c.tx_depth, 1, 4096);
+  range("handshake_timeout_ms", c.handshake_timeout_ms, 1, 60000);
+  range("buffer_size", c.buffer_size, 129, 4096);
+  range("max_send_sge", c.max_send_sge, 0, UINT8_MAX);
+  range("read_window", c.read_window, 1, 1024);
+  range("offer_window", c.offer_window, 1, 1024);
+  range("max_pending_bytes", c.max_pending_bytes, c.buffer_size, UINT32_MAX);
+  if (c.dev_name.find('\0') != std::string::npos)
+    throw std::invalid_argument("dev_name must not contain NUL");
+  if (!c.registered_pool.enabled)
+    throw std::invalid_argument("URMA requires a registered pool");
+  urma_detail::MemoryPool::validate(c.registered_pool);
+}
 UrmaConfig loadUrmaConfigFile(const std::string& path, const UrmaConfig& base) {
   try {
     if (path.empty()) throw std::invalid_argument("empty path");
@@ -55,23 +69,8 @@ UrmaConfig loadUrmaConfigFile(const std::string& path, const UrmaConfig& base) {
     opts.validate_keys = true;
     opts.validate_utf8 = true;
     const auto root = parseJson(text, opts);
-    keys(root, {"version",
-                "dev_name",
-                "max_send_sge",
-                "rx_depth",
-                "rx_target",
-                "tx_depth",
-                "buffer_size",
-                "handshake_timeout_ms",
-                "enable_read",
-                "read_threshold",
-                "read_window",
-                "offer_window",
-                "max_pending_bytes",
-                "registered_pool"});
-    uint32_t version = 3;
-    number(root, "version", version);
-    if (version != 3) throw std::invalid_argument("unsupported config version");
+    keys(root, {"dev_name", "rx_depth", "rx_target", "tx_depth",
+                "handshake_timeout_ms", "max_pending_bytes", "registered_pool"});
     auto c = base;
     if (auto* name = root.get_ptr("dev_name")) {
       if (!name->isString() ||
@@ -79,60 +78,17 @@ UrmaConfig loadUrmaConfigFile(const std::string& path, const UrmaConfig& base) {
         throw std::invalid_argument("dev_name must be a string without NUL");
       c.dev_name = name->asString();
     }
-    number(root, "max_send_sge", c.max_send_sge);
     number(root, "rx_depth", c.rx_depth);
     number(root, "rx_target", c.rx_target);
     number(root, "tx_depth", c.tx_depth);
-    number(root, "buffer_size", c.buffer_size);
     number(root, "handshake_timeout_ms", c.handshake_timeout_ms);
-    number(root, "read_threshold", c.read_threshold);
-    number(root, "read_window", c.read_window);
-    number(root, "offer_window", c.offer_window);
     number(root, "max_pending_bytes", c.max_pending_bytes);
-    boolean(root, "enable_read", c.enable_read);
     if (auto* pool = root.get_ptr("registered_pool")) {
-      keys(*pool,
-           {"enabled", "zero_copy", "region_bytes", "pool_size",
-            "pool_max_size", "elastic", "tls_block_size", "tls_cache_blocks",
-            "classes", "idle_ms", "retry_ms"});
-      auto& p = c.registered_pool;
-      boolean(*pool, "enabled", p.enabled);
-      boolean(*pool, "zero_copy", p.zero_copy);
-      number(*pool, "region_bytes", p.region_bytes);
-      number(*pool, "pool_size", p.pool_size);
-      number(*pool, "pool_max_size", p.pool_max_size);
-      number(*pool, "tls_block_size", p.tls_block_size);
-      number(*pool, "tls_cache_blocks", p.tls_cache_blocks);
-      boolean(*pool, "elastic", p.elastic);
-      number(*pool, "idle_ms", p.idle_ms);
-      number(*pool, "retry_ms", p.retry_ms);
-      if (auto* classes = pool->get_ptr("classes")) {
-        if (!classes->isArray() || classes->size() > 64)
-          throw std::invalid_argument(
-              "classes must be an array of at most 64 entries");
-        p.classes.clear();
-        for (const auto& entry : *classes) {
-          keys(entry, {"bytes"});
-          UrmaPoolClass tier{};
-          number(entry, "bytes", tier.bytes);
-          p.classes.push_back(tier);
-        }
-      }
-      // Validate even disabled pool settings so typos cannot become latent
-      // errors.
-      auto checked = p;
-      checked.enabled = true;
-      urma_detail::MemoryPool::validate(checked);
-      if (p.zero_copy && !p.enabled)
-        throw std::invalid_argument("zero_copy requires enabled pool");
+      keys(*pool, {"pool_size", "pool_max_size"});
+      number(*pool, "pool_size", c.registered_pool.pool_size);
+      number(*pool, "pool_max_size", c.registered_pool.pool_max_size);
     }
-    if (!c.read_window || c.read_window > 1024 ||
-        !c.offer_window || c.offer_window > 1024 || !c.registered_pool.enabled)
-      throw std::invalid_argument("READ/offer bounds must be 1..1024 with a registered pool");
-    if (c.rx_depth > 65536 || c.rx_target > 65536 || !c.tx_depth || c.tx_depth > 4096 ||
-        c.buffer_size <= 128 || c.buffer_size > 65536 ||
-        !c.handshake_timeout_ms || c.max_pending_bytes < c.buffer_size)
-      throw std::invalid_argument("invalid basic URMA configuration");
+    validateUrmaConfig(c);
 
     return c;
   } catch (const std::exception& e) {

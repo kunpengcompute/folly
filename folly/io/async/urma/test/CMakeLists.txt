@@ -25,7 +25,7 @@ foreach(mode callback_read callback_read_movable callback_write callback_close
   set_tests_properties(URMA.Socket.${mode} PROPERTIES TIMEOUT 45 LABELS "URMA")
 endforeach()
 # Existing dual-host programs remain explicit hardware validation entry points.
-foreach(test Coalescing Read CleanupRead)
+foreach(test Echo Coalescing Read CleanupRead)
   add_executable(Urma${test}Test ${test}Test.cpp)
   target_link_libraries(Urma${test}Test PRIVATE folly ${CMAKE_DL_LIBS})
   apply_folly_compile_options_to_target(Urma${test}Test)
