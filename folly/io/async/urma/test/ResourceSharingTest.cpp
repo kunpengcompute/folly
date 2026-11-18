@@ -1,5 +1,7 @@
 /* Copyright (c) Huawei Technologies Co., Ltd. 2026. Licensed under Apache-2.0. */
 #include "TestUtil.h"
+using namespace folly;
+using namespace folly::urma_test;
 struct TestListener : UrmaIoContext::Listener {
   unsigned wakes{0}, completions{0}, receives{0};
   bool blockData{false}, retainData{false};
@@ -1700,7 +1702,10 @@ int main(int argc, char** argv) {
       ordered.received = ordered.completed = 0;
       auto largeSource = IOBuf::copyBuffer(ordered.expected);
       const auto readLimit = UrmaInit::getMaxReadSize();
-      const auto slices = (ordered.expected.size() + readLimit - 1) / readLimit;
+      if (!readLimit) {
+        throw std::runtime_error("ordered READ slicing requires a positive READ limit");
+      }
+      const auto slices = 1 + (ordered.expected.size() - 1) / readLimit;
       const auto slicePullsBefore = checkedPulls;
       const auto before =
           static_cast<UrmaAsyncSocket*>(ordered.socket.get())->getUrmaStats();
@@ -1936,13 +1941,7 @@ int main(int argc, char** argv) {
       // or start READ before its destination and active budget are available.
       {
         stage = "READ count wait";
-        std::vector<std::shared_ptr<void>> pressure;
-        const size_t count = 1024;
-        for (size_t i = 0; i < count; ++i) {
-          pressure.push_back(
-              owner.retainRead());
-          require(bool(pressure.back()), "could not occupy READ budget");
-        }
+        auto pressure = holdReadSlots(owner);
         ordered.expected.assign(8192, 'b');
         ordered.received = ordered.completed = 0;
         const auto readsBefore = owner.snapshot().reads;
@@ -1975,10 +1974,8 @@ int main(int argc, char** argv) {
       // can itself supply the READ target and invalidate this pressure setup.
       std::vector<UrmaInit::Buffer> pressure;
       for (size_t bytes : {size_t(1024 * 1024), size_t(4096)}) {
-        while (true) {
-          auto buffer = UrmaInit::allocateBuffer(bytes);
-          if (!buffer.memory)
-            break;
+        for (auto buffer = UrmaInit::allocateBuffer(bytes); buffer.memory;
+             buffer = UrmaInit::allocateBuffer(bytes)) {
           pressure.push_back(std::move(buffer));
         }
       }

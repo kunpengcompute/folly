@@ -3,7 +3,9 @@
 #include "TestUtil.h"
 #include <functional>
 #include <utility>
+using namespace folly;
 using namespace folly::urma_detail;
+using namespace folly::urma_test;
 using namespace std::chrono_literals;
 namespace {
 uint8_t pattern(size_t i, unsigned seed) {

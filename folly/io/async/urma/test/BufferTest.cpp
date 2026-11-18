@@ -8,12 +8,11 @@
 #include <stdexcept>
 
 using namespace folly;
-void check(bool condition, int line) {
+void require(bool condition, int line = __builtin_LINE()) {
   if (!condition)
     throw std::runtime_error("buffer callback assertion failed at " +
                              std::to_string(line));
 }
-#define require(condition) check((condition), __LINE__)
 struct Write : AsyncTransport::WriteCallback {
   unsigned success{0}, errors{0};
   void writeSuccess() noexcept override { ++success; }

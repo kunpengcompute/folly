@@ -21,7 +21,7 @@
 #include <folly/io/async/urma/UrmaCleanup.h>
 #include <folly/io/async/urma/UrmaIoContext.h>
 
-namespace {
+namespace folly::urma_test {
 std::vector<std::shared_ptr<void>> holdReadSlots(folly::UrmaIoContext& owner) {
   std::vector<std::shared_ptr<void>> holds;
   for (unsigned i = 0; i < 1024; ++i) {
@@ -103,7 +103,6 @@ bool inject(const char* name) {
   createFailure.clear();
   return true;
 }
-} // namespace
 
 extern "C" {
 urma_jfce_t* urma_create_jfce(urma_context_t*) {
@@ -232,7 +231,9 @@ urma_status_t urma_post_jfr_wr(
   posted[jfr].push_back({sg.addr, wr->user_ctx, sg.len});
   return URMA_SUCCESS;
 }
-static urma_status_t postOne(
+} // extern "C"
+
+inline urma_status_t postOne(
     urma_jfs_t* jfs, urma_jfs_wr_t* wr, urma_jfs_wr_t** bad) {
   if (unknownAcceptance) {
     unknownAcceptance = false;
@@ -371,6 +372,7 @@ static urma_status_t postOne(
     signalQueue(jfs->jfs_cfg.jfc, tx);
   return URMA_SUCCESS;
 }
+extern "C" {
 urma_status_t urma_post_jfs_wr(
     urma_jfs_t* jfs, urma_jfs_wr_t* wr, urma_jfs_wr_t** bad) {
   if (wr->opcode != URMA_OPC_READ) {
@@ -443,8 +445,6 @@ void urma_ack_jfc(urma_jfc_t**, uint32_t* counts, uint32_t n) {
 }
 }
 
-using namespace folly;
-
 std::shared_ptr<AsyncServerSocket> listenOnLoopback(
     EventBase& evb, AsyncServerSocket::AcceptCallback& callback,
     SocketAddress& address, int backlog) {
@@ -456,3 +456,4 @@ std::shared_ptr<AsyncServerSocket> listenOnLoopback(
   server->getAddress(&address);
   return server;
 }
+} // namespace folly::urma_test

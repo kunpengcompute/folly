@@ -101,8 +101,17 @@ void Connection::attach(AsyncTransport::UniquePtr p){
       }
       dynamic_cast<UrmaAsyncSocket*>(socket.get())->writeChainWithRecords(
           &callbacks[i],std::move(chain),std::move(records));
-    } else if(i%2)socket->writev(&callbacks[i],parts.data(),parts.size());
-    else{auto chain=IOBuf::create(0);for(auto v:parts)chain->prependChain(IOBuf::copyBuffer(v.iov_base,v.iov_len));socket->writeChain(&callbacks[i],std::move(chain));}
+    } else if (i % 2 || std::getenv("TEST_SOURCE_HOLD_MS")) {
+      // The pressure fixture owns these bytes until completion. Copying them
+      // into the exhausted pool here would fail before the socket can wait.
+      socket->writev(&callbacks[i], parts.data(), parts.size());
+    } else {
+      auto chain = IOBuf::create(0);
+      for (auto part : parts) {
+        chain->prependChain(IOBuf::copyBuffer(part.iov_base, part.iov_len));
+      }
+      socket->writeChain(&callbacks[i], std::move(chain));
+    }
   }
   if(std::getenv("TEST_CLOSE_MS"))run.evb.runAfterDelay([this]{if(!done)socket->closeNow();},std::stoi(std::getenv("TEST_CLOSE_MS")));
   if(std::getenv("TEST_HALF_CLOSE"))socket->shutdownWrite();
@@ -175,9 +184,8 @@ int main(int argc,char**argv){
     if(std::getenv("TEST_SOURCE_HOLD_MS")) {
       if(run.server)return 2;
       UrmaIoContext::get(&run.evb);
-      while (true) {
-        auto block = UrmaInit::allocateBuffer(1024 * 1024);
-        if (!block.memory) break;
+      for (auto block = UrmaInit::allocateBuffer(1024 * 1024); block.memory;
+           block = UrmaInit::allocateBuffer(1024 * 1024)) {
         pressure.push_back(std::move(block));
       }
       if(pressure.empty())std::abort();

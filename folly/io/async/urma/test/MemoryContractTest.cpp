@@ -14,6 +14,7 @@
 #include <limits>
 #include <new>
 #include <poll.h>
+#include <stdexcept>
 #include <unistd.h>
 #include <thread>
 #include <vector>
@@ -313,7 +314,11 @@ void resourceNotifications() {
                "1000 concurrent block-return races\n";
 }
 void largeExtents() {
-  const size_t page = sysconf(_SC_PAGESIZE);
+  const long pageSize = sysconf(_SC_PAGESIZE);
+  if (pageSize <= 0) {
+    throw std::runtime_error("could not determine system page size");
+  }
+  const auto page = static_cast<size_t>(pageSize);
   constexpr size_t mib = 1024 * 1024;
   UrmaPoolConfig c;
   c.elastic = false;
