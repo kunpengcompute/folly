@@ -161,9 +161,19 @@ void UrmaInit::init(const UrmaConfig& requested) {
         uint64_t(effective.rx_depth) + effective.tx_depth + 1 <=
             attr.dev_cap.max_jfc_depth) {
       eids = urma_get_eid_list(device, &n);
-      if (eids && n) {
-        eid = eids[0].eid;
-        created = urma_create_context(device, eids[0].eid_index);
+      uint32_t i = 0;
+      if (config.eid_index) {
+        while (eids && i < n && eids[i].eid_index != *config.eid_index) ++i;
+        if (!eids || i == n) {
+          throw std::runtime_error(std::string("URMA device ") + device->name +
+              ": eid_index=" + std::to_string(*config.eid_index) + " unavailable");
+        }
+      }
+      if (eids && i < n) {
+        const auto& selected = eids[i];
+        eid = selected.eid;
+        effective.eid_index = selected.eid_index;
+        created = urma_create_context(device, selected.eid_index);
       }
     }
   }
@@ -194,6 +204,8 @@ void UrmaInit::init(const UrmaConfig& requested) {
     }
     if (!(*memoryPool)->warm(std::chrono::seconds(5)))
       throw std::runtime_error("URMA soft capacity unavailable at startup");
+    XLOG(INFO) << "URMA context device=" << device->name
+               << " eid_index=" << *settings.eid_index;
     std::atomic_store(&*publishedPool, *memoryPool);
     poolEpoch.fetch_add(1, std::memory_order_release);
     poolIOBufEnabled.store(

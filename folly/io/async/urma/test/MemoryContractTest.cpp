@@ -409,8 +409,9 @@ int main(int argc, char** argv) {
     check(argc == 2, "shipped config fixture argument missing");
     UrmaConfig base;
     base.dev_name = "device-supplied-by-caller";
+    base.eid_index = 3;
     auto example = loadUrmaConfigFile(argv[1], base);
-    check(example.dev_name == base.dev_name &&
+    check(example.dev_name == base.dev_name && example.eid_index == base.eid_index &&
               example.registered_pool.enabled &&
               example.registered_pool.elastic &&
               example.registered_pool.zero_copy &&
@@ -423,6 +424,11 @@ int main(int argc, char** argv) {
     check(fd >= 0, "temporary config creation failed");
     ::close(fd);
     auto removeFile = makeGuard([&] { ::unlink(path); });
+    for (uint32_t index : {uint32_t(0), uint32_t(7), UINT32_MAX}) {
+      std::ofstream(path) << "{\"eid_index\":" << index << "}";
+      check(loadUrmaConfigFile(path, base).eid_index == index,
+            "JSON EID index did not override the caller's selection");
+    }
     for (const char* key : {"io_owners", "max_water", "fc_rx_depth",
                             "fc_max_water", "rx_spare_blocks",
                             "io_free_rx_reserve", "credit_target",
@@ -472,6 +478,9 @@ int main(int argc, char** argv) {
       check(rejects([&] { loadUrmaConfigFile(path, base); }), "JSON/C++ validation differs");
     }
     for (const char* json : {"{\"rx_depth\":4,\"rx_target\":5}",
+                             "{\"eid_index\":-1}", "{\"eid_index\":2.5}",
+                             "{\"eid_index\":4294967296}", "{\"eid_index\":true}",
+                             "{\"eid_index\":\"7\"}", "{\"eid_index\":null}",
                              "{\"tx_depth\":1,\"tx_depth\":2}",
                              "{\"tx_depth\":1.5}", "{\"tx_depth\":true}",
                              "{\"tx_depth\":-1}", "{\"tx_depth\":4294967296}",
@@ -485,6 +494,7 @@ int main(int argc, char** argv) {
       check(rejected, "invalid type, duplicate, or dependent limits accepted");
     }
     { std::ofstream out(path); out << "{}"; }
+    check(!loadUrmaConfigFile(path).eid_index, "omitted EID index selected zero");
     check(loadUrmaConfigFile(path, base).dev_name == base.dev_name,
           "empty overlay lost caller defaults");
     std::cout << "PASS versionless config, public fields, ranges and JSON/C++ parity\n";

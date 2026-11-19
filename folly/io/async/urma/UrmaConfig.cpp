@@ -21,14 +21,16 @@ void keys(const dynamic& obj, std::initializer_list<const char*> allowed) {
   }
 }
 template <class T>
-void number(const dynamic& obj, const char* key, T& out) {
+bool number(const dynamic& obj, const char* key, T& out) {
   if (auto* v = obj.get_ptr(key)) {
     if (!v->isInt() || v->getInt() < 0 ||
         uint64_t(v->getInt()) > std::numeric_limits<T>::max())
       throw std::invalid_argument(std::string(key) +
                                   " must be an unsigned integer in range");
     out = static_cast<T>(v->getInt());
+    return true;
   }
+  return false;
 }
 void range(const char* field, uint64_t value, uint64_t low, uint64_t high) {
   if (value < low || value > high)
@@ -69,7 +71,7 @@ UrmaConfig loadUrmaConfigFile(const std::string& path, const UrmaConfig& base) {
     opts.validate_keys = true;
     opts.validate_utf8 = true;
     const auto root = parseJson(text, opts);
-    keys(root, {"dev_name", "rx_depth", "rx_target", "tx_depth",
+    keys(root, {"dev_name", "eid_index", "rx_depth", "rx_target", "tx_depth",
                 "handshake_timeout_ms", "max_pending_bytes", "registered_pool"});
     auto c = base;
     if (auto* name = root.get_ptr("dev_name")) {
@@ -78,6 +80,8 @@ UrmaConfig loadUrmaConfigFile(const std::string& path, const UrmaConfig& base) {
         throw std::invalid_argument("dev_name must be a string without NUL");
       c.dev_name = name->asString();
     }
+    uint32_t index;
+    if (number(root, "eid_index", index)) c.eid_index = index;
     number(root, "rx_depth", c.rx_depth);
     number(root, "rx_target", c.rx_target);
     number(root, "tx_depth", c.tx_depth);

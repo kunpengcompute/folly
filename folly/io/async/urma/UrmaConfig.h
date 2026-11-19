@@ -5,6 +5,7 @@
 #include <folly/io/async/urma/UrmaMemoryPool.h>
 
 #include <cstdint>
+#include <optional>
 #include <string>
 namespace folly {
 // Process-wide pool settings and per-connection transport limits.
@@ -28,6 +29,8 @@ struct UrmaConfig {
   // Per-connection admission/receive bounds, not an up-front reservation.
   uint32_t max_pending_bytes{128 * 1024 * 1024};
   UrmaPoolConfig registered_pool;
+  // Local SDK index. If omitted, select the first EID reported by the device.
+  std::optional<uint32_t> eid_index;
 };
 // Shared by JSON overlays and direct C++ initialization, before SDK calls.
 void validateUrmaConfig(const UrmaConfig& config);
