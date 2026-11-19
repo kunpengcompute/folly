@@ -20,6 +20,7 @@ Failure failure = Failure::None;
 bool borrowedLibrary = false;
 int initializes = 0, finalizes = 0, devices = 0, eids = 0, contexts = 0;
 uint32_t deviceSendSges = 4;
+constexpr uint32_t kDeviceMaxReadSize = 1024 * 1024;
 uint32_t deviceRxDepth = 4096, deviceTxDepth = 4096, deviceCqDepth = 8193;
 urma_device_t device{};
 urma_device_t* deviceList[]{&device};
@@ -104,7 +105,7 @@ urma_status_t urma_query_device(urma_device_t*, urma_device_attr_t* attr) {
   attr->dev_cap.max_jfs_sge = deviceSendSges;
   attr->dev_cap.max_jfc_depth = deviceCqDepth;
   attr->dev_cap.max_msg_size = 65536;
-  attr->dev_cap.max_read_size = 1024 * 1024;
+  attr->dev_cap.max_read_size = kDeviceMaxReadSize;
   return URMA_SUCCESS;
 }
 urma_eid_info_t* urma_get_eid_list(urma_device_t*, uint32_t* count) {

@@ -1701,11 +1701,9 @@ int main(int argc, char** argv) {
         ordered.expected[i] = char((i / 4096 + i) % 251);
       ordered.received = ordered.completed = 0;
       auto largeSource = IOBuf::copyBuffer(ordered.expected);
-      const auto readLimit = UrmaInit::getMaxReadSize();
-      if (!readLimit) {
-        throw std::runtime_error("ordered READ slicing requires a positive READ limit");
-      }
-      const auto slices = 1 + (ordered.expected.size() - 1) / readLimit;
+      require(UrmaInit::getMaxReadSize() == kDeviceMaxReadSize,
+              "unexpected READ limit for the test device");
+      const auto slices = 1 + (ordered.expected.size() - 1) / kDeviceMaxReadSize;
       const auto slicePullsBefore = checkedPulls;
       const auto before =
           static_cast<UrmaAsyncSocket*>(ordered.socket.get())->getUrmaStats();
