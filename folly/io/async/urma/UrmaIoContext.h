@@ -2,133 +2,117 @@
  */
 #pragma once
 #ifdef FOLLY_HAVE_URMA
-#include <folly/io/async/AsyncTimeout.h>
+#include <urma_api.h>
+#include <cstdint>
+#include <memory>
+#include <folly/io/IOBuf.h>
 #include <folly/io/async/EventBase.h>
-#include <folly/io/async/EventHandler.h>
-#include <folly/io/async/urma/UrmaConfig.h>
+#include <folly/io/async/urma/UrmaInit.h>
 #include <folly/io/async/urma/UrmaProtocol.h>
-#include <folly/io/async/urma/UrmaRxStorage.h>
-#include <chrono>
+#include <folly/io/async/urma/UrmaSegmentState.h>
 
-namespace folly::urma_detail {
-class UrmaIoContext;
-struct TxCompletionCtx;
-struct UrmaRoute : std::enable_shared_from_this<UrmaRoute> {
-  virtual ~UrmaRoute() = default;
-  uint64_t socketId{allocateSocketId()};
-  UrmaIoContext* ioOwner{nullptr};
-  virtual std::shared_ptr<RxBudget> receiveBudget() = 0;
-  virtual void onRecord(const RecordHeader&, std::unique_ptr<IOBuf>, uint64_t) = 0;
-  virtual void onTx(TxCompletionCtx&, bool) = 0;
-  virtual void progress() noexcept = 0;
-  virtual void failed(const char*) noexcept = 0;
-  virtual void ownerStopped() noexcept { failed("URMA EventBase stopped"); }
-};
-enum class Operation { Data, Pull, Free, Read };
-struct TxCompletionCtx {
-  Operation kind{Operation::Data};
-  std::shared_ptr<UrmaRoute> route;
-  std::shared_ptr<void> completion, imported;
-  UrmaPoolBuffer control, localPin, headerPin;
-  std::array<UrmaPoolBuffer, 2> extraPins;
-  std::unique_ptr<RxStorageLease> destination;
-  std::array<urma_sge_t, 4> sges{};
-  urma_sge_t remote{};
-  urma_jfs_wr_t wr{};
-  uint64_t sequence{0};
-  size_t bytes{0}, writeOffset{0};
-  // RNR explicitly rejected this SEND at the receiver. Retain the exact WR
-  // and its pins until successful retry, bounded timeout or shutdown.
-  std::chrono::steady_clock::time_point rnrSince{}, retryAt{};
-  bool retryPending{false};
-  bool remoteRejected{false}; // RNR proves this SEND was not delivered.
-};
-enum class PostResult { Accepted, Unaccepted, Unknown, Full };
-enum class RxSlotState { Empty, Ready, Posted, Completed };
-// Exclusively owned by one socket, even when several sockets use one EventBase.
-struct ConnectionQueue {
-  static constexpr int kEventBatch = 8;
-  struct RxBuf {
-    RxSlotState state{RxSlotState::Empty};
-    std::unique_ptr<RxStorageLease> storage;
-    urma_sge_t sge{};
-    urma_jfr_wr_t wr{};
-    urma_cr_t completion{};
-    bool deferred{false};
-  };
-  urma_jfce_t* event{nullptr};
-  urma_jfc_t* cq{nullptr};
-  urma_jfs_t* tx{nullptr};
-  urma_jfr_t* rx{nullptr};
-  urma_jetty_t* endpoint{nullptr};
-  std::array<urma_jfc_t*, kEventBatch> events{};
-  int eventCount{0};
-  std::vector<RxBuf> slots;
-  std::vector<size_t> deferredOrder;
-  size_t deferredCount{0};
-  std::vector<std::unique_ptr<TxCompletionCtx>> flights;
-  uint32_t target{0}, depth{0}, posted{0}, inflight{0}, sendDepth{0};
-  size_t replacementFailures{0};
-  size_t retrying{0};
-  bool refillPending{false}, broken{false};
-};
-class UrmaIoContext : public EventBase::LoopCallback,
-                      private AsyncTimeout,
-                      public std::enable_shared_from_this<UrmaIoContext> {
+namespace folly {
+class EventBase;
+// One instance per EventBase, independent of the number of logical sockets.
+// All methods except counters() must run on that EventBase's thread.
+class UrmaIoContext {
  public:
-  // Always creates independent queues. SDK preparation runs off the EventBase.
-  static std::shared_ptr<UrmaIoContext> get(EventBase*);
-  static uint32_t validateCapacity(UrmaConfig&);
-  static size_t activeRoutes();
-  ~UrmaIoContext() override;
-  void add(const std::shared_ptr<UrmaRoute>&);
-  void remove(uint64_t, const UrmaRoute*);
-  void wait(const std::shared_ptr<UrmaRoute>&);
-  void wake() noexcept;
-  void stopOwner() noexcept;
-  bool ready();
-  PostResult post(std::unique_ptr<TxCompletionCtx>&);
-  bool canPost(Operation) const;
-  urma_context_t* context() const { return context_; }
-  urma_jetty_id_t endpoint() const;
-  EventBase* eventBase() const { return evb_; }
-  std::shared_ptr<UrmaPoolSignal> signal() const { return signal_; }
-  std::shared_ptr<RxBudget> readBudget() const { return readBudget_; }
-  std::shared_ptr<RxBudget> pendingBudget() const { return pendingBudget_; }
-  ConnectionQueue& io() { return io_; }
-  const UrmaConfig& config() const { return config_; }
-  void runLoopCallback() noexcept override;
+  struct Listener {
+    virtual ~Listener() = default;
+    // False retains the completed buffer; its JFR slot is replenished.
+    virtual bool receiveReady(const urma_detail::PacketHeader&, const urma_cr_t&,
+                              const uint8_t*, size_t) { return true; }
+    virtual void receive(
+        const urma_detail::PacketHeader&,
+        const urma_cr_t&,
+        std::unique_ptr<IOBuf>) = 0;
+    virtual void completed(const urma_cr_t&, bool read) = 0;
+    virtual void writable() = 0;
+    virtual void revokeSegments(const std::vector<uint64_t>&) {}
+    virtual void failed(const char*) = 0;
+  };
+  // Cold close path. No application callbacks; accepted WRs and late protocol
+  // obligations can outlive the socket, but never the owner's DMA barrier.
+  struct Retired : Listener {
+    // Transfer a closing socket's WR. Known-unsubmitted READs are cancelled;
+    // return true to receive the terminal CQE of an accepted WR instead.
+    virtual bool adopt(uint64_t user, bool read, bool submitted) = 0;
+    // Validated, deferred packets never reached the socket's record queue.
+    virtual void discardReceive(const urma_detail::PacketHeader&) {}
+    virtual bool progress() = 0; // true once all obligations are discharged
+  };
+  struct Counters {
+    uint64_t createAttempts, created, destroyed, live, peak;
+  };
+  struct Snapshot {
+    uint32_t jfs, jfr, rxDepth, txDepth, rxTarget, posted;
+    size_t connections, imports, inflight, waiting;
+    uint64_t sends, receives, reads, completions;
+    uint64_t readConnections, dataConnections;
+    size_t retired;
+  };
+  // Import handles have context and WR lifetimes, not socket lifetimes.
+  struct Peer;
+  using ImportedSegment = urma_detail::ImportedSegment;
+  using ReadBuffer = UrmaInit::Buffer;
+  static UrmaIoContext& get(EventBase*);
+  // Nonblocking preparation: false means transient memory/RQ pressure.
+  bool prepare();
+  // Shutdown only: no attached sockets and no owner callback on the stack.
+  static void release(EventBase*);
+  static Counters counters();
+  ~UrmaIoContext();
+  static uint64_t allocateSocketId();
+  uint64_t attach(Listener*, uint64_t id = 0);
+  void detach(uint64_t);
+  // Closed connections may still owe a remote READ source. Only a matching
+  // terminal notification can discharge that obligation; a timer cannot.
+  void retire(uint64_t, std::shared_ptr<Retired>);
+  // Available only after prepare() succeeds.
+  const urma_jfr_id_t& endpoint() const;
+  std::shared_ptr<Peer> importPeer(const urma_jfr_id_t&);
+  static urma_target_jetty_t* handle(const std::shared_ptr<Peer>&);
+  // The process initial segment, already registered by UrmaInit::init().
+  // Buffers retain it through local DMA, remote FREE, and application IOBuf
+  // lifetimes.
+  const urma_seg_t* initialReadSegment();
+  ReadBuffer takeReadBuffer(size_t);
+  // Bounds active READs and unsent/inflight FREE responsibilities. PULLs
+  // waiting for admission remain in the connection's bounded record queue.
+  std::shared_ptr<void> retainRead();
+  std::shared_ptr<void> retainReadSource();
+  std::shared_ptr<ImportedSegment> importReadSegment(const urma_seg_t&);
+  static urma_target_seg_t* handle(const std::shared_ptr<ImportedSegment>&);
+  // Reserve before writing the DMA buffer. A slot is one WR, also for READ.
+  static constexpr uint32_t kNoSlot = UINT32_MAX;
+  uint32_t reserve(uint64_t, bool freeNotification = false);
+  // Retry on owner progress, with a timer for resources returned by another
+  // thread/owner. Registration is deduplicated and detach cancels the wait.
+  void waitForResources(uint64_t);
+  // Allocated only for this WR; null means retry after pool/owner progress.
+  uint8_t* buffer(uint32_t, size_t bytes, bool control = false);
+  urma_target_seg_t* segment(uint32_t) const;
+  void cancel(uint32_t);
+  // Build a SEND directly in its reserved slot. The returned WR has room for
+  // max_send_sge source entries and remains owned by the slot until completion.
+  urma_jfs_wr_t& prepareSend(uint32_t);
+  // READs admitted during CQ dispatch are chained at the next poll boundary,
+  // with one completion and one slot per WR. Success transfers ownership;
+  // the owner retries a known-unaccepted suffix without duplicating its prefix.
+  // Skip the owner poll timer only when the caller provides its own watchdog.
+  urma_status_t post(uint32_t, uint64_t, urma_jfs_wr_t&, std::shared_ptr<void>,
+                     bool schedulePoll = true);
+  void poll();
+  // During a CQ event, deliver its ready prefix after polling, before rearm.
+  // The callback's existing intrusive hook also cancels delivery on close.
+  void scheduleRead(EventBase::LoopCallback*);
+  Snapshot snapshot() const;
+  bool hasDeferredReceives(uint64_t socket) const;
 
  private:
-  friend class UrmaIoContextTestPeer;
-  struct Handler;
-  struct RetiredConnection;
-  UrmaIoContext(urma_context_t*, const UrmaConfig&);
-  void prepare(ConnectionQueue&);
-  bool refill(ConnectionQueue&, size_t);
-  void poll(ConnectionQueue&);
-  void complete(ConnectionQueue&, const urma_cr_t&) noexcept;
-  void retryRnr(ConnectionQueue&);
-  void finishRejected(ConnectionQueue&, size_t) noexcept;
-  void receive(ConnectionQueue&, const urma_cr_t&);
-  void fail(const char*) noexcept;
-  void timeoutExpired() noexcept override { wake(); }
-  void retryLater() noexcept;
-  bool cleanup(ConnectionQueue&) noexcept;
-  urma_context_t* context_;
-  UrmaConfig config_;
-  EventBase* evb_{nullptr};
-  ConnectionQueue io_;
-  std::shared_ptr<UrmaPoolSignal> signal_;
-  std::shared_ptr<RxBudget> budget_, readBudget_, pendingBudget_;
-  std::unique_ptr<Handler> ioHandler_, poolHandler_;
-  std::unique_ptr<RetiredConnection> cleanupTask_;
-  std::shared_ptr<UrmaRoute> route_;
-  std::atomic<bool> stopping_{false}, prepared_{false};
-  bool detached_{true}, polling_{false}, failed_{false};
-  bool preparedOK_{false}, pendingProgress_{false}, readyProgress_{false};
-  bool cqPending_{false};
-  bool ownsContext_{false}, counted_{false};
+  explicit UrmaIoContext(EventBase*);
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
 };
-}  // namespace folly::urma_detail
+} // namespace folly
 #endif

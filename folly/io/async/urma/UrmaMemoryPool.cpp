@@ -40,7 +40,7 @@ bool UrmaPoolConfig::operator==(const UrmaPoolConfig& o) const {
          pool_size == o.pool_size && pool_max_size == o.pool_max_size &&
          elastic == o.elastic && tls_block_size == o.tls_block_size &&
          tls_cache_blocks == o.tls_cache_blocks &&
-         region_bytes == o.region_bytes && budgets == o.budgets &&
+         region_bytes == o.region_bytes &&
          classes == o.classes && idle_ms == o.idle_ms && retry_ms == o.retry_ms;
 }
 namespace urma_detail {
@@ -51,13 +51,14 @@ struct MemoryPin {
   urma_target_seg_t* segment{nullptr};
   uint64_t id{0};
   virtual ~MemoryPin() = default;
+  virtual bool reusable(const void* owner) const noexcept = 0;
 };
 struct MemoryPool::State : std::enable_shared_from_this<State> {
   static constexpr size_t unused = std::numeric_limits<size_t>::max();
   struct Region;
   struct Block {
     Region* region{nullptr};
-    size_t offset{0}, bytes{0}, tier{unused}, purpose{0};
+    size_t offset{0}, bytes{0}, tier{unused};
     size_t refs[3]{};  // allocation, local DMA, exported READ
     bool cached{false}, listed{false};
     Block* previous{nullptr};
@@ -70,7 +71,8 @@ struct MemoryPool::State : std::enable_shared_from_this<State> {
     void* base{nullptr};
     urma_target_seg_t* segment{nullptr};
     std::map<size_t, Block> blocks;
-    bool initial{false}, building{true}, retiring{false};
+    bool initial{false}, building{true};
+    std::atomic<bool> retiring{false};
     int error{0};
     Clock::time_point idle{Clock::now()}, retry{};
     bool busy() const { return holds || activeBlocks; }
@@ -78,8 +80,7 @@ struct MemoryPool::State : std::enable_shared_from_this<State> {
   struct Bucket {
     Block* free{nullptr};
     size_t count{0};
-    std::array<size_t, kUrmaMemoryPurposes> allocated{};
-    std::array<bool, kUrmaMemoryPurposes> requested{};
+    bool requested{false};
   };
   urma_context_t* context;
   const UrmaPoolConfig config;
@@ -91,9 +92,10 @@ struct MemoryPool::State : std::enable_shared_from_this<State> {
   std::vector<std::shared_ptr<Region>> regions;
   std::vector<std::weak_ptr<UrmaPoolSignal>> signals;
   std::thread worker;
-  std::array<size_t, kUrmaMemoryPurposes> held{};
+  size_t requestedLarge{0};
   size_t registered{0}, reserved{0}, nextId{1};
-  bool stopping{false}, done{false};
+  std::atomic<bool> stopping{false};
+  bool done{false};
   UrmaPoolStats counters;
   Clock::time_point growthRetry{}, cacheTrim{};
   void notify() noexcept {
@@ -129,16 +131,20 @@ struct MemoryPool::State : std::enable_shared_from_this<State> {
     b.listed = true;
     ++list.count;
   }
-  size_t protectedFree(size_t tier, size_t except = unused) const {
-    size_t count = 0;
-    for (size_t p = 0; p < kUrmaMemoryPurposes; ++p)
-      if (p != except &&
-          config.classes[tier].reserve[p] > buckets[tier].allocated[p])
-        count += config.classes[tier].reserve[p] - buckets[tier].allocated[p];
-    return count;
-  }
-  Block* split(Region& r, Block& b, size_t tier) {
-    const size_t bytes = config.classes[tier].bytes;
+  Block* split(Region& r, Block& b, size_t bytes, size_t tier) {
+    // Large extents must be page-aligned even after small class allocations.
+    const size_t padding = tier == unused ? (page - b.offset % page) % page : 0;
+    if (padding) {
+      auto it = r.blocks.try_emplace(b.offset + padding).first;
+      auto& aligned = it->second;
+      aligned.region = &r;
+      aligned.offset = b.offset + padding;
+      aligned.bytes = b.bytes - padding;
+      try { split(r, aligned, bytes, tier); }
+      catch (...) { r.blocks.erase(it); throw; }
+      b.bytes = padding;
+      return &aligned;
+    }
     // Allocate metadata before changing the original extent.
     if (b.bytes > bytes) {
       auto& tail = r.blocks.try_emplace(b.offset + bytes).first->second;
@@ -154,14 +160,15 @@ struct MemoryPool::State : std::enable_shared_from_this<State> {
   void coalesce(Region& r) noexcept {
     for (auto& item : r.blocks) {
       auto& b = item.second;
-      if (b.listed && buckets[b.tier].count > protectedFree(b.tier)) {
+      if (!b.busy()) {
         unlink(b);
         b.tier = unused;
       }
     }
     for (auto it = r.blocks.begin(); it != r.blocks.end();) {
       auto next = std::next(it);
-      if (it->second.tier == unused && next != r.blocks.end() &&
+      if (!it->second.busy() && it->second.tier == unused &&
+          next != r.blocks.end() && !next->second.busy() &&
           next->second.tier == unused) {
         it->second.bytes += next->second.bytes;
         r.blocks.erase(next);
@@ -169,13 +176,15 @@ struct MemoryPool::State : std::enable_shared_from_this<State> {
         ++it;
     }
   }
-  Block* carve(size_t tier, const Region* excluded = nullptr) {
+  Block* carve(size_t bytes, size_t tier) {
     for (auto& r : regions) {
-      if (r.get() == excluded || r->building || r->retiring) continue;
+      if (r->building || r->retiring) continue;
       for (auto& item : r->blocks) {
         auto& b = item.second;
-        if (b.tier == unused && b.bytes >= config.classes[tier].bytes)
-          return split(*r, b, tier);
+        const size_t padding = tier == unused ? (page - b.offset % page) % page : 0;
+        if (!b.busy() && b.tier == unused && padding <= b.bytes &&
+            bytes <= b.bytes - padding)
+          return split(*r, b, bytes, tier);
       }
     }
     return nullptr;
@@ -190,18 +199,6 @@ struct MemoryPool::State : std::enable_shared_from_this<State> {
     auto& b = r->blocks.try_emplace(0).first->second;
     b.region = r.get();
     b.bytes = bytes;
-    if (initial) {
-      // Largest first; one initial segment, not one segment per purpose.
-      size_t offset = 0;
-      for (size_t i = config.classes.size(); i; --i) {
-        size_t count = 0;
-        for (auto n : config.classes[i - 1].reserve) count += n;
-        for (size_t n = 0; n < count; ++n) {
-          split(*r, r->blocks.at(offset), i - 1);
-          offset += config.classes[i - 1].bytes;
-        }
-      }
-    }
     if (bytes > hard - registered - reserved)
       throw std::runtime_error("URMA registration hard limit exceeded");
     regions.push_back(r);  // last allocating operation before SDK registration
@@ -218,7 +215,7 @@ struct MemoryPool::State : std::enable_shared_from_this<State> {
     urma_seg_cfg_t cfg{};
     cfg.va = reinterpret_cast<uint64_t>(r.base);
     cfg.len = r.bytes;
-    cfg.flag.bs.access = r.initial ? URMA_ACCESS_READ : URMA_ACCESS_LOCAL_ONLY;
+    cfg.flag.bs.access = URMA_ACCESS_READ;
     r.segment = urma_register_seg(context, &cfg);
     if (!r.segment) {
       munmap(r.base, r.bytes);
@@ -235,8 +232,11 @@ struct MemoryPool::State : std::enable_shared_from_this<State> {
     notify();
   }
   void markRetiring(Region& r) noexcept {
+    if (r.retiring) return;
     r.retiring = true;
     for (auto& b : r.blocks) unlink(b.second);
+    for (const auto& weak : signals)
+      if (auto signal = weak.lock()) signal->signal();
   }
   void remove(const std::shared_ptr<Region>& r) noexcept {
     if (r->building)
@@ -247,85 +247,66 @@ struct MemoryPool::State : std::enable_shared_from_this<State> {
     *it = std::move(regions.back());
     regions.pop_back();
   }
-  UrmaPoolBuffer pin(const std::shared_ptr<Region>& r, Block* b, size_t kind) {
+  UrmaPoolBuffer pin(Region& r, Block* b, size_t kind) {
     struct Pin final : MemoryPin {
       std::shared_ptr<State> state;
-      std::shared_ptr<Region> region;
+      // State owns the region until all block/segment pins are returned.
+      Region* region;
       Block* block;
       size_t kind;
-      Pin(std::shared_ptr<State> s, std::shared_ptr<Region> r, Block* b,
+      Pin(std::shared_ptr<State> s, Region* r, Block* b,
           size_t k)
-          : state(std::move(s)), region(std::move(r)), block(b), kind(k) {}
+          : state(std::move(s)), region(r), block(b), kind(k) {}
+      bool reusable(const void* owner) const noexcept override {
+        return state.get() == owner &&
+            !state->stopping.load(std::memory_order_acquire) &&
+            !region->retiring.load(std::memory_order_acquire);
+      }
       ~Pin() override {
         std::lock_guard<std::mutex> lock(state->mutex);
-        bool returnedBudget = false;
+        bool returnedBlock = false;
         if (!block)
           --region->holds;
         else {
           --block->refs[kind];
           if (!block->busy()) {
             --region->activeBlocks;
-            state->held[block->purpose] -= block->bytes;
-            --state->buckets[block->tier].allocated[block->purpose];
             block->cached = false;
             state->link(*block);
-            returnedBudget = true;
+            returnedBlock = true;
           }
         }
-        if (!region->busy()) {
+        if (!region->activeBlocks) {
           region->idle = Clock::now();
           if (region->retiring || state->stopping)
             state->changed.notify_all();
+          if (returnedBlock && region->retiring)
+            for (const auto& weak : state->signals)
+              if (auto signal = weak.lock()) signal->signal();
         }
         // Ending one DMA/export pin often leaves the allocation and other
         // pins intact. That creates no allocatable storage: waking every IO
         // owner here just makes them poll and contend for the same pool again.
-        // Retiring blocks cannot be allocated again, but returning their
-        // purpose budget can unblock allocation from another live region.
-        if (returnedBudget)
+        if (returnedBlock)
           state->notify();  // physical capacity/accounting returned first
         // Normal returns do not wake the maintenance thread. Misses request
         // growth explicitly; its timed pass still performs idle shrink.
       }
     };
-    auto p = std::make_shared<Pin>(shared_from_this(), r, b, kind);
-    p->data = static_cast<char*>(r->base) + (b ? b->offset : 0);
-    p->bytes = b ? b->bytes : r->bytes;
-    p->segment = r->segment;
-    p->id = r->id;
+    auto p = std::make_shared<Pin>(shared_from_this(), &r, b, kind);
+    p->data = static_cast<char*>(r.base) + (b ? b->offset : 0);
+    p->bytes = b ? b->bytes : r.bytes;
+    p->segment = r.segment;
+    p->id = r.id;
     if (b) {
       unlink(*b);
-      if (!b->busy()) ++r->activeBlocks;
+      if (!b->busy()) ++r.activeBlocks;
       ++b->refs[kind];
     } else
-      ++r->holds;
-    r->idle = Clock::now();
+      ++r.holds;
+    // An occupied block cannot be idle. Its final return timestamps the region.
+    if (!b) r.idle = Clock::now();
     return UrmaPoolBuffer(std::move(p));
-  }
-  bool preservesReserves(const Region& r) const {
-    for (size_t t = 0; t < buckets.size(); ++t) {
-      size_t removed = 0;
-      for (const auto& b : r.blocks)
-        removed += b.second.listed && b.second.tier == t;
-      if (buckets[t].count - removed < protectedFree(t)) return false;
-    }
-    return true;
-  }
-  bool prepareShrink(Region& candidate) {
-    if (preservesReserves(candidate)) return true;
-    // A free reserved block can end up in a growth region after pressure.
-    // Recreate the required free blocks in retained storage before retiring
-    // that region. Never move live buffers or count the candidate as backing.
-    for (auto& r : regions)
-      if (r.get() != &candidate && !r->building && !r->retiring) coalesce(*r);
-    for (size_t t = 0; t < buckets.size(); ++t) {
-      size_t removed = 0;
-      for (const auto& b : candidate.blocks)
-        removed += b.second.listed && b.second.tier == t;
-      while (buckets[t].count - removed < protectedFree(t))
-        if (!carve(t, &candidate)) return false;
-    }
-    return preservesReserves(candidate);
   }
   // Called only by the elastic worker or UrmaInit's deferred cleanup worker.
   bool cleanupOne(std::unique_lock<std::mutex>& lock) {
@@ -377,15 +358,18 @@ struct MemoryPool::State : std::enable_shared_from_this<State> {
                 Clock::now() + std::chrono::milliseconds(config.idle_ms);
             if (stopping) continue;
           }
+          size_t retained = registered;
+          for (const auto& r : regions)
+            if (r->retiring && !r->building) retained -= r->bytes;
           for (auto& r : regions)
-            if (!r->initial && !r->building && !r->retiring && !r->busy() &&
-                registered - r->bytes >= config.pool_size &&
-                now - r->idle >= std::chrono::milliseconds(config.idle_ms) &&
-                prepareShrink(*r))
+            if (!r->initial && !r->building && !r->retiring && !r->activeBlocks &&
+                retained >= config.pool_size + r->bytes &&
+                now - r->idle >= std::chrono::milliseconds(config.idle_ms)) {
               markRetiring(*r);
-          bool demand = false;
-          for (const auto& b : buckets)
-            for (bool v : b.requested) demand |= v;
+              retained -= r->bytes;
+            }
+          bool demand = requestedLarge != 0;
+          for (const auto& b : buckets) demand |= b.requested;
           if (demand && now >= growthRetry) {
             lock.unlock();
             IoBufPool::reclaim(this, false);
@@ -395,29 +379,23 @@ struct MemoryPool::State : std::enable_shared_from_this<State> {
               if (!r->retiring) coalesce(*r);
             size_t needed = 0;
             for (size_t t = 0; t < buckets.size(); ++t) {
-              for (size_t p = 0; p < kUrmaMemoryPurposes; ++p) {
-                auto& request = buckets[t].requested[p];
-                if (!request) continue;
-                const size_t n = config.classes[t].bytes;
-                if (n > config.budgets[p] - held[p]) {
-                  request = false;
-                  continue;
-                }
-                if (buckets[t].count <= protectedFree(t, p)) carve(t);
-                // A free block reserved for another purpose is not capacity
-                // for this waiter. Re-evaluate exactly the requested class.
-                if (buckets[t].count > protectedFree(t, p))
-                  request = false;
-                else
-                  needed = std::max(needed, n);
-              }
+              auto& bucket = buckets[t];
+              if (!bucket.requested) continue;
+              const size_t n = config.classes[t].bytes;
+              if (bucket.free || carve(n, t)) bucket.requested = false;
+              else needed = std::max(needed, n);
             }
-            const auto minimum = std::max(config.region_bytes, needed);
-            const auto padding = (page - minimum % page) % page;
+            if (requestedLarge) {
+              // Do not cache a class for each large size. Leave the free extent
+              // unclassified until the waiting allocator consumes it.
+              if (carve(requestedLarge, unused)) requestedLarge = 0;
+              else needed = std::max(needed, requestedLarge);
+            }
+            notify();
             const auto available = hard - registered - reserved;
-            if (needed && minimum <= available &&
-                padding <= available - minimum) {
-              const auto bytes = minimum + padding;
+            const auto padding = (page - needed % page) % page;
+            if (needed && needed <= available && padding <= available - needed) {
+              const auto bytes = std::min(std::max(config.region_bytes, needed + padding), available);
               auto r = prepare(bytes, false);  // E charged before unlocking
               lock.unlock();
               const auto began = Clock::now();
@@ -450,36 +428,24 @@ void MemoryPool::validate(const UrmaPoolConfig& c) {
   if (!c.enabled) return;
   const auto page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
   const size_t hard = c.pool_max_size ? c.pool_max_size : c.pool_size;
-  if (!page || !c.pool_size || c.pool_size % page || hard % page ||
-      c.pool_size > hard || !c.region_bytes || c.region_bytes % page ||
+  if (!page || !c.pool_size || c.pool_size % page)
+    throw std::invalid_argument("registered_pool.pool_size must be positive and page-aligned");
+  if (hard < c.pool_size || hard % page)
+    throw std::invalid_argument("registered_pool.pool_max_size must be page-aligned and >= pool_size (0 uses pool_size)");
+  if (!c.region_bytes || c.region_bytes % page ||
       c.classes.empty() || c.classes.size() > 64 || !c.retry_ms || !c.idle_ms ||
       c.tls_cache_blocks > 16 || c.tls_block_size < 4096)
     throw std::invalid_argument(
         "invalid URMA soft/hard capacity, alignment or cache");
-  size_t previous = 0, reserveBytes = 0;
-  std::array<size_t, kUrmaMemoryPurposes> byPurpose{};
+  size_t previous = 0;
   for (const auto& tier : c.classes) {
     if (tier.bytes <= previous || tier.bytes % 4096 || tier.bytes > UINT32_MAX)
-      throw std::invalid_argument(
-          "URMA size classes must increase in 4 KiB units");
+      throw std::invalid_argument("URMA size classes must increase in 4 KiB units");
     previous = tier.bytes;
-    for (size_t p = 0; p < kUrmaMemoryPurposes; ++p) {
-      if (byPurpose[p] > c.budgets[p] ||
-          tier.reserve[p] > (c.budgets[p] - byPurpose[p]) / tier.bytes ||
-          tier.reserve[p] > (c.pool_size - reserveBytes) / tier.bytes)
-        throw std::invalid_argument(
-            "URMA startup class reserves exceed soft capacity/budget");
-      const size_t n = tier.reserve[p] * tier.bytes;
-      byPurpose[p] += n;
-      reserveBytes += n;
-    }
   }
-  if (c.tls_block_size > c.classes.back().bytes)
-    throw std::invalid_argument("TLS block has no registered size class");
-  for (auto n : c.budgets)
-    if (!n || n > hard || n % 4096)
-      throw std::invalid_argument(
-          "URMA purpose budget outside hard capacity/alignment");
+  if (c.tls_block_size > hard)
+    throw std::invalid_argument("TLS block exceeds registered pool capacity");
+
 }
 MemoryPool::MemoryPool(urma_context_t* context, const UrmaPoolConfig& config) {
   validate(config);
@@ -500,48 +466,41 @@ MemoryPool::MemoryPool(urma_context_t* context, const UrmaPoolConfig& config) {
 MemoryPool::~MemoryPool() {
   if (state_->worker.joinable() || !state_->regions.empty()) std::terminate();
 }
-UrmaPoolBuffer MemoryPool::allocate(size_t bytes, UrmaMemoryPurpose purpose,
-                                    UrmaPoolSignal* waiter) {
+UrmaPoolBuffer MemoryPool::allocate(size_t bytes, UrmaPoolSignal* waiter) {
   auto& s = *state_;
   std::lock_guard<std::mutex> lock(s.mutex);
-  const size_t p = size_t(purpose);
-  if (s.stopping || !bytes || p >= kUrmaMemoryPurposes) return {};
-  for (size_t t = 0; t < s.buckets.size(); ++t) {
-    const size_t capacity = s.config.classes[t].bytes;
-    if (capacity < bytes) continue;
-    if (capacity > s.config.budgets[p] - s.held[p]) break;
-    try {
-      if (s.buckets[t].count <= s.protectedFree(t, p)) {
-        if (!s.carve(t)) {
-          for (auto& r : s.regions)
-            if (!r->building && !r->retiring) s.coalesce(*r);
-          s.carve(t);
-        }
-      }
-      if (s.buckets[t].count > s.protectedFree(t, p)) {
-        auto* b = s.buckets[t].free;
-        for (auto& r : s.regions)
-          if (r.get() == b->region) {
-            auto result = s.pin(r, b, 0);
-            b->purpose = p;
-            s.held[p] += b->bytes;
-            ++s.buckets[t].allocated[p];
-            s.buckets[t].requested[p] = false;
-            ++s.counters.fast_allocations;
-            return result;
-          }
-      }
-      if (s.config.elastic && s.worker.joinable()) {
-        s.buckets[t].requested[p] = true;
-        s.changed.notify_all();
-      }
-    } catch (const std::bad_alloc&) {
+  const size_t capacity = bufferSize(bytes);
+  if (s.stopping || !capacity) return {};
+  size_t tier = State::unused;
+  for (size_t t = 0; t < s.buckets.size(); ++t)
+    if (s.config.classes[t].bytes == capacity) { tier = t; break; }
+  try {
+    auto* b = tier == State::unused ? nullptr : s.buckets[tier].free;
+    if (!b) b = s.carve(capacity, tier);
+    if (!b) {
+      for (auto& r : s.regions)
+        if (!r->building && !r->retiring) s.coalesce(*r);
+      b = s.carve(capacity, tier);
     }
-    break;  // Do not silently skip a configured 12 KiB tier for 16 KiB.
+    if (b) {
+      auto result = s.pin(*b->region, b, 0);
+      if (tier != State::unused) s.buckets[tier].requested = false;
+      else if (s.requestedLarge == capacity) s.requestedLarge = 0;
+      ++s.counters.fast_allocations;
+      return result;
+    }
+    if (s.config.elastic && s.worker.joinable()) {
+      if (tier != State::unused) s.buckets[tier].requested = true;
+      else s.requestedLarge = std::max(s.requestedLarge, capacity);
+      s.changed.notify_all();
+    }
+  } catch (const std::bad_alloc&) {
+    // Metadata allocation failure is not registered-capacity backpressure.
+    ++s.counters.allocation_failures;
+    throw;
   }
   ++s.counters.allocation_failures;
-  // Serialize the failed attempt and subscription with physical returns and
-  // growth publication: capacity cannot arrive in an unobserved gap.
+  // Serialize subscription with returns/publication; never block an IO owner.
   if (waiter) waiter->arm();
   return {};
 }
@@ -552,7 +511,7 @@ UrmaPoolBuffer MemoryPool::lookup(const void* address, size_t length,
   const auto start = reinterpret_cast<uintptr_t>(address);
   if (s.stopping || !start || !length) return {};
   for (auto& r : s.regions) {
-    if (r->building || r->retiring || (exported && !r->initial)) continue;
+    if (r->building || r->retiring) continue;
     const auto base = reinterpret_cast<uintptr_t>(r->base);
     if (start < base || start - base >= r->bytes ||
         length > r->bytes - (start - base))
@@ -562,11 +521,7 @@ UrmaPoolBuffer MemoryPool::lookup(const void* address, size_t length,
     if (it == r->blocks.begin()) return {};
     auto& b = std::prev(it)->second;
     if (!b.refs[0] || length > b.bytes - (offset - b.offset)) return {};
-    try {
-      return s.pin(r, &b, exported ? 2 : 1);
-    } catch (const std::bad_alloc&) {
-      return {};
-    }
+    return s.pin(*r, &b, exported ? 2 : 1);
   }
   return {};
 }
@@ -575,8 +530,25 @@ UrmaPoolBuffer MemoryPool::initialSegment() {
   std::lock_guard<std::mutex> lock(s.mutex);
   if (!s.stopping)
     for (auto& r : s.regions)
-      if (r->initial && !r->retiring) return s.pin(r, nullptr, 0);
+      if (r->initial && !r->retiring) return s.pin(*r, nullptr, 0);
   return {};
+}
+UrmaPoolBuffer MemoryPool::holdSegment(uint64_t id) {
+  auto& s = *state_;
+  std::lock_guard<std::mutex> lock(s.mutex);
+  if (!s.stopping)
+    for (auto& r : s.regions)
+      if (r->id == id && !r->building && !r->retiring)
+        return s.pin(*r, nullptr, 0);
+  return {};
+}
+std::vector<uint64_t> MemoryPool::revocableSegments() const {
+  std::lock_guard<std::mutex> lock(state_->mutex);
+  std::vector<uint64_t> ids;
+  for (const auto& r : state_->regions)
+    if (!r->initial && r->retiring && !r->building && !r->activeBlocks)
+      ids.push_back(r->id);
+  return ids;
 }
 void MemoryPool::retire(const UrmaPoolBuffer& buffer) {
   {
@@ -618,9 +590,15 @@ bool MemoryPool::shutdown(std::chrono::milliseconds timeout) {
   return state_->regions.empty();
 }
 size_t MemoryPool::bufferSize(size_t requested) const noexcept {
-  for (const auto& t : state_->config.classes)
-    if (t.bytes >= requested) return t.bytes;
-  return 0;
+  if (!requested) return 0;
+  const auto& s = *state_;
+  // The initial region stays registered; a growth region must fit beside it.
+  const size_t limit = std::max(s.config.pool_size,
+      s.config.elastic ? s.hard - s.config.pool_size : size_t(0));
+  for (const auto& t : s.config.classes)
+    if (t.bytes >= requested) return t.bytes <= limit ? t.bytes : 0;
+  const size_t padding = (s.page - requested % s.page) % s.page;
+  return requested <= limit && padding <= limit - requested ? requested + padding : 0;
 }
 const UrmaPoolConfig& MemoryPool::config() const noexcept {
   return state_->config;
@@ -649,12 +627,13 @@ void MemoryPool::setCached(const UrmaPoolBuffer& buffer, bool cached) {
     }
 }
 bool MemoryPool::reusable(const UrmaPoolBuffer& buffer, bool recycle) const {
+  if (!recycle)
+    return buffer.pin_ && buffer.pin_->reusable(state_.get());
   std::lock_guard<std::mutex> lock(state_->mutex);
   if (!state_->stopping)
     for (auto& r : state_->regions)
       if (r->id == buffer.regionId() && r->segment == buffer.segment()) {
         if (r->retiring) return false;
-        if (!recycle) return true;
         const auto offset = static_cast<const char*>(buffer.data()) -
                             static_cast<const char*>(r->base);
         auto it = r->blocks.find(offset);
@@ -670,7 +649,6 @@ UrmaPoolStats MemoryPool::stats() const {
   out.hard_bytes = state_->hard;
   out.registered_bytes = state_->registered;
   out.registering_bytes = state_->reserved;
-  out.held_by_purpose = state_->held;
   out.regions = state_->regions.size();
   for (const auto& r : state_->regions) {
     if (r->building) continue;

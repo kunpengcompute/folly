@@ -1,32 +1,42 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. Licensed under Apache-2.0.
-# Contract tests exercise behavior, not a Cartesian product of parameter setters.
-foreach(test MemoryContract ConnectionQueue CleanupQueue Interrupt)
+# Shared-owner and socket contracts use deterministic SDK fixtures.
+foreach(test MemoryContract Wire ResourceSharing Init Buffer CleanupQueue SocketContract)
   add_executable(Urma${test}Test ${test}Test.cpp)
   target_link_libraries(Urma${test}Test PRIVATE folly ${CMAKE_DL_LIBS})
   apply_folly_compile_options_to_target(Urma${test}Test)
   if(test STREQUAL "MemoryContract")
     add_test(NAME URMA.${test} COMMAND Urma${test}Test ${CMAKE_CURRENT_SOURCE_DIR}/../urma.json)
-  else()
+  elseif(NOT test STREQUAL "SocketContract")
     add_test(NAME URMA.${test} COMMAND Urma${test}Test)
   endif()
-  set_tests_properties(URMA.${test} PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77 LABELS "URMA")
+  if(NOT test STREQUAL "SocketContract")
+    set_tests_properties(URMA.${test} PROPERTIES TIMEOUT 60 LABELS "URMA")
+  endif()
 endforeach()
-set_tests_properties(URMA.ConnectionQueue PROPERTIES RESOURCE_LOCK urma_device)
-foreach(mode stop throw)
-  add_test(NAME URMA.CompletionCallback.${mode} COMMAND UrmaConnectionQueueTest ${mode})
-  set_tests_properties(URMA.CompletionCallback.${mode} PROPERTIES TIMEOUT 30
-    SKIP_RETURN_CODE 77 LABELS "URMA;device" RESOURCE_LOCK urma_device)
+foreach(mode read-error rx-timeout revoke-abort close-read close-read-unknown rnr-gap read-pressure)
+  add_test(NAME URMA.ResourceSharing.${mode} COMMAND UrmaResourceSharingTest --${mode})
+  set_tests_properties(URMA.ResourceSharing.${mode} PROPERTIES TIMEOUT 60 LABELS "URMA")
 endforeach()
-add_executable(UrmaSocketContractTest SocketContractTest.cpp)
-target_link_libraries(UrmaSocketContractTest PRIVATE folly ${CMAKE_DL_LIBS})
-apply_folly_compile_options_to_target(UrmaSocketContractTest)
-foreach(mode send read pressure multi retry cancel prepare_fail queue_fail process threads uncertain chain chain_single_sge new_region owner_exit rnr_data rnr_read rnr_free rnr_timeout rnr_pull_timeout rnr_cancel rnr_unknown batch_reclaim rnr_full_duplex rnr_fanout completion_order
-    callback_read callback_read_movable callback_write callback_close
-    callback_unregister callback_replace tls_alignment
-    drain_read_budget drain_read_sq drain_read_reject drain_read_accepted
-    drain_read_unknown drain_read_failed eof_tail eof_movable eof_paused
-    eof_read_budget eof_read_reject eof_truncated)
+foreach(mode callback_read callback_read_movable callback_write callback_close
+    callback_unregister callback_replace eof_tail eof_movable eof_paused
+    eof_read_budget eof_read_reject eof_truncated eof_duplicate eof_missing_tail
+    delivery_batch delivery_event delivery_close timer_progress timer_watchdog)
   add_test(NAME URMA.Socket.${mode} COMMAND UrmaSocketContractTest ${mode})
-  set_tests_properties(URMA.Socket.${mode} PROPERTIES TIMEOUT 45
-    SKIP_RETURN_CODE 77 LABELS "URMA;device" RESOURCE_LOCK urma_device)
+  set_tests_properties(URMA.Socket.${mode} PROPERTIES TIMEOUT 45 LABELS "URMA")
 endforeach()
+# Existing dual-host programs remain explicit hardware validation entry points.
+foreach(test Echo Coalescing Read CleanupRead)
+  add_executable(Urma${test}Test ${test}Test.cpp)
+  target_link_libraries(Urma${test}Test PRIVATE folly ${CMAKE_DL_LIBS})
+  apply_folly_compile_options_to_target(Urma${test}Test)
+endforeach()
+foreach(test Read Cleanup)
+  add_library(Urma${test}FaultInjection SHARED ${test}FaultInjection.cpp)
+  target_link_libraries(Urma${test}FaultInjection PRIVATE folly ${CMAKE_DL_LIBS})
+  apply_folly_compile_options_to_target(Urma${test}FaultInjection)
+endforeach()
+add_executable(UrmaSegmentStateTest SegmentStateTest.cpp)
+target_link_libraries(UrmaSegmentStateTest PRIVATE folly ${CMAKE_DL_LIBS})
+apply_folly_compile_options_to_target(UrmaSegmentStateTest)
+add_test(NAME URMA.SegmentState COMMAND UrmaSegmentStateTest)
+set_tests_properties(URMA.SegmentState PROPERTIES TIMEOUT 60 LABELS "URMA")

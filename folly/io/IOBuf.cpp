@@ -364,6 +364,9 @@ unique_ptr<IOBuf> IOBuf::create(std::size_t capacity) {
 }
 
 unique_ptr<IOBuf> IOBuf::createCombined(std::size_t capacity) {
+#ifdef FOLLY_HAVE_URMA
+  if (auto pooled = UrmaInit::tryCreateIOBuf(capacity)) return pooled;
+#endif
   if (capacity > kMaxIOBufSize) {
     throw_exception<std::bad_alloc>();
   }
@@ -1094,6 +1097,22 @@ void IOBuf::reserveSlow(std::size_t minHeadroom, std::size_t minTailroom) {
     return;
   }
 
+#ifdef FOLLY_HAVE_URMA
+  if (UrmaInit::poolIOBufAllocationEnabled()) {
+    uint8_t* buffer;
+    SharedInfo* info;
+    size_t capacity;
+    allocExtBuffer(newCapacity, &buffer, &info, &capacity);
+    if (length_) memcpy(buffer + minHeadroom, data_, length_);
+    decrementRefcount();
+    setFlagsAndSharedInfo(0, info);
+    buf_ = buffer;
+    data_ = buffer + minHeadroom;
+    capacity_ = capacity;
+    return;
+  }
+#endif
+
   size_t newAllocatedCapacity = 0;
   uint8_t* newBuffer = nullptr;
   std::size_t newHeadroom = 0;
@@ -1221,6 +1240,23 @@ void IOBuf::allocExtBuffer(
     throw_exception<std::bad_alloc>();
   }
 
+#ifdef FOLLY_HAVE_URMA
+  if (UrmaInit::poolIOBufAllocationEnabled()) {
+    size_t bytes;
+    if (!checked_add(&bytes, minCapacity, sizeof(SharedInfo)))
+      throw_exception<std::bad_alloc>();
+    auto block = UrmaInit::poolAlloc(bytes);
+    if (!block) throw_exception<std::bad_alloc>();
+    auto owner = std::make_unique<UrmaPoolBuffer>(std::move(block));
+    auto* buf = static_cast<uint8_t*>(owner->data());
+    initExtBuffer(buf, owner->capacity(), infoReturn, capacityReturn);
+    (*infoReturn)->freeFn = UrmaInit::freePoolBuffer;
+    (*infoReturn)->userData = owner.release();
+    *bufReturn = buf;
+    return;
+  }
+#endif
+
   size_t mallocSize = goodExtBufferSize(minCapacity);
   auto buf = static_cast<uint8_t*>(checkedMalloc(mallocSize));
   initExtBuffer(buf, mallocSize, infoReturn, capacityReturn);
@@ -1270,6 +1306,17 @@ void IOBuf::initExtBuffer(
 }
 
 fbstring IOBuf::moveToFbString() {
+#ifdef FOLLY_HAVE_URMA
+  // fbstring takes malloc ownership; registered storage cannot be handed off.
+  if (UrmaInit::poolIOBufAllocationEnabled()) {
+    fbstring result;
+    result.reserve(computeChainDataLength());
+    for (const auto& range : *this)
+      result.append(reinterpret_cast<const char*>(range.data()), range.size());
+    *this = IOBuf();
+    return result;
+  }
+#endif
   // we need to save useHeapFullStorage and the observerListHead since
   // sharedInfo() may not be valid after fbstring str
   bool useHeapFullStorage = false;

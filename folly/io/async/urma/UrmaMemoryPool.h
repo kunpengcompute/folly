@@ -4,7 +4,6 @@
 #ifdef FOLLY_HAVE_URMA
 #include <urma_api.h>
 
-#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -14,55 +13,29 @@
 #include <vector>
 
 namespace folly {
-enum class UrmaMemoryPurpose : size_t {
-  Rx,
-  Tx,
-  Control,
-  ReadSource,
-  ReadTarget,
-  ReadControl,  // READ completion messages have a separate progress reserve.
-  Count
-};
-constexpr size_t kUrmaMemoryPurposes = size_t(UrmaMemoryPurpose::Count);
 struct UrmaPoolClass {
   size_t bytes;
-  std::array<size_t, kUrmaMemoryPurposes> reserve;
-  bool operator==(const UrmaPoolClass& other) const {
-    return bytes == other.bytes && reserve == other.reserve;
-  }
+  bool operator==(const UrmaPoolClass& other) const { return bytes == other.bytes; }
 };
 struct UrmaPoolConfig {
   bool enabled{true};
-  // Process-wide IOBuf allocation mode after UrmaInit; misses use normal heap.
+  // Process-wide IOBuf allocation mode after UrmaInit; misses throw bad_alloc.
   bool zero_copy{true};
   // Initial process-wide capacity, not the size of each region.
   size_t pool_size{256 * 1024 * 1024};
   // Zero means pool_size. Set elastic=false to keep a fixed registered pool.
   size_t pool_max_size{512 * 1024 * 1024};
   bool elastic{true};
+  // Requests including slice metadata must fit this size to enter TLS.
+  // Retained capacity per thread is at most tls_cache_blocks times the pool's
+  // rounded allocation size for tls_block_size; live uncached users are extra.
   size_t tls_block_size{16384};
   size_t tls_cache_blocks{2};
   // Optional growth unit; pool_size remains the initial total capacity.
   size_t region_bytes{4 * 1024 * 1024};
-  // Maximum held physical bytes per purpose. Class reserves protect progress.
-  std::array<size_t, kUrmaMemoryPurposes> budgets{
-      {32 * 1024 * 1024, 16 * 1024 * 1024, 4 * 1024 * 1024, 102 * 1024 * 1024,
-       102 * 1024 * 1024, 4 * 1024 * 1024}};
   std::vector<UrmaPoolClass> classes{
-      {4096, {{0, 4, 4, 2, 2}}},
-      {16384, {{0, 0, 0, 2, 2}}},
-      {65536, {{0, 0, 0, 1, 1}}},
-      {262144, {{4, 0, 0, 1, 1}}},
-      {1048576, {{0, 0, 0, 1, 1}}},
-      // Grow intermediate large classes on demand; a protocol header must not
-      // turn a 1 MiB payload into a 16 MiB allocation/clear on every request.
-      {2097152, {{0, 0, 0, 0, 0}}},
-      {4194304, {{0, 0, 0, 0, 0}}},
-      {8388608, {{0, 0, 0, 0, 0}}},
-      // An 8 MiB body also needs serializer/TLS metadata. Keep those small
-      // additions from doubling each source and target's physical charge.
-      {8388608 + 65536, {{0, 0, 0, 0, 0}}},
-      {16777216, {{0, 0, 0, 1, 1}}}};
+      {4096}, {16384}, {65536}, {262144}, {1048576}, {2097152}, {4194304},
+      {8388608}, {8388608 + 65536}, {16777216}};
   uint32_t idle_ms{1000};
   uint32_t retry_ms{100};
   bool operator==(const UrmaPoolConfig& other) const;
@@ -80,7 +53,6 @@ struct UrmaPoolStats {
   size_t tls_retained_bytes{0};
   uint64_t register_calls{0}, unregister_calls{0};
   uint64_t register_nanoseconds{0}, unregister_nanoseconds{0};
-  std::array<size_t, kUrmaMemoryPurposes> held_by_purpose{};
 };
 struct UrmaPoolRegionInfo {
   uint64_t id;
@@ -138,11 +110,13 @@ class MemoryPool {
   static void validate(const UrmaPoolConfig& config);
   MemoryPool(urma_context_t* context, const UrmaPoolConfig& config);
   ~MemoryPool();
-  UrmaPoolBuffer allocate(size_t bytes, UrmaMemoryPurpose purpose,
-                          UrmaPoolSignal* waiter = nullptr);
+  UrmaPoolBuffer allocate(size_t bytes, UrmaPoolSignal* waiter = nullptr);
   UrmaPoolBuffer lookup(const void* address, size_t length, bool exported);
-  // Connection hold for the only segment advertised in HELLO.
+  // Region leases prevent unregister while a peer can still reference a segment.
   UrmaPoolBuffer initialSegment();
+  UrmaPoolBuffer holdSegment(uint64_t regionId);
+  // Cold-path snapshot: no new allocation/export, and all block users drained.
+  std::vector<uint64_t> revocableSegments() const;
   size_t bufferSize(size_t requested) const noexcept;
   void setCached(const UrmaPoolBuffer&, bool cached);
   bool reusable(const UrmaPoolBuffer&, bool recycle = false) const;

@@ -1,18 +1,23 @@
 /* Copyright (c) Huawei Technologies Co., Ltd. 2026. Licensed under Apache-2.0.
  */
 #pragma once
-#ifdef FOLLY_HAVE_URMA
-#include <urma_api.h>
-
 #include <array>
-#include <atomic>
+#include <cstddef>
+#include <cstdint>
 #include <cstring>
-#include <stdexcept>
+
 namespace folly::urma_detail {
+constexpr size_t kHeaderSize = 24;
+constexpr size_t kPullSize = 40;
+constexpr size_t kHelloSize = 102;
+constexpr size_t kSegmentSize = 40;
+constexpr uint16_t kHelloVersion = 1;
+constexpr uint8_t kWireVersion = 1;
 constexpr uint32_t kMagic = 0x55524d41;
-constexpr size_t kHeaderBytes = 24, kHelloBytes = 98, kPullBytes = 32;
-constexpr size_t kEndBytes = 12;
-enum class Message : uint8_t { Data = 0, Pull = 1, Free = 2 };
+enum class PacketKind : uint8_t {
+  Data = 0, Pull = 1, Free = 2, Segment = 3, SegmentReady = 4,
+  SegmentRevoke = 5, SegmentRevoked = 6
+};
 inline uint64_t getInteger(const uint8_t* p, size_t n) {
   uint64_t result = 0;
   for (size_t i = 0; i < n; ++i) result = (result << 8) | p[i];
@@ -24,106 +29,116 @@ inline void putInteger(uint8_t* p, uint64_t v, size_t n) {
     v >>= 8;
   }
 }
-// Sent on TCP before a graceful FIN. The exclusive DATA/PULL sequence bounds
-// the receive stream across the independently dispatched TCP and URMA paths.
-inline std::array<uint8_t, kEndBytes> encodeEnd(uint64_t nextSequence) {
-  std::array<uint8_t, kEndBytes> p{};
-  putInteger(p.data(), kMagic, 4);
-  putInteger(p.data() + 4, nextSequence, 8);
-  return p;
+inline void store16(uint8_t* p, uint16_t n) { putInteger(p, n, 2); }
+inline uint16_t load16(const uint8_t* p) { return getInteger(p, 2); }
+inline void store32(uint8_t* p, uint32_t n) { putInteger(p, n, 4); }
+inline uint32_t load32(const uint8_t* p) { return getInteger(p, 4); }
+inline void store64(uint8_t* p, uint64_t n) { putInteger(p, n, 8); }
+inline uint64_t load64(const uint8_t* p) { return getInteger(p, 8); }
+// TCP write-side boundary: the first business sequence not sent by the peer.
+constexpr size_t kEndSize = 12;
+inline std::array<uint8_t, kEndSize> encodeEnd(uint64_t nextSequence) {
+  std::array<uint8_t, kEndSize> result{};
+  store32(result.data(), kMagic);
+  store64(result.data() + 4, nextSequence);
+  return result;
 }
 inline bool decodeEnd(const uint8_t* p, size_t n, uint64_t& nextSequence) {
-  if (n != kEndBytes || getInteger(p, 4) != kMagic) return false;
-  nextSequence = getInteger(p + 4, 8);
-  return nextSequence != 0;
+  if (n != kEndSize || load32(p) != kMagic || !load64(p + 4)) return false;
+  nextSequence = load64(p + 4);
+  return true;
 }
-struct RecordHeader {
-  Message type;
-  uint64_t destination, sequence;
+struct PacketHeader {
+  PacketKind kind;
+  uint64_t destination;
+  uint64_t sequence;
 };
-inline void encodeHeader(uint8_t* p, const RecordHeader& h) {
-  std::memset(p, 0, kHeaderBytes);
-  putInteger(p, kMagic, 4);
-  p[4] = 2;
-  p[6] = uint8_t(h.type);
-  putInteger(p + 8, h.destination, 8);
-  putInteger(p + 16, h.sequence, 8);
+inline void encodeHeader(uint8_t* p, const PacketHeader& h) {
+  store32(p, kMagic);
+  p[4] = kWireVersion;
+  p[5] = 0;
+  p[6] = uint8_t(h.kind);
+  p[7] = 0;
+  store64(p + 8, h.destination);
+  store64(p + 16, h.sequence);
 }
-inline bool decodeHeader(const uint8_t* p, size_t n, RecordHeader& h) {
-  if (n < 24 || getInteger(p, 4) != kMagic || p[4] != 2 || p[5] || p[7] ||
-      p[6] > 2)
+inline bool decodeHeader(const uint8_t* p, size_t n, PacketHeader& h) {
+  if (n < kHeaderSize || load32(p) != kMagic || p[4] != kWireVersion || p[5] || p[7] ||
+      p[6] > uint8_t(PacketKind::SegmentRevoked) || !load64(p + 8) || !load64(p + 16))
     return false;
-  h = {Message(p[6]), getInteger(p + 8, 8), getInteger(p + 16, 8)};
-  return h.destination && h.sequence;
+  h = {PacketKind(p[6]), load64(p + 8), load64(p + 16)};
+  return h.kind == PacketKind::Data ? n > kHeaderSize
+      : h.kind == PacketKind::Pull
+      ? n == kPullSize && load32(p + 24) && !load32(p + 28) && load64(p + 32)
+      : h.kind == PacketKind::Segment ? n == kHeaderSize + kSegmentSize
+      : n == kHeaderSize;
 }
 struct Hello {
-  uint32_t bufferSize{0}, receiveCount{0}, ioJetty{0}, uasid{0},
-      maxRead{0};
-  urma_eid_t eid{};
-  urma_seg_t segment{};
-  uint64_t socketId{0};
+  uint32_t bufferSize{0}, posted{0}, jfr{0};
+  std::array<uint8_t, 16> eid{};
+  uint32_t uasid{0};
+  uint8_t tpType{0};
   bool read{false};
+  std::array<uint8_t, 16> segmentEid{};
+  uint32_t segmentUasid{0};
+  uint64_t segmentAddress{0}, segmentLength{0};
+  uint32_t segmentToken{0}, fcJfr{0};
+  uint64_t socket{0};
+  uint32_t maxRead{0};
 };
-inline std::array<uint8_t, kHelloBytes> encodeHello(const Hello& h) {
-  std::array<uint8_t, kHelloBytes> p{};
-  putInteger(p.data(), kMagic, 4);
-  putInteger(p.data() + 4, kHelloBytes, 2);
-  putInteger(p.data() + 6, 5, 2);
-  putInteger(p.data() + 8, 2, 2);
-  putInteger(p.data() + 10, h.bufferSize, 4);
-  putInteger(p.data() + 14, h.receiveCount, 4);
-  putInteger(p.data() + 18, h.ioJetty, 4);
-  std::memcpy(p.data() + 22, h.eid.raw, 16);
-  putInteger(p.data() + 38, h.uasid, 4);
-  p[42] = URMA_CTP;
+inline void encodeHello(uint8_t* p, const Hello& h) {
+  std::memset(p, 0, kHelloSize);
+  store32(p, kMagic);
+  store16(p + 4, kHelloSize);
+  store16(p + 6, kHelloVersion);
+  store16(p + 8, kWireVersion);
+  store32(p + 10, h.bufferSize);
+  store32(p + 14, h.posted);
+  store32(p + 18, h.jfr);
+  std::memcpy(p + 22, h.eid.data(), 16);
+  store32(p + 38, h.uasid);
+  p[42] = h.tpType;
   p[43] = h.read ? 4 : 0;
-  std::memcpy(p.data() + 46, h.segment.ubva.eid.raw, 16);
-  putInteger(p.data() + 62, h.segment.ubva.uasid, 4);
-  putInteger(p.data() + 66, h.segment.ubva.va, 8);
-  putInteger(p.data() + 74, h.segment.len, 8);
-  putInteger(p.data() + 82, h.segment.token_id, 4);
-  putInteger(p.data() + 86, h.socketId, 8);
-  putInteger(p.data() + 94, h.maxRead, 4);
-  return p;
+  std::memcpy(p + 46, h.segmentEid.data(), 16);
+  store32(p + 62, h.segmentUasid);
+  store64(p + 66, h.segmentAddress);
+  store64(p + 74, h.segmentLength);
+  store32(p + 82, h.segmentToken);
+  store32(p + 86, h.fcJfr);
+  store64(p + 90, h.socket);
+  store32(p + 98, h.maxRead);
 }
 inline bool decodeHello(const uint8_t* p, size_t n, Hello& h) {
-  if (n != kHelloBytes || getInteger(p, 4) != kMagic ||
-      getInteger(p + 4, 2) != kHelloBytes || getInteger(p + 6, 2) != 5 ||
-      getInteger(p + 8, 2) != 2 || p[42] != URMA_CTP || (p[43] & ~4) || p[44] ||
-      p[45])
+  if (n != kHelloSize || load32(p) != kMagic || load16(p + 4) != n ||
+      load16(p + 6) != kHelloVersion || load16(p + 8) != kWireVersion || (p[43] & ~4) || p[44] ||
+      p[45] || !load64(p + 90))
     return false;
-  h.bufferSize = getInteger(p + 10, 4);
-  h.receiveCount = getInteger(p + 14, 4);
-  h.ioJetty = getInteger(p + 18, 4);
-  std::memcpy(h.eid.raw, p + 22, 16);
-  h.uasid = getInteger(p + 38, 4);
-  h.segment = {};
-  std::memcpy(h.segment.ubva.eid.raw, p + 46, 16);
-  h.segment.ubva.uasid = getInteger(p + 62, 4);
-  h.segment.ubva.va = getInteger(p + 66, 8);
-  h.segment.len = getInteger(p + 74, 8);
-  h.segment.token_id = getInteger(p + 82, 4);
-  h.segment.attr.bs.access = URMA_ACCESS_READ;
-  h.segment.attr.bs.token_policy = URMA_TOKEN_NONE;
-  h.socketId = getInteger(p + 86, 8);
-  h.maxRead = getInteger(p + 94, 4);
-  h.read = p[43] == 4;
-  return h.bufferSize >= 32 && h.receiveCount && h.ioJetty &&
-         h.socketId &&
-         (h.read ? h.maxRead && h.segment.ubva.va && h.segment.len
-                 : !h.maxRead);
+  h.bufferSize = load32(p + 10);
+  h.posted = load32(p + 14);
+  h.jfr = load32(p + 18);
+  std::memcpy(h.eid.data(), p + 22, 16);
+  h.uasid = load32(p + 38);
+  h.tpType = p[42];
+  h.read = p[43] != 0;
+  std::memcpy(h.segmentEid.data(), p + 46, 16);
+  h.segmentUasid = load32(p + 62);
+  h.segmentAddress = load64(p + 66);
+  h.segmentLength = load64(p + 74);
+  h.segmentToken = load32(p + 82);
+  h.fcJfr = load32(p + 86);
+  h.socket = load64(p + 90);
+  h.maxRead = load32(p + 98);
+  if (h.read)
+    return h.maxRead && h.segmentAddress && h.segmentLength &&
+        h.segmentLength <= UINT64_MAX - h.segmentAddress;
+  for (size_t i = 46; i < 86; ++i)
+    if (p[i])
+      return false;
+  return !h.maxRead;
 }
-inline bool contains(const urma_seg_t& s, uint64_t address, size_t length) {
-  return length && address >= s.ubva.va && address - s.ubva.va < s.len &&
-         length <= s.len - (address - s.ubva.va);
+inline bool containsRead(const Hello& h, uint64_t address, uint32_t length) {
+  return h.read && length && length <= h.maxRead &&
+      address >= h.segmentAddress && length <= h.segmentLength &&
+      address - h.segmentAddress <= h.segmentLength - length;
 }
-inline uint64_t allocateSocketId() {
-  static std::atomic<uint64_t> last{0};
-  auto value = last.load(std::memory_order_relaxed);
-  while (value != UINT64_MAX)
-    if (last.compare_exchange_weak(value, value + 1, std::memory_order_relaxed))
-      return value + 1;
-  throw std::runtime_error("URMA socket ID exhausted");
-}
-}  // namespace folly::urma_detail
-#endif
+} // namespace folly::urma_detail
