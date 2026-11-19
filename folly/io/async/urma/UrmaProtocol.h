@@ -10,55 +10,10 @@ namespace folly::urma_detail {
 constexpr size_t kHeaderSize = 24;
 constexpr size_t kPullSize = 40;
 constexpr size_t kSegmentSize = 40;
-struct Hello;
-inline void encodeHelloV1(uint8_t*, const Hello&);
-inline bool decodeHelloV1(const uint8_t*, Hello&);
-struct HelloLayout {
-  uint16_t version, size;
-  void (*encode)(uint8_t*, const Hello&);
-  bool (*decode)(const uint8_t*, Hello&);
-};
-struct Protocol {
-  const HelloLayout& hello;
-  uint8_t wire;
-};
-// Released combinations, newest first. Keep old entries and their codecs.
-inline constexpr HelloLayout kHelloV1{1, 75, encodeHelloV1, decodeHelloV1};
-inline constexpr Protocol kProtocols[] = {{kHelloV1, 1}};
-inline constexpr auto& kCurrentProtocol = kProtocols[0];
-// Bound reads and peeking even when the offered layout is still unknown.
-inline constexpr size_t kHelloSize = [] {
-  size_t size = 0;
-  for (const auto& p : kProtocols)
-    if (p.hello.size > size) size = p.hello.size;
-  return size;
-}();
+constexpr size_t kHelloSize = 75;
 constexpr size_t kHelloPrefixSize = 10;
-template <size_t N>
-constexpr const Protocol* selectProtocol(
-    uint16_t hello, uint16_t wire, const Protocol (&supported)[N]) {
-  for (const auto& p : supported)
-    if (p.hello.version == hello && p.wire == wire) return &p;
-  return nullptr;
-}
-constexpr bool supportsWire(uint8_t wire) {
-  for (const auto& p : kProtocols)
-    if (p.wire == wire) return true;
-  return false;
-}
-// decodeHeader already rejects unknown versions. Only mixed-wire builds
-// need a second check against the destination connection.
-constexpr bool kSingleWire = [] {
-  for (const auto& p : kProtocols)
-    if (p.wire != kCurrentProtocol.wire) return false;
-  return true;
-}();
-inline uint8_t sendWire(const Protocol* protocol) {
-  return kSingleWire ? kCurrentProtocol.wire : protocol->wire;
-}
-inline bool acceptsDecodedWire(const Protocol* protocol, uint8_t wire) {
-  return kSingleWire || protocol->wire == wire;
-}
+constexpr uint16_t kHelloVersion = 1;
+constexpr uint8_t kWireVersion = 1;
 constexpr uint32_t kMagic = 0x55524d41;
 enum class PacketKind : uint8_t {
   Data = 0, Pull = 1, Free = 2, Segment = 3, SegmentReady = 4,
@@ -95,17 +50,13 @@ inline bool decodeEnd(const uint8_t* p, size_t n, uint64_t& nextSequence) {
   return true;
 }
 struct PacketHeader {
-  PacketKind kind{};
-  uint8_t wire{kCurrentProtocol.wire};
-  uint64_t destination{}, sequence{};
-  PacketHeader() = default;
-  PacketHeader(PacketKind k, uint64_t dest, uint64_t seq,
-               uint8_t version = kCurrentProtocol.wire)
-      : kind(k), wire(version), destination(dest), sequence(seq) {}
+  PacketKind kind;
+  uint64_t destination;
+  uint64_t sequence;
 };
 inline void encodeHeader(uint8_t* p, const PacketHeader& h) {
   store32(p, kMagic);
-  p[4] = h.wire;
+  p[4] = kWireVersion;
   p[5] = 0;
   p[6] = uint8_t(h.kind);
   p[7] = 0;
@@ -113,10 +64,10 @@ inline void encodeHeader(uint8_t* p, const PacketHeader& h) {
   store64(p + 16, h.sequence);
 }
 inline bool decodeHeader(const uint8_t* p, size_t n, PacketHeader& h) {
-  if (n < kHeaderSize || load32(p) != kMagic || !supportsWire(p[4]) || p[5] || p[7] ||
+  if (n < kHeaderSize || load32(p) != kMagic || p[4] != kWireVersion || p[5] || p[7] ||
       p[6] > uint8_t(PacketKind::SegmentRevoked) || !load64(p + 8) || !load64(p + 16))
     return false;
-  h = {PacketKind(p[6]), load64(p + 8), load64(p + 16), p[4]};
+  h = {PacketKind(p[6]), load64(p + 8), load64(p + 16)};
   return h.kind == PacketKind::Data ? n > kHeaderSize
       : h.kind == PacketKind::Pull
       ? n == kPullSize && load32(p + 24) && !load32(p + 28) && load64(p + 32)
@@ -133,21 +84,15 @@ struct Hello {
   uint64_t socket{0};
   uint32_t maxRead{0};
 };
-inline void encodeHello(uint8_t* p, const Hello& h,
-                        const Protocol& protocol = kCurrentProtocol) {
+inline bool validHelloPrefix(const uint8_t* p) {
+  return load32(p) == kMagic && load16(p + 4) == kHelloSize &&
+      load16(p + 6) == kHelloVersion && load16(p + 8) == kWireVersion;
+}
+inline void encodeHello(uint8_t* p, const Hello& h) {
   store32(p, kMagic);
-  store16(p + 4, protocol.hello.size);
-  store16(p + 6, protocol.hello.version);
-  store16(p + 8, protocol.wire);
-  protocol.hello.encode(p, h);
-}
-inline bool decodeHello(const uint8_t* p, size_t n, Hello& h,
-                        const Protocol& protocol = kCurrentProtocol) {
-  return n == protocol.hello.size && load32(p) == kMagic && load16(p + 4) == n &&
-      load16(p + 6) == protocol.hello.version && load16(p + 8) == protocol.wire &&
-      protocol.hello.decode(p, h);
-}
-inline void encodeHelloV1(uint8_t* p, const Hello& h) {
+  store16(p + 4, kHelloSize);
+  store16(p + 6, kHelloVersion);
+  store16(p + 8, kWireVersion);
   store32(p + 10, h.bufferSize);
   store32(p + 14, h.jfr);
   std::memcpy(p + 18, h.eid.data(), 16);
@@ -160,7 +105,8 @@ inline void encodeHelloV1(uint8_t* p, const Hello& h) {
   store64(p + 63, h.socket);
   store32(p + 71, h.maxRead);
 }
-inline bool decodeHelloV1(const uint8_t* p, Hello& h) {
+inline bool decodeHello(const uint8_t* p, size_t n, Hello& h) {
+  if (n != kHelloSize || !validHelloPrefix(p)) return false;
   h.bufferSize = load32(p + 10);
   h.jfr = load32(p + 14);
   std::memcpy(h.eid.data(), p + 18, 16);

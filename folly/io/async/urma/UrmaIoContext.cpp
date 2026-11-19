@@ -469,11 +469,6 @@ struct UrmaIoContext::Impl : EventHandler, AsyncTimeout {
     }
     auto found = sockets.find(header.destination);
     if (found != sockets.end() &&
-        !urma_detail::acceptsDecodedWire(found->second.listener->protocol, header.wire)) {
-      found->second.listener->failed("unexpected URMA wire version");
-      return;
-    }
-    if (found != sockets.end() &&
         !found->second.listener->receiveReady(header, c, data->data(), data->length())) {
       // Keep the completed buffer, not its JFR slot. Otherwise later records
       // can occupy every slot while an earlier RNR retry needs one to arrive.
@@ -498,8 +493,7 @@ struct UrmaIoContext::Impl : EventHandler, AsyncTimeout {
       connection->listener->receive(header, c, std::move(data));
     } else {
       auto old = retired.find(header.destination);
-      if (old != retired.end() && urma_detail::acceptsDecodedWire(old->second->protocol, header.wire))
-        old->second->receive(header, c, std::move(data));
+      if (old != retired.end()) old->second->receive(header, c, std::move(data));
     }
   }
   void retryReceives() {

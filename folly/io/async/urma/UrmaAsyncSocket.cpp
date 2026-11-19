@@ -257,8 +257,7 @@ struct UrmaAsyncSocket::Impl final : AsyncSocket::ConnectCallback,
           io->waitForResources(socket);
           break;
         }
-        urma_detail::encodeHeader(packet, {work->kind, destination, work->sequence,
-                                           urma_detail::sendWire(protocol)});
+        urma_detail::encodeHeader(packet, {work->kind, destination, work->sequence});
         urma_sge_t sge{};
         sge.addr = reinterpret_cast<uintptr_t>(packet);
         sge.len = urma_detail::kHeaderSize;
@@ -444,11 +443,9 @@ struct UrmaAsyncSocket::Impl final : AsyncSocket::ConnectCallback,
       hello.segmentLength = segment->len;
       hello.segmentToken = segment->token_id;
     }
-    const auto& format = std::size(urma_detail::kProtocols) == 1
-        ? urma_detail::kCurrentProtocol : *protocol;
     std::array<uint8_t, kHelloSize> h;
-    urma_detail::encodeHello(h.data(), hello, format);
-    sendHandshake(h.data(), format.hello.size);
+    urma_detail::encodeHello(h.data(), hello);
+    sendHandshake(h.data(), h.size());
   }
   static std::unique_ptr<IOBuf> copyHandshake(const void* p, size_t n) {
     // TCP control storage is independent of registered DMA capacity, so pool
@@ -493,30 +490,20 @@ struct UrmaAsyncSocket::Impl final : AsyncSocket::ConnectCallback,
   }
   void processHandshake() {
     if (!haveHello) {
-      if (handshake.size() < urma_detail::kHelloPrefixSize) return;
       const auto* p = handshake.data();
-      const auto helloVersion = urma_detail::load16(p + 6);
-      const auto wireVersion = urma_detail::load16(p + 8);
-      const auto* selected = urma_detail::selectProtocol(
-          helloVersion, wireVersion, urma_detail::kProtocols);
-      if (!selected || (client && selected != protocol)) {
-        fail("incompatible URMA handshake version: hello=" + std::to_string(helloVersion) +
-             " wire=" + std::to_string(wireVersion));
+      if (handshake.size() < kHelloSize) {
+        if (handshake.size() >= urma_detail::kHelloPrefixSize && !urma_detail::validHelloPrefix(p)) {
+          fail("invalid URMA HELLO prefix");
+        }
         return;
       }
-      if (load32(p) != urma_detail::kMagic || urma_detail::load16(p + 4) != selected->hello.size) {
-        fail("invalid URMA HELLO magic or size");
-        return;
-      }
-      if (handshake.size() < selected->hello.size) return;
-      if (!selected->hello.decode(p, peerHello) ||
+      if (!urma_detail::decodeHello(p, kHelloSize, peerHello) ||
           peerHello.tpType != URMA_CTP || peerHello.fcJfr ||
           peerHello.bufferSize <= kHeadroom || peerHello.bufferSize > 4096 ||
           !peerHello.jfr) {
         fail("invalid URMA HELLO fields");
         return;
       }
-      protocol = selected;
       std::memcpy(peerId.eid.raw, peerHello.eid.data(), 16);
       peerId.uasid = peerHello.uasid;
       peerId.id = peerHello.jfr;
@@ -551,7 +538,7 @@ struct UrmaAsyncSocket::Impl final : AsyncSocket::ConnectCallback,
         }
       }
       haveHello = true;
-      handshake.erase(handshake.begin(), handshake.begin() + protocol->hello.size);
+      handshake.erase(handshake.begin(), handshake.begin() + kHelloSize);
       if (client) {
         uint8_t ready[4];
         store32(ready, kReady);
@@ -1188,8 +1175,7 @@ struct UrmaAsyncSocket::Impl final : AsyncSocket::ConnectCallback,
       cursor.skip(work->offset);
       cursor.pull(packet + urma_detail::kHeaderSize, payload);
     }
-    urma_detail::encodeHeader(packet, {work->kind, peerSocketId, work->sequence,
-                                       urma_detail::sendWire(protocol)});
+    urma_detail::encodeHeader(packet, {work->kind, peerSocketId, work->sequence});
     wr.opcode =
         (work->kind == SendKind::Data || work->kind == SendKind::Pull ||
          work->kind == SendKind::Segment)
@@ -1595,7 +1581,6 @@ struct UrmaAsyncSocket::Impl final : AsyncSocket::ConnectCallback,
       try {
         auto retired = std::make_shared<Retirement>(
             io, socketId, peerSocketId, peerId, res);
-        retired->protocol = protocol;
         for (const auto& entry : sources)
           if (entry.second->resources->sourceExposed.load())
             retired->sources.emplace(entry.first, entry.second->resources);

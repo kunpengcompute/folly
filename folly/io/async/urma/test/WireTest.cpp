@@ -82,15 +82,6 @@ int main() {
       0,1,0,0,0,0,0,0, 0,0,0,0,8,0,0,0, 0,0,0,9, 0,0,0,0,
       255,255,255,255,255,255,255,255, 0,128,0,0}};
   require(hello == expected);
-  // A newer server policy must select the exact pair offered by a v1 client.
-  static constexpr HelloLayout future{2, 80, nullptr, nullptr};
-  constexpr Protocol supported[] = {{future, 2}, {future, 1}, {kHelloV1, 1}};
-  auto selected = selectProtocol(load16(expected.data() + 6),
-                                 load16(expected.data() + 8), supported);
-  require(selected == &supported[2]);
-  encodeHello(hello.data(), local, *selected);
-  require(hello == expected && !selectProtocol(1, 2, supported) &&
-          !selectProtocol(1, 257, supported) && selectProtocol(2, 1, supported) == &supported[1]);
   require(
       decoded.socket == UINT64_MAX && decoded.eid == local.eid &&
       decoded.uasid == local.uasid && decoded.segmentToken == 9 &&
@@ -127,8 +118,13 @@ int main() {
   end = encodeEnd(0);
   require(!decodeEnd(end.data(), end.size(), boundary));
   encodeHello(hello.data(), local);
-  store16(hello.data() + 6, 0);
-  require(!decodeHello(hello.data(), hello.size(), decoded));
+  for (size_t offset : {6, 8}) {
+    for (uint16_t version : {0, 2, 257}) {
+      store16(hello.data() + offset, version);
+      require(!decodeHello(hello.data(), hello.size(), decoded));
+    }
+    store16(hello.data() + offset, 1);
+  }
   std::cout
       << "PASS H24/PULL40/FREE24/SEGMENT64/READY24 and HELLO75: exact wire, full uint64 IDs, versions, READ ranges\n";
 }
