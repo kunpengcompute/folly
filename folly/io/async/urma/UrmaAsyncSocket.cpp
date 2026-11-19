@@ -257,7 +257,8 @@ struct UrmaAsyncSocket::Impl final : AsyncSocket::ConnectCallback,
           io->waitForResources(socket);
           break;
         }
-        urma_detail::encodeHeader(packet, {work->kind, destination, work->sequence});
+        urma_detail::encodeHeader(packet, {work->kind, destination, work->sequence,
+                                           urma_detail::sendWire(protocol)});
         urma_sge_t sge{};
         sge.addr = reinterpret_cast<uintptr_t>(packet);
         sge.len = urma_detail::kHeaderSize;
@@ -420,7 +421,6 @@ struct UrmaAsyncSocket::Impl final : AsyncSocket::ConnectCallback,
     urma_detail::Hello hello;
     const auto& id = io->endpoint();
     hello.bufferSize = config.buffer_size;
-    hello.posted = io->snapshot().posted;
     hello.jfr = id.id;
     std::memcpy(hello.eid.data(), id.eid.raw, 16);
     hello.uasid = id.uasid;
@@ -432,19 +432,23 @@ struct UrmaAsyncSocket::Impl final : AsyncSocket::ConnectCallback,
         fail("URMA initial READ segment setup failed");
         return;
       }
-      hello.read = true;
+      if (std::memcmp(id.eid.raw, segment->ubva.eid.raw, hello.eid.size()) ||
+          id.uasid != segment->ubva.uasid) {
+        fail("URMA initial READ segment and JFR have different EID or UASID");
+        return;
+      }
       hello.maxRead =
           std::min(config.max_pending_bytes, UrmaInit::getMaxReadSize());
-      std::memcpy(hello.segmentEid.data(), segment->ubva.eid.raw, 16);
-      hello.segmentUasid = segment->ubva.uasid;
       hello.segmentAddress = segment->ubva.va;
       initialReadAddress = hello.segmentAddress;
       hello.segmentLength = segment->len;
       hello.segmentToken = segment->token_id;
     }
-    std::array<uint8_t, kHelloSize> h{};
-    urma_detail::encodeHello(h.data(), hello);
-    sendHandshake(h.data(), h.size());
+    const auto& format = std::size(urma_detail::kProtocols) == 1
+        ? urma_detail::kCurrentProtocol : *protocol;
+    std::array<uint8_t, kHelloSize> h;
+    urma_detail::encodeHello(h.data(), hello, format);
+    sendHandshake(h.data(), format.hello.size);
   }
   static std::unique_ptr<IOBuf> copyHandshake(const void* p, size_t n) {
     // TCP control storage is independent of registered DMA capacity, so pool
@@ -488,28 +492,37 @@ struct UrmaAsyncSocket::Impl final : AsyncSocket::ConnectCallback,
     processHandshake();
   }
   void processHandshake() {
-    if (!haveHello && handshake.size() >= 10 &&
-        (load32(handshake.data()) != urma_detail::kMagic ||
-         urma_detail::load16(handshake.data() + 4) != kHelloSize ||
-         urma_detail::load16(handshake.data() + 6) != urma_detail::kHelloVersion ||
-         urma_detail::load16(handshake.data() + 8) != urma_detail::kWireVersion)) {
-      fail("incompatible URMA handshake version");
-      return;
-    }
-    if (!haveHello && handshake.size() >= kHelloSize) {
-      if (!urma_detail::decodeHello(handshake.data(), kHelloSize, peerHello) ||
-          peerHello.tpType != URMA_CTP || peerHello.fcJfr ||
-          peerHello.bufferSize <= kHeadroom || peerHello.bufferSize > 4096 ||
-          !peerHello.jfr || !peerHello.posted) {
-        fail("incompatible URMA HELLO102 or flow-control mode");
+    if (!haveHello) {
+      if (handshake.size() < urma_detail::kHelloPrefixSize) return;
+      const auto* p = handshake.data();
+      const auto helloVersion = urma_detail::load16(p + 6);
+      const auto wireVersion = urma_detail::load16(p + 8);
+      const auto* selected = urma_detail::selectProtocol(
+          helloVersion, wireVersion, urma_detail::kProtocols);
+      if (!selected || (client && selected != protocol)) {
+        fail("incompatible URMA handshake version: hello=" + std::to_string(helloVersion) +
+             " wire=" + std::to_string(wireVersion));
         return;
       }
+      if (load32(p) != urma_detail::kMagic || urma_detail::load16(p + 4) != selected->hello.size) {
+        fail("invalid URMA HELLO magic or size");
+        return;
+      }
+      if (handshake.size() < selected->hello.size) return;
+      if (!selected->hello.decode(p, peerHello) ||
+          peerHello.tpType != URMA_CTP || peerHello.fcJfr ||
+          peerHello.bufferSize <= kHeadroom || peerHello.bufferSize > 4096 ||
+          !peerHello.jfr) {
+        fail("invalid URMA HELLO fields");
+        return;
+      }
+      protocol = selected;
       std::memcpy(peerId.eid.raw, peerHello.eid.data(), 16);
       peerId.uasid = peerHello.uasid;
       peerId.id = peerHello.jfr;
       peerBuffer = std::min(config.buffer_size, peerHello.bufferSize);
       peerRead =
-          peerHello.read && config.enable_read && UrmaInit::getMaxReadSize();
+          peerHello.maxRead && config.enable_read && UrmaInit::getMaxReadSize();
       peerSocketId = peerHello.socket;
       if (!client) {
         // Validate the peer before publishing our routing identity, but send
@@ -525,8 +538,8 @@ struct UrmaAsyncSocket::Impl final : AsyncSocket::ConnectCallback,
       }
       if (peerRead) {
         urma_seg_t segment{};
-        std::memcpy(segment.ubva.eid.raw, peerHello.segmentEid.data(), 16);
-        segment.ubva.uasid = peerHello.segmentUasid;
+        segment.ubva.eid = peerId.eid;
+        segment.ubva.uasid = peerId.uasid;
         segment.ubva.va = peerHello.segmentAddress;
         segment.len = peerHello.segmentLength;
         segment.token_id = peerHello.segmentToken;
@@ -538,7 +551,7 @@ struct UrmaAsyncSocket::Impl final : AsyncSocket::ConnectCallback,
         }
       }
       haveHello = true;
-      handshake.erase(handshake.begin(), handshake.begin() + kHelloSize);
+      handshake.erase(handshake.begin(), handshake.begin() + protocol->hello.size);
       if (client) {
         uint8_t ready[4];
         store32(ready, kReady);
@@ -1175,7 +1188,8 @@ struct UrmaAsyncSocket::Impl final : AsyncSocket::ConnectCallback,
       cursor.skip(work->offset);
       cursor.pull(packet + urma_detail::kHeaderSize, payload);
     }
-    urma_detail::encodeHeader(packet, {work->kind, peerSocketId, work->sequence});
+    urma_detail::encodeHeader(packet, {work->kind, peerSocketId, work->sequence,
+                                       urma_detail::sendWire(protocol)});
     wr.opcode =
         (work->kind == SendKind::Data || work->kind == SendKind::Pull ||
          work->kind == SendKind::Segment)
@@ -1581,6 +1595,7 @@ struct UrmaAsyncSocket::Impl final : AsyncSocket::ConnectCallback,
       try {
         auto retired = std::make_shared<Retirement>(
             io, socketId, peerSocketId, peerId, res);
+        retired->protocol = protocol;
         for (const auto& entry : sources)
           if (entry.second->resources->sourceExposed.load())
             retired->sources.emplace(entry.first, entry.second->resources);

@@ -18,6 +18,7 @@ class EventBase;
 class UrmaIoContext {
  public:
   struct Listener {
+    const urma_detail::Protocol* protocol{&urma_detail::kCurrentProtocol};
     virtual ~Listener() = default;
     // False retains the completed buffer; its JFR slot is replenished.
     virtual bool receiveReady(const urma_detail::PacketHeader&, const urma_cr_t&,

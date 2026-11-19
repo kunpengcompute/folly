@@ -1501,7 +1501,6 @@ int main(int argc, char** argv) {
       urma_detail::Hello hello;
       const auto& endpoint = UrmaIoContext::get(&evb).endpoint();
       hello.bufferSize = 4096;
-      hello.posted = 4;
       hello.jfr = endpoint.id;
       hello.tpType = URMA_CTP;
       hello.socket = UrmaIoContext::allocateSocketId();
@@ -1545,6 +1544,36 @@ int main(int argc, char** argv) {
       require(accepted->isUrmaReady(), "split TCP ACK not accepted");
       ::close(raw);
       acceptor.connections.clear();
+      for (size_t offset : {size_t(5), size_t(7), size_t(9)}) {
+        auto prefix = std::vector<uint8_t>(encoded.begin(), encoded.begin() + 10);
+        // Reject the old draft length, an unknown HELLO, and an unknown wire.
+        prefix[offset] = offset == 5 ? 102 : 2;
+        int pair[2];
+        require(!::socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, pair),
+                "invalid HELLO socketpair");
+        auto tcp = AsyncSocket::newSocket(&evb, NetworkSocket::fromFd(pair[0]));
+        UrmaAsyncSocket socket(std::move(tcp), std::chrono::steady_clock::now(),
+                               std::move(prefix));
+        require(socket.error() && ::recv(pair[1], reply, sizeof(reply), 0) == 0,
+                "invalid HELLO prefix did not close before reply");
+        ::close(pair[1]);
+      }
+      auto& localId = receivers.at(endpoint.id)->jfr_id;
+      for (bool changeEid : {true, false}) {
+        const auto saved = localId;
+        if (changeEid) localId.eid.raw[0] ^= 1;
+        else localId.uasid ^= 1;
+        int pair[2];
+        require(!::socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, pair),
+                "segment identity socketpair");
+        auto tcp = AsyncSocket::newSocket(&evb, NetworkSocket::fromFd(pair[0]));
+        UrmaAsyncSocket socket(std::move(tcp), std::chrono::steady_clock::now(),
+                               {encoded.begin(), encoded.end()});
+        localId = saved;
+        require(socket.error() && ::recv(pair[1], reply, sizeof(reply), 0) == 0,
+                "server advertised a READ segment with a different identity");
+        ::close(pair[1]);
+      }
       // A mixed listener may already own part or all of HELLO. Any bytes
       // still buffered by AsyncSocket must follow that prefix exactly once.
       for (size_t prefixSize : {size_t{13}, encoded.size()}) {
