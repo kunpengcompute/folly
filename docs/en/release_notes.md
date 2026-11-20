@@ -1,6 +1,6 @@
 # Release Notes
 
-<!-- md-trans-meta sourceCommit=70e53fbff2954afd12d690b81046748fe2b1410a translatedAt=2026-10-13T03:53:30.361Z pushedAt=2026-10-13T07:43:34.310Z -->
+<!-- md-trans-meta sourceCommit=9fd8cca36c7749aba8ba971f40670b2232085803 translatedAt=2026-11-17T03:53:30.361Z pushedAt=2026-11-17T07:43:34.310Z -->
 
 ## Version Requirements
 
@@ -11,13 +11,13 @@
 |Product name|Kunpeng BoostKit|
 |Product version|26.2.RC1|
 |Software name|Folly|
-|Package version|v1.1.0|
+|Package version|V1.1.0|
 
 ### OS, Compiler, and CPU
 
 |OS|Compiler|CPU|
 |--|--|--|
-|Debian 12, openEuler, or other Linux systems|Clang 16|Kunpeng 950 or other supported processors|
+|Linux system, Debian 12 or openEuler recommended|Clang 16|Kunpeng 950 processor|
 
 ### Virus Scan Result
 
@@ -29,7 +29,7 @@ For details, see [Quick Start](./quick_start.md).
 
 ## Change Description
 
-### v1.1.0
+### V1.1.0
 
 #### New Features
 
@@ -59,7 +59,7 @@ For details, see [Quick Start](./quick_start.md).
 - When an IOBuf is destructed across threads, data blocks may enter the TLS cache of the thread that performs the final release. The memory distribution across threads should be monitored.
 - The block size and cache limit affect resident memory usage and should be tuned based on the number of threads and request size distribution.
 
-### v1.0.0
+### V1.0.0
 
 #### New Features
 
@@ -71,9 +71,9 @@ For details, see [Quick Start](./quick_start.md).
 
 |Document|Description|Delivery Form|
 |---|---|---|
-|[API Reference](./api_reference.md)|Provides API usage instructions for the Folly v1.1.0 optimization features.|Open-source repository|
-|[Quick Start](./quick_start.md)|Provides entry-level guidance for compiling the optimized Folly version.|Open-source repository.|
-|[Release Notes](./release_notes.md)|Provides release information for the Folly optimization patch versions.|Open-source repository|
+|API Reference|Provides API usage instructions for the Folly V1.1.0 optimization features.|Open-source repository|
+|Quick Start|Provides entry-level guidance for compiling the optimized Folly version.|Open-source repository|
+|Release Notes|Provides release information for the Folly optimization patch versions.|Open-source repository|
 
 ### Obtaining Documentation
 
