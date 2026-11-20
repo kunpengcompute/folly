@@ -62,41 +62,35 @@ int main() {
 
   Hello local;
   local.bufferSize = 4096;
-  local.posted = 1024;
   local.jfr = 37;
   local.eid[0] = 12;
   local.uasid = 123;
   local.tpType = 1;
-  local.read = true;
-  local.segmentEid[0] =
-      13; // Segment and endpoint address domains are distinct.
-  local.segmentUasid = 456;
   local.segmentAddress = uint64_t(1) << 48;
   local.segmentLength = 128 * 1024 * 1024;
   local.segmentToken = 9;
   local.socket = UINT64_MAX;
   local.maxRead = 8 * 1024 * 1024;
-  std::array<uint8_t, kHelloSize> hello{};
+  std::array<uint8_t, kHelloSize> hello;
+  hello.fill(0xa5);
   encodeHello(hello.data(), local);
   Hello decoded;
   require(decodeHello(hello.data(), hello.size(), decoded));
+  // Independent v1 fixture, including every offset and the network byte order.
+  const std::array<uint8_t, 75> expected = {{
+      'U','R','M','A', 0,75, 0,1, 0,1, 0,0,16,0, 0,0,0,37,
+      12,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,0,0,123, 1,
+      0,1,0,0,0,0,0,0, 0,0,0,0,8,0,0,0, 0,0,0,9, 0,0,0,0,
+      255,255,255,255,255,255,255,255, 0,128,0,0}};
+  require(hello == expected);
   require(
-      load16(hello.data() + 4) == 102 && load16(hello.data() + 6) == kHelloVersion &&
-      load16(hello.data() + 8) == kWireVersion && hello[43] == 4);
-  require(
-      decoded.socket == UINT64_MAX && decoded.segmentEid[0] == 13 &&
-      decoded.segmentUasid == 456 && decoded.segmentToken == 9 &&
+      decoded.socket == UINT64_MAX && decoded.eid == local.eid &&
+      decoded.uasid == local.uasid && decoded.segmentToken == 9 &&
       decoded.segmentAddress == local.segmentAddress && decoded.fcJfr == 0);
   for (size_t n = 0; n < hello.size(); ++n)
     require(!decodeHello(hello.data(), n, decoded));
   for (size_t byte :
-       {size_t(0),
-        size_t(4),
-        size_t(6),
-        size_t(8),
-        size_t(43),
-        size_t(44),
-        size_t(45)}) {
+       {size_t(0), size_t(4), size_t(6), size_t(8)}) {
     hello[byte] ^= 1;
     require(!decodeHello(hello.data(), hello.size(), decoded));
     hello[byte] ^= 1;
@@ -109,14 +103,14 @@ int main() {
   require(!containsRead(local, UINT64_MAX - 1, 8));
   require(!containsRead(local, local.segmentAddress, 0));
   require(!containsRead(local, local.segmentAddress, local.maxRead + 1));
-  local.read = false;
+  local.maxRead = 0;
   encodeHello(hello.data(), local);
   require(!decodeHello(hello.data(), hello.size(), decoded));
   local = {};
   local.socket = 1;
   encodeHello(hello.data(), local);
   require(decodeHello(hello.data(), hello.size(), decoded));
-  require(!decoded.read && !decoded.maxRead && !decoded.segmentAddress);
+  require(!decoded.maxRead && !decoded.segmentAddress);
   uint64_t boundary = 0;
   auto end = encodeEnd(0x123456789abcdefULL);
   require(decodeEnd(end.data(), end.size(), boundary) &&
@@ -125,8 +119,13 @@ int main() {
   end = encodeEnd(0);
   require(!decodeEnd(end.data(), end.size(), boundary));
   encodeHello(hello.data(), local);
-  store16(hello.data() + 6, 0);
-  require(!decodeHello(hello.data(), hello.size(), decoded));
+  for (size_t offset : {6, 8}) {
+    for (uint16_t version : {0, 2, 257}) {
+      store16(hello.data() + offset, version);
+      require(!decodeHello(hello.data(), hello.size(), decoded));
+    }
+    store16(hello.data() + offset, 1);
+  }
   std::cout
-      << "PASS H24/PULL40/FREE24/SEGMENT64/READY24 and HELLO102: exact wire, full uint64 IDs, versions, READ ranges\n";
+      << "PASS H24/PULL40/FREE24/SEGMENT64/READY24 and HELLO75: exact wire, full uint64 IDs, versions, READ ranges\n";
 }

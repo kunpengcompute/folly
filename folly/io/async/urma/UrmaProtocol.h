@@ -9,8 +9,9 @@
 namespace folly::urma_detail {
 constexpr size_t kHeaderSize = 24;
 constexpr size_t kPullSize = 40;
-constexpr size_t kHelloSize = 102;
 constexpr size_t kSegmentSize = 40;
+constexpr size_t kHelloSize = 75;
+constexpr size_t kHelloPrefixSize = 10;
 constexpr uint16_t kHelloVersion = 1;
 constexpr uint8_t kWireVersion = 1;
 constexpr uint32_t kMagic = 0x55524d41;
@@ -74,18 +75,22 @@ inline bool decodeHeader(const uint8_t* p, size_t n, PacketHeader& h) {
       : n == kHeaderSize;
 }
 struct Hello {
-  uint32_t bufferSize{0}, posted{0}, jfr{0};
+  uint32_t bufferSize{0}, jfr{0};
   std::array<uint8_t, 16> eid{};
   uint32_t uasid{0};
   uint8_t tpType{0};
-  bool read{false};
-  std::array<uint8_t, 16> segmentEid{};
-  uint32_t segmentUasid{0};
   uint64_t segmentAddress{0}, segmentLength{0};
   uint32_t segmentToken{0}, fcJfr{0};
   uint64_t socket{0};
   uint32_t maxRead{0};
 };
+inline const char* helloPrefixError(const uint8_t* p) {
+  if (load32(p) != kMagic) return "invalid URMA HELLO magic";
+  if (load16(p + 4) != kHelloSize) return "unsupported URMA HELLO length";
+  if (load16(p + 6) != kHelloVersion) return "unsupported URMA HELLO version";
+  if (load16(p + 8) != kWireVersion) return "unsupported URMA wire version";
+  return nullptr;
+}
 inline void encodeHello(uint8_t* p, const Hello& h) {
   std::memset(p, 0, kHelloSize);
   store32(p, kMagic);
@@ -93,51 +98,38 @@ inline void encodeHello(uint8_t* p, const Hello& h) {
   store16(p + 6, kHelloVersion);
   store16(p + 8, kWireVersion);
   store32(p + 10, h.bufferSize);
-  store32(p + 14, h.posted);
-  store32(p + 18, h.jfr);
-  std::memcpy(p + 22, h.eid.data(), 16);
-  store32(p + 38, h.uasid);
-  p[42] = h.tpType;
-  p[43] = h.read ? 4 : 0;
-  std::memcpy(p + 46, h.segmentEid.data(), 16);
-  store32(p + 62, h.segmentUasid);
-  store64(p + 66, h.segmentAddress);
-  store64(p + 74, h.segmentLength);
-  store32(p + 82, h.segmentToken);
-  store32(p + 86, h.fcJfr);
-  store64(p + 90, h.socket);
-  store32(p + 98, h.maxRead);
+  store32(p + 14, h.jfr);
+  std::memcpy(p + 18, h.eid.data(), 16);
+  store32(p + 34, h.uasid);
+  p[38] = h.tpType;
+  store64(p + 39, h.segmentAddress);
+  store64(p + 47, h.segmentLength);
+  store32(p + 55, h.segmentToken);
+  store32(p + 59, h.fcJfr);
+  store64(p + 63, h.socket);
+  store32(p + 71, h.maxRead);
 }
 inline bool decodeHello(const uint8_t* p, size_t n, Hello& h) {
-  if (n != kHelloSize || load32(p) != kMagic || load16(p + 4) != n ||
-      load16(p + 6) != kHelloVersion || load16(p + 8) != kWireVersion || (p[43] & ~4) || p[44] ||
-      p[45] || !load64(p + 90))
-    return false;
+  if (n != kHelloSize || helloPrefixError(p)) return false;
   h.bufferSize = load32(p + 10);
-  h.posted = load32(p + 14);
-  h.jfr = load32(p + 18);
-  std::memcpy(h.eid.data(), p + 22, 16);
-  h.uasid = load32(p + 38);
-  h.tpType = p[42];
-  h.read = p[43] != 0;
-  std::memcpy(h.segmentEid.data(), p + 46, 16);
-  h.segmentUasid = load32(p + 62);
-  h.segmentAddress = load64(p + 66);
-  h.segmentLength = load64(p + 74);
-  h.segmentToken = load32(p + 82);
-  h.fcJfr = load32(p + 86);
-  h.socket = load64(p + 90);
-  h.maxRead = load32(p + 98);
-  if (h.read)
-    return h.maxRead && h.segmentAddress && h.segmentLength &&
+  h.jfr = load32(p + 14);
+  std::memcpy(h.eid.data(), p + 18, 16);
+  h.uasid = load32(p + 34);
+  h.tpType = p[38];
+  h.segmentAddress = load64(p + 39);
+  h.segmentLength = load64(p + 47);
+  h.segmentToken = load32(p + 55);
+  h.fcJfr = load32(p + 59);
+  h.socket = load64(p + 63);
+  h.maxRead = load32(p + 71);
+  if (!h.socket) return false;
+  if (h.maxRead)
+    return h.segmentAddress && h.segmentLength &&
         h.segmentLength <= UINT64_MAX - h.segmentAddress;
-  for (size_t i = 46; i < 86; ++i)
-    if (p[i])
-      return false;
-  return !h.maxRead;
+  return !h.segmentAddress && !h.segmentLength && !h.segmentToken;
 }
 inline bool containsRead(const Hello& h, uint64_t address, uint32_t length) {
-  return h.read && length && length <= h.maxRead &&
+  return length && length <= h.maxRead &&
       address >= h.segmentAddress && length <= h.segmentLength &&
       address - h.segmentAddress <= h.segmentLength - length;
 }

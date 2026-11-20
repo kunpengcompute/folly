@@ -420,7 +420,6 @@ struct UrmaAsyncSocket::Impl final : AsyncSocket::ConnectCallback,
     urma_detail::Hello hello;
     const auto& id = io->endpoint();
     hello.bufferSize = config.buffer_size;
-    hello.posted = io->snapshot().posted;
     hello.jfr = id.id;
     std::memcpy(hello.eid.data(), id.eid.raw, 16);
     hello.uasid = id.uasid;
@@ -432,17 +431,19 @@ struct UrmaAsyncSocket::Impl final : AsyncSocket::ConnectCallback,
         fail("URMA initial READ segment setup failed");
         return;
       }
-      hello.read = true;
+      if (std::memcmp(id.eid.raw, segment->ubva.eid.raw, hello.eid.size()) ||
+          id.uasid != segment->ubva.uasid) {
+        fail("URMA initial READ segment and JFR have different EID or UASID");
+        return;
+      }
       hello.maxRead =
           std::min(config.max_pending_bytes, UrmaInit::getMaxReadSize());
-      std::memcpy(hello.segmentEid.data(), segment->ubva.eid.raw, 16);
-      hello.segmentUasid = segment->ubva.uasid;
       hello.segmentAddress = segment->ubva.va;
       initialReadAddress = hello.segmentAddress;
       hello.segmentLength = segment->len;
       hello.segmentToken = segment->token_id;
     }
-    std::array<uint8_t, kHelloSize> h{};
+    std::array<uint8_t, kHelloSize> h;
     urma_detail::encodeHello(h.data(), hello);
     sendHandshake(h.data(), h.size());
   }
@@ -480,28 +481,30 @@ struct UrmaAsyncSocket::Impl final : AsyncSocket::ConnectCallback,
     DestructorGuard guard(owner);
     if (!live())
       return;
-    if (handshake.size() + n > kHelloSize + 4 + urma_detail::kEndSize) {
-      fail("unexpected data on URMA handshake channel");
-      return;
-    }
     handshake.insert(handshake.end(), tcpBuffer.begin(), tcpBuffer.begin() + n);
     processHandshake();
   }
   void processHandshake() {
-    if (!haveHello && handshake.size() >= 10 &&
-        (load32(handshake.data()) != urma_detail::kMagic ||
-         urma_detail::load16(handshake.data() + 4) != kHelloSize ||
-         urma_detail::load16(handshake.data() + 6) != urma_detail::kHelloVersion ||
-         urma_detail::load16(handshake.data() + 8) != urma_detail::kWireVersion)) {
-      fail("incompatible URMA handshake version");
+    const auto* p = handshake.data();
+    if (!haveHello && handshake.size() >= urma_detail::kHelloPrefixSize) {
+      if (const auto* error = urma_detail::helloPrefixError(p)) {
+        fail(error);
+        return;
+      }
+    }
+    if (handshake.size() > kHelloSize + 4 + urma_detail::kEndSize) {
+      fail("unexpected data on URMA handshake channel");
       return;
     }
-    if (!haveHello && handshake.size() >= kHelloSize) {
-      if (!urma_detail::decodeHello(handshake.data(), kHelloSize, peerHello) ||
+    if (!haveHello) {
+      if (handshake.size() < kHelloSize) {
+        return;
+      }
+      if (!urma_detail::decodeHello(p, kHelloSize, peerHello) ||
           peerHello.tpType != URMA_CTP || peerHello.fcJfr ||
           peerHello.bufferSize <= kHeadroom || peerHello.bufferSize > 4096 ||
-          !peerHello.jfr || !peerHello.posted) {
-        fail("incompatible URMA HELLO102 or flow-control mode");
+          !peerHello.jfr) {
+        fail("invalid URMA HELLO fields");
         return;
       }
       std::memcpy(peerId.eid.raw, peerHello.eid.data(), 16);
@@ -509,7 +512,7 @@ struct UrmaAsyncSocket::Impl final : AsyncSocket::ConnectCallback,
       peerId.id = peerHello.jfr;
       peerBuffer = std::min(config.buffer_size, peerHello.bufferSize);
       peerRead =
-          peerHello.read && config.enable_read && UrmaInit::getMaxReadSize();
+          peerHello.maxRead && config.enable_read && UrmaInit::getMaxReadSize();
       peerSocketId = peerHello.socket;
       if (!client) {
         // Validate the peer before publishing our routing identity, but send
@@ -525,8 +528,8 @@ struct UrmaAsyncSocket::Impl final : AsyncSocket::ConnectCallback,
       }
       if (peerRead) {
         urma_seg_t segment{};
-        std::memcpy(segment.ubva.eid.raw, peerHello.segmentEid.data(), 16);
-        segment.ubva.uasid = peerHello.segmentUasid;
+        segment.ubva.eid = peerId.eid;
+        segment.ubva.uasid = peerId.uasid;
         segment.ubva.va = peerHello.segmentAddress;
         segment.len = peerHello.segmentLength;
         segment.token_id = peerHello.segmentToken;

@@ -24,7 +24,9 @@ constexpr uint32_t kDeviceMaxReadSize = 1024 * 1024;
 uint32_t deviceRxDepth = 4096, deviceTxDepth = 4096, deviceCqDepth = 8193;
 urma_device_t device{};
 urma_device_t* deviceList[]{&device};
-urma_eid_info_t eid{};
+urma_eid_info_t deviceEids[2]{};
+uint32_t eidCount = 1;
+std::optional<uint32_t> createdIndex;
 urma_context_t context{};
 #ifndef URMA_TEST_EXTERNAL_POOL
 unsigned poolRegistrations = 0, poolUnregistrations = 0;
@@ -44,6 +46,9 @@ void reset(Failure stage = Failure::None, bool borrowed = false) {
   failure = stage;
   borrowedLibrary = borrowed;
   initializes = finalizes = 0;
+  eidCount = 1;
+  for (auto& entry : deviceEids) entry = {};
+  createdIndex.reset();
 }
 } // namespace
 
@@ -109,20 +114,22 @@ urma_status_t urma_query_device(urma_device_t*, urma_device_attr_t* attr) {
   return URMA_SUCCESS;
 }
 urma_eid_info_t* urma_get_eid_list(urma_device_t*, uint32_t* count) {
-  *count = failure == Failure::Eids ? 0 : 1;
+  *count = failure == Failure::Eids ? 0 : eidCount;
   if (!*count) {
     return nullptr;
   }
   ++eids;
-  return &eid;
+  return deviceEids;
 }
 void urma_free_eid_list(urma_eid_info_t*) {
   --eids;
 }
-urma_context_t* urma_create_context(urma_device_t*, uint32_t) {
+urma_context_t* urma_create_context(urma_device_t*, uint32_t index) {
+  createdIndex = index;
   if (failure == Failure::Context) {
     return nullptr;
   }
+  context.eid_index = index;
   ++contexts;
   return &context;
 }
@@ -178,6 +185,46 @@ int main() {
         !folly::UrmaInit::isInitialized(), "failed init published a context");
     std::cout
         << "PASS configuration allocation failure precedes SDK acquisition\n";
+
+    auto resetSparseEids = [](uint32_t secondIndex) {
+      reset();
+      eidCount = 2;
+      deviceEids[0].eid_index = 3;
+      deviceEids[0].eid.raw[0] = 0xa3;
+      deviceEids[1].eid_index = secondIndex;
+      deviceEids[1].eid.raw[0] = 0xa7;
+    };
+    auto checkEid = [&](std::optional<uint32_t> requested, size_t entry) {
+      config.eid_index = requested;
+      folly::UrmaInit::init(config);
+      const auto local = folly::UrmaInit::getLocalEid();
+      require(createdIndex == deviceEids[entry].eid_index &&
+                  folly::UrmaInit::getConfig().eid_index == createdIndex &&
+                  !std::memcmp(local.raw, deviceEids[entry].eid.raw, sizeof(local.raw)),
+              "context index and local EID must come from the selected entry");
+      folly::UrmaInit::fini();
+    };
+    resetSparseEids(7);
+    checkEid(std::nullopt, 0);
+    resetSparseEids(7);
+    checkEid(7, 1);
+    resetSparseEids(7);
+    config.eid_index = 0;
+    bool missing = false;
+    try {
+      folly::UrmaInit::init(config);
+    } catch (const std::runtime_error& e) {
+      const std::string msg(e.what());
+      missing = msg.find(config.dev_name) != std::string::npos &&
+          msg.find("eid_index=0") != std::string::npos;
+    }
+    require(missing && !createdIndex && !eids && !devices && !contexts &&
+                finalizes == 1 && !folly::UrmaInit::isInitialized(),
+            "missing EID must fail before context creation and release SDK lists");
+    resetSparseEids(0);
+    checkEid(0, 1);
+    config.eid_index.reset();
+    std::cout << "PASS sparse EID selection, missing index rollback and explicit zero\n";
 
     for (bool borrowed : {false, true}) {
       for (Failure stage :
