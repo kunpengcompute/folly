@@ -177,12 +177,12 @@ When a thread exits, `current_share` can release only the reference held by TLS 
 - It is recommended to call `setBlockSize()` only once during the startup phase.
 - The block size and per-thread cache limit should be tuned based on the request distribution, number of worker threads, and overall memory budget.
 
-## Folly V1.1.0: io_uring Hybrid Read/Write APIs
+## Folly V1.0.0: io_uring Hybrid Read/Write APIs
 
 > ![note](./public_sys-resources/icon-note.gif) **NOTE:**
->This section covers the `io_uring` hybrid read/write APIs provided in Folly V1.1.0, documented independently of the IOBuf TLS memory pool in Folly V1.1.0.
+>This section covers the `io_uring` hybrid read/write APIs provided in Folly V1.0.0, documented independently of the IOBuf TLS memory pool in Folly V1.1.0.
 
-### Folly V1.1.0: io_uring API Overview
+### Folly V1.0.0: io_uring API Overview
 
 |Name|Description|
 |--|--|

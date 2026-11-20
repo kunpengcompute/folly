@@ -33,7 +33,7 @@ folly/
 │   ├── en/                         # English documents
 │   │   ├── api_reference.md        # API reference
 │   │   ├── quick_start.md          # Quick start guide
-|   |   ├── menu_folly.md           # Document list
+|   |   ├── menu_folly_en.md           # Document list
 │   │   └── release_notes.md        # Release notes
 │   │
 │   ├── zh/                         # Chinese documents
