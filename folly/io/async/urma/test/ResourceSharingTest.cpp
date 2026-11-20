@@ -47,6 +47,7 @@ struct Echo : AsyncTransport::ReadCallback, AsyncTransport::WriteCallback {
   bool closeOnRead{false};
   bool retainRead{false};
   bool allowReadError{false};
+  std::string readErrorMessage;
   size_t readErrors{0}, eofs{0};
   std::unique_ptr<IOBuf> retained;
   explicit Echo(AsyncTransport::UniquePtr s, bool e)
@@ -87,6 +88,7 @@ struct Echo : AsyncTransport::ReadCallback, AsyncTransport::WriteCallback {
   void readEOF() noexcept override { ++eofs; }
   void readErr(const AsyncSocketException& e) noexcept override {
     if (allowReadError) {
+      readErrorMessage = e.what();
       ++readErrors;
       return;
     }
@@ -1544,20 +1546,32 @@ int main(int argc, char** argv) {
       require(accepted->isUrmaReady(), "split TCP ACK not accepted");
       ::close(raw);
       acceptor.connections.clear();
-      for (size_t offset : {size_t(5), size_t(7), size_t(9)}) {
-        auto prefix = std::vector<uint8_t>(encoded.begin(), encoded.begin() + 10);
-        // Reject the old draft length, an unknown HELLO, and an unknown wire.
-        prefix[offset] = offset == 5 ? 102 : 2;
+      auto rejectHello = [&](size_t bytes, size_t offset, uint8_t value, const char* reason) {
+        std::vector<uint8_t> frame(encoded.begin(), encoded.end());
+        frame.resize(bytes);
+        frame[offset] = value;
         int pair[2];
         require(!::socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, pair),
                 "invalid HELLO socketpair");
-        auto tcp = AsyncSocket::newSocket(&evb, NetworkSocket::fromFd(pair[0]));
-        UrmaAsyncSocket socket(std::move(tcp), std::chrono::steady_clock::now(),
-                               std::move(prefix));
-        require(socket.error() && ::recv(pair[1], reply, sizeof(reply), 0) == 0,
-                "invalid HELLO prefix did not close before reply");
+        Echo peer(AsyncTransport::UniquePtr(new UrmaAsyncSocket(&evb, pair[0])), false);
+        peer.allowReadError = true;
+        require(::send(pair[1], frame.data(), bytes, MSG_NOSIGNAL) == ssize_t(bytes),
+                "short invalid HELLO send");
+        for (int i = 0; i < 1000 && !peer.readErrors; ++i)
+          evb.loopOnce(EVLOOP_NONBLOCK);
+        require(peer.readErrors == 1 && peer.readErrorMessage.find(reason) != std::string::npos &&
+                    ::recv(pair[1], reply, sizeof(reply), 0) == 0,
+                "invalid HELLO must report the cause and close before reply");
         ::close(pair[1]);
+      };
+      for (size_t bytes : {urma_detail::kHelloPrefixSize, encoded.size()}) {
+        rejectHello(bytes, 0, 0, "invalid URMA HELLO magic");
+        rejectHello(bytes, 5, 102, "unsupported URMA HELLO length");
+        rejectHello(bytes, 7, 2, "unsupported URMA HELLO version");
+        rejectHello(bytes, 9, 2, "unsupported URMA wire version");
       }
+      rejectHello(102, 5, 102, "unsupported URMA HELLO length");
+      rejectHello(encoded.size(), 38, 0xff, "invalid URMA HELLO fields");
       auto& localId = receivers.at(endpoint.id)->jfr_id;
       for (bool changeEid : {true, false}) {
         const auto saved = localId;

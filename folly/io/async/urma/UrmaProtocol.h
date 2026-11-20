@@ -84,11 +84,15 @@ struct Hello {
   uint64_t socket{0};
   uint32_t maxRead{0};
 };
-inline bool validHelloPrefix(const uint8_t* p) {
-  return load32(p) == kMagic && load16(p + 4) == kHelloSize &&
-      load16(p + 6) == kHelloVersion && load16(p + 8) == kWireVersion;
+inline const char* helloPrefixError(const uint8_t* p) {
+  if (load32(p) != kMagic) return "invalid URMA HELLO magic";
+  if (load16(p + 4) != kHelloSize) return "unsupported URMA HELLO length";
+  if (load16(p + 6) != kHelloVersion) return "unsupported URMA HELLO version";
+  if (load16(p + 8) != kWireVersion) return "unsupported URMA wire version";
+  return nullptr;
 }
 inline void encodeHello(uint8_t* p, const Hello& h) {
+  std::memset(p, 0, kHelloSize);
   store32(p, kMagic);
   store16(p + 4, kHelloSize);
   store16(p + 6, kHelloVersion);
@@ -106,7 +110,7 @@ inline void encodeHello(uint8_t* p, const Hello& h) {
   store32(p + 71, h.maxRead);
 }
 inline bool decodeHello(const uint8_t* p, size_t n, Hello& h) {
-  if (n != kHelloSize || !validHelloPrefix(p)) return false;
+  if (n != kHelloSize || helloPrefixError(p)) return false;
   h.bufferSize = load32(p + 10);
   h.jfr = load32(p + 14);
   std::memcpy(h.eid.data(), p + 18, 16);

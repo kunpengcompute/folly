@@ -481,20 +481,23 @@ struct UrmaAsyncSocket::Impl final : AsyncSocket::ConnectCallback,
     DestructorGuard guard(owner);
     if (!live())
       return;
-    if (handshake.size() + n > kHelloSize + 4 + urma_detail::kEndSize) {
-      fail("unexpected data on URMA handshake channel");
-      return;
-    }
     handshake.insert(handshake.end(), tcpBuffer.begin(), tcpBuffer.begin() + n);
     processHandshake();
   }
   void processHandshake() {
+    const auto* p = handshake.data();
+    if (!haveHello && handshake.size() >= urma_detail::kHelloPrefixSize) {
+      if (const auto* error = urma_detail::helloPrefixError(p)) {
+        fail(error);
+        return;
+      }
+    }
+    if (handshake.size() > kHelloSize + 4 + urma_detail::kEndSize) {
+      fail("unexpected data on URMA handshake channel");
+      return;
+    }
     if (!haveHello) {
-      const auto* p = handshake.data();
       if (handshake.size() < kHelloSize) {
-        if (handshake.size() >= urma_detail::kHelloPrefixSize && !urma_detail::validHelloPrefix(p)) {
-          fail("invalid URMA HELLO prefix");
-        }
         return;
       }
       if (!urma_detail::decodeHello(p, kHelloSize, peerHello) ||

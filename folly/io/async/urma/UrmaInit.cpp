@@ -205,7 +205,7 @@ void UrmaInit::init(const UrmaConfig& requested) {
     if (!(*memoryPool)->warm(std::chrono::seconds(5)))
       throw std::runtime_error("URMA soft capacity unavailable at startup");
     XLOG(INFO) << "URMA context device=" << device->name
-               << " eid_index=" << *settings.eid_index;
+               << " eid_index=" << created->eid_index;
     std::atomic_store(&*publishedPool, *memoryPool);
     poolEpoch.fetch_add(1, std::memory_order_release);
     poolIOBufEnabled.store(

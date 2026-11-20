@@ -46,6 +46,8 @@ void reset(Failure stage = Failure::None, bool borrowed = false) {
   failure = stage;
   borrowedLibrary = borrowed;
   initializes = finalizes = 0;
+  eidCount = 1;
+  for (auto& entry : deviceEids) entry = {};
   createdIndex.reset();
 }
 } // namespace
@@ -127,6 +129,7 @@ urma_context_t* urma_create_context(urma_device_t*, uint32_t index) {
   if (failure == Failure::Context) {
     return nullptr;
   }
+  context.eid_index = index;
   ++contexts;
   return &context;
 }
@@ -183,13 +186,15 @@ int main() {
     std::cout
         << "PASS configuration allocation failure precedes SDK acquisition\n";
 
-    eidCount = 2;
-    deviceEids[0].eid_index = 3;
-    deviceEids[0].eid.raw[0] = 0xa3;
-    deviceEids[1].eid_index = 7;
-    deviceEids[1].eid.raw[0] = 0xa7;
-    auto checkEid = [&](std::optional<uint32_t> requested, size_t entry) {
+    auto resetSparseEids = [](uint32_t secondIndex) {
       reset();
+      eidCount = 2;
+      deviceEids[0].eid_index = 3;
+      deviceEids[0].eid.raw[0] = 0xa3;
+      deviceEids[1].eid_index = secondIndex;
+      deviceEids[1].eid.raw[0] = 0xa7;
+    };
+    auto checkEid = [&](std::optional<uint32_t> requested, size_t entry) {
       config.eid_index = requested;
       folly::UrmaInit::init(config);
       const auto local = folly::UrmaInit::getLocalEid();
@@ -199,9 +204,11 @@ int main() {
               "context index and local EID must come from the selected entry");
       folly::UrmaInit::fini();
     };
+    resetSparseEids(7);
     checkEid(std::nullopt, 0);
+    resetSparseEids(7);
     checkEid(7, 1);
-    reset();
+    resetSparseEids(7);
     config.eid_index = 0;
     bool missing = false;
     try {
@@ -214,7 +221,7 @@ int main() {
     require(missing && !createdIndex && !eids && !devices && !contexts &&
                 finalizes == 1 && !folly::UrmaInit::isInitialized(),
             "missing EID must fail before context creation and release SDK lists");
-    deviceEids[1].eid_index = 0;
+    resetSparseEids(0);
     checkEid(0, 1);
     config.eid_index.reset();
     std::cout << "PASS sparse EID selection, missing index rollback and explicit zero\n";

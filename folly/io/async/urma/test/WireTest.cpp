@@ -71,7 +71,8 @@ int main() {
   local.segmentToken = 9;
   local.socket = UINT64_MAX;
   local.maxRead = 8 * 1024 * 1024;
-  std::array<uint8_t, kHelloSize> hello{};
+  std::array<uint8_t, kHelloSize> hello;
+  hello.fill(0xa5);
   encodeHello(hello.data(), local);
   Hello decoded;
   require(decodeHello(hello.data(), hello.size(), decoded));
