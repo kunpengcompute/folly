@@ -175,12 +175,12 @@ IoBufBlock
 - setBlockSize()建议只在启动阶段调用一次。
 - 块大小和每线程缓存上限需要结合请求分布、工作线程数及总体内存预算调优。
 
-## Folly V1.1.0：io_uring混合读写接口说明
+## Folly V1.0.0：io_uring混合读写接口说明
 
 >![表示说明的图片](./public_sys-resources/icon-note.gif) **说明**
->本节保留Folly V1.1.0提供的io_uring混合读写接口，与Folly V1.1.0的IOBuf TLS内存池分开说明。
+>本节保留Folly V1.0.0提供的io_uring混合读写接口，与Folly V1.1.0的IOBuf TLS内存池分开说明。
 
-### Folly V1.1.0：io_uring混合读写接口概览
+### Folly V1.0.0：io_uring混合读写接口概览
 
 |名称|说明|
 |--|--|

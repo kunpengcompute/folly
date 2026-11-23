@@ -1,10 +1,12 @@
 # API Reference
 
-<!-- md-trans-meta sourceCommit=8238e077500cf42ad004454abe733af1fc900534 translatedAt=2026-10-13T03:53:07.457Z pushedAt=2026-10-13T06:49:09.732Z -->
+<!-- md-trans-meta sourceCommit=14b83392c2971dc9bc5c6e50559cb65eee2d2af7 translatedAt=2026-11-17T03:53:07.457Z pushedAt=2026-11-17T06:49:09.732Z -->
 
-## Folly v1.1.0: IOBuf TLS Memory Pool APIs
+This document provides the API reference and is intended for users who need to call Folly interfaces.
 
-This document describes the IOBuf thread-local storage (TLS) memory pool APIs and lifecycle rules introduced in Folly v1.1.0. By default, this capability does not change the original allocation behavior. The pooled allocation path is entered only after `enableMemoryPool()` is called.
+## Folly V1.1.0: IOBuf TLS Memory Pool APIs
+
+This document describes the IOBuf thread-local storage (TLS) memory pool APIs and lifecycle rules introduced in Folly V1.1.0. By default, this capability does not change the original allocation behavior. The pooled allocation path is entered only after `enableMemoryPool()` is called.
 
 ### API Overview
 
@@ -50,9 +52,9 @@ static void folly::IOBuf::setBlockSize(std::size_t size);
 
 #### IOBuf::setBlockSize Function Parameter Description
 
-|Parameter|Description|Input/Output|
-|--|--|--|
-|size|Total number of bytes for a newly created pooled block.|Input|
+|Parameter|Description|Input/Output|Type|Required|Value Range|
+|--|--|--|--|--|--|
+|size|Total number of bytes for a newly created pooled block.|Input|std::size_t|Required|Must be greater than the block header metadata; a multiple of 8 KB is recommended. Default value: 8 KB|
 
 This configuration affects subsequently created data blocks and should not be modified frequently during request processing. It is recommended to complete the setting before calling `enableMemoryPool()` and to evaluate memory usage based on the request size distribution.
 
@@ -139,7 +141,7 @@ IoBufBlock
 
 ### Pooling Flags and Lifecycle
 
-#### `flagsAndSharedInfo_` Reuse
+#### flagsAndSharedInfo_ Reuse
 
 The memory pool does not add new data members to IOBuf; instead, it reuses `flagsAndSharedInfo_`.
 
@@ -171,16 +173,16 @@ When a thread exits, `current_share` can release only the reference held by TLS 
 
 - By default, each thread caches a maximum of eight free blocks, with a default block size of 8 KB.
 - Only data blocks are pooled, and IOBuf objects are not pooled.
-- When the memory pool is disabled, the requested capacity is too large, or pooled creation fails, the original Folly path is used a fallback.
+- When the memory pool is disabled, the requested capacity is too large, or pooled creation fails, the original Folly path is used as a fallback.
 - It is recommended to call `setBlockSize()` only once during the startup phase.
 - The block size and per-thread cache limit should be tuned based on the request distribution, number of worker threads, and overall memory budget.
 
-## Folly v1.0.0: io_uring Hybrid Read/Write APIs
+## Folly V1.0.0: io_uring Hybrid Read/Write APIs
 
 > ![note](./public_sys-resources/icon-note.gif) **NOTE:**
->This section covers the hybrid `io_uring` read/write APIs provided in Folly v1.0.0, documented independently of the IOBuf TLS memory pool in Folly v1.1.0.
+>This section covers the `io_uring` hybrid read/write APIs provided in Folly V1.0.0, documented independently of the IOBuf TLS memory pool in Folly V1.1.0.
 
-### Folly v1.0.0：io_uring API Overview
+### Folly V1.0.0: io_uring API Overview
 
 |Name|Description|
 |--|--|
@@ -216,5 +218,5 @@ This function has no return value. When `send` cannot continue sending due to in
 ## Change History
 
 | Version | Date | Description |
-|:---|:---|:---|
+| ---- | ---- | ---- |
 | 01 | 2026-09-30 | This is the first official release. |
