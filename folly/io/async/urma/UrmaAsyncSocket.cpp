@@ -185,24 +185,31 @@ void UrmaAsyncSocket::onHandshakeReady() {
 
   handlePendingWrites();
 
-  // Phase 7: 接收方授予初始 credit(FC_REP)— 仅 fc_enable 时执行
-  if (UrmaInit::getConfig().fc_enable && res_.remote_fc_jetty) {
-    uint32_t initial_credit = 0;
-    if (shared_) {
-      initial_credit = shared_->creditIdle() / UrmaFcState::INITIAL_CREDIT_DIVISOR;
-      if (initial_credit > 0) {
-        for (uint32_t i = 0; i < initial_credit; ++i) {
-          shared_->tryAllocCredit();
-        }
+  // 流控:接收方授予初始窗口 GRANT(INITIAL_WINDOW,给充足不全给)。
+  // 先发 GRANT,成功后才记账(失败不泄漏 credit)。
+  if (UrmaInit::getConfig().fc_enable && res_.remote_fc_jetty && shared_) {
+    // 连接创建分配额度前先检查池子水位:使用率过高就按阶梯扩容补投。
+    shared_->tryGrowRxPool(&shared_->ioJfrMeta());
+    uint32_t want = UrmaInit::getConfig().fc_initial_window;
+    uint32_t grant = std::min(want, shared_->creditIdle());
+    // 先记账再发送;发送失败回滚,避免 credit 泄漏
+    if (grant > 0 && shared_->grantCredit(grant)) {
+      if (sendFcGrant(static_cast<int32_t>(grant))) {
+        conn_rx_.limit_conn += grant;
+        conn_rx_.last_grant = grant;
+        // 以握手时刻作为空闲计时起点:若该连接此后一直不发数据,
+        // 100ms 后可被回收(否则 last_recv_ts=0 永不回收,额度卡死)
+        conn_rx_.last_recv_ts = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count());
+        XLOG(DBG) << "[URMA-FC] initial GRANT=" << grant
+                  << " limit_conn=" << conn_rx_.limit_conn
+                  << " socket_id=0x" << std::hex << socket_id_.toUint64()
+                  << std::dec;
+      } else {
+        shared_->releaseCredit(grant);
       }
-    }
-    if (initial_credit > 0) {
-      fc_state_.peer_granted.fetch_add(initial_credit, std::memory_order_acq_rel);
-      uint16_t rep_seq = fc_state_.fc_seq_next.fetch_add(1, std::memory_order_relaxed);
-      bool sent = sendFcMsg(FC_REP, static_cast<uint16_t>(initial_credit), rep_seq);
-      XLOG(DBG) << "[URMA-FC] onHandshakeReady: granted initial credit=" << initial_credit
-                << " rep_seq=" << rep_seq << " sent=" << sent
-                << " socket_id=0x" << std::hex << socket_id_.toUint64() << std::dec;
     }
   }
 
@@ -531,21 +538,11 @@ urma_status_t UrmaAsyncSocket::sendChain(WriteCallback* cb,
     return URMA_EAGAIN;
   }
 
-  // Phase 7: credit 流控(软限制)— 仅 fc_enable 时触发 FC_REQ
-  // close_loop 场景下 FC 闭环为净开销(per-EVB 独占 + 水位线已防溢出),
-  // 默认禁用,消除跨线程 FC 消息通知导致的 P99 尾部延迟雪崩。
-  if (UrmaInit::getConfig().fc_enable &&
-      fc_state_.peer_credit.load(std::memory_order_acquire) <= 0) {
-    uint32_t multiple = fc_state_.credit_multiple.load(std::memory_order_relaxed);
-    uint16_t req_cnt = 1;
-    if (shared_) {
-      req_cnt = static_cast<uint16_t>(
-          std::max(1u, multiple * shared_->creditIdle() /
-                        UrmaFcState::INITIAL_CREDIT_DIVISOR));
-    }
-    uint16_t req_seq = fc_state_.fc_seq_next.fetch_add(1, std::memory_order_relaxed);
-    sendFcMsg(FC_REQ, req_cnt, req_seq);
-    // 不返回 EAGAIN,继续发送(软限制)
+  // 流控:硬限流。窗口耗尽 → 挂起 + 首次发 BLOCKED(撞底),不发送。
+  // 每条消息(含控制包)消耗 1 个 credit,见下方 post 成功分支。
+  if (UrmaInit::getConfig().fc_enable && fc_state_.peer_credit <= 0) {
+    onCreditExhausted();
+    return URMA_EAGAIN;
   }
 
   if (!shared_) {
@@ -640,6 +637,12 @@ urma_status_t UrmaAsyncSocket::sendChain(WriteCallback* cb,
     // hdr_buf 加入发送链,保持存活到 TX CQE
     wr_chain_head->appendChain(std::move(hdr_buf));
 
+    // 流控:每条 WR 消耗 1 个 credit(循环内二次检查,防一批超发)
+    if (UrmaInit::getConfig().fc_enable && fc_state_.peer_credit <= 0) {
+      onCreditExhausted();
+      return URMA_EAGAIN;
+    }
+
     // SDD-URMA-EVBEXCLUSIVE-001: 独占 JFS,sq_inflight 由 ctx_->tryAcquireIoSq() 管理
     if (!shared_->tryAcquireIoSq()) {
       // 问题 01:SQ 满 → 登记等待者,配额归还时 wakeOneIoSqWaiter 唤醒重试
@@ -671,7 +674,7 @@ urma_status_t UrmaAsyncSocket::sendChain(WriteCallback* cb,
     urma_status_t ret = urma_post_jfs_wr(io_jfs->jfs, &wr, &bad_wr);
     if (ret == URMA_SUCCESS) {
       if (UrmaInit::getConfig().fc_enable) {
-        fc_state_.peer_credit.fetch_sub(1, std::memory_order_acq_rel);
+        --fc_state_.peer_credit;
       }
       continue;
     }
@@ -709,7 +712,10 @@ void UrmaAsyncSocket::handlePendingWrites() noexcept {
       pw->buf = std::move(chain);
       // 问题 01:重试仍 EAGAIN → 重新登记等待者
       // (原缺陷:被 pop 后不重登记就永久丢失唤醒资格)
-      shared_->addIoSqWaiter(&io_sq_waiter_);
+      // 流控挂起(credit 耗尽)时由 GRANT 唤醒,不登记 SQ 等待者
+      if (!credit_blocked_) {
+        shared_->addIoSqWaiter(&io_sq_waiter_);
+      }
       // SDD-URMA-EVBEXCLUSIVE-001: TX CQE 由 pollAndDispatch 统一收割(I3)
       return;
     }
@@ -834,12 +840,36 @@ bool UrmaAsyncSocket::postControlPacketFrags(
   if (!res_.remote_jetty) return false;
   if (!frags || frag_count == 0 || frag_count > kMaxPullFrags) return false;
 
+  // 流控:控制包同样占对端 recv buffer,有额度时消耗 1 个 credit。
+  // 但 PULL/FREE 是数据面推进的必要消息,额度耗尽时不能阻塞(否则死锁),
+  // 这里仅"有额度则扣",无额度仍放行并打点。
+  const bool fc_on = UrmaInit::getConfig().fc_enable;
+  bool credit_taken = false;
+  if (fc_on) {
+    if (fc_state_.peer_credit > 0) {
+      --fc_state_.peer_credit;
+      credit_taken = true;
+    } else {
+      static std::atomic<uint64_t> s_ctrl_over{0};
+      uint64_t n = s_ctrl_over.fetch_add(1, std::memory_order_relaxed) + 1;
+      if ((n % 10000) == 1) {
+        XLOG(WARN) << "[URMA-FC] control packet sent with peer_credit<=0"
+                   << " (count=" << n << ") socket_id=0x"
+                   << std::hex << socket_id_.toUint64() << std::dec;
+      }
+    }
+  }
+
   // SDD-URMA-EVBEXCLUSIVE-001: 独占 IO JFS
   if (!shared_) return false;
   EvbJfs* io_jfs = shared_->ioJfs();
-  if (!io_jfs || !io_jfs->jfs) return false;
+  if (!io_jfs || !io_jfs->jfs) {
+    if (credit_taken) ++fc_state_.peer_credit;
+    return false;
+  }
   if (!shared_->tryAcquireIoSq()) {
     XLOG(WARN) << "[URMA] postControlPacketFrags: SQ full";
+    if (credit_taken) ++fc_state_.peer_credit;
     return false;
   }
 
@@ -883,6 +913,7 @@ bool UrmaAsyncSocket::postControlPacketFrags(
   if (st != URMA_SUCCESS) {
     shared_->releaseIoSq();
     delete tx_ctx;
+    if (credit_taken) ++fc_state_.peer_credit;  // 回滚
     XLOG(ERR) << "[URMA] ctrlPullFrags FAIL msg_id=" << msg_id
               << " frags=" << frag_count << " total=" << total_size
               << " st=" << static_cast<int>(st);
@@ -1302,7 +1333,6 @@ void UrmaAsyncSocket::ScanTimer::timeoutExpired() noexcept {
   }
   sock_->scanBigMsgTimeout();
   sock_->checkReorderTimeout();
-  sock_->maybeReturnCredit();
   scheduleTimeout(100);  // 100ms 周期自续(设计 §4.7.8)
 }
 
@@ -1330,39 +1360,6 @@ void UrmaAsyncSocket::checkReorderTimeout() noexcept {
     for (auto& buf : released) {
       onRxBuf(std::move(buf));
     }
-  }
-}
-
-// ── FC:周期 credit 归还(任务:流控闭环) ──
-// 旧实现只借不还:发送方消耗 credit 后从不 RETURN → 接收方 credit_idle
-// 单调下降、REQ 授予枯竭、peer_credit 单调下探(统计失效,M-2 遗留)。
-// 归还策略(ScanTimer 100ms 周期):peer_credit 超过保留水位(初始授予量
-// rx_depth/DIVISOR)时,归还多余部分 → 接收方 idle 回升 → 下一轮 REQ 可再授予。
-// 闭环:REQ(借) → REP(授) → 消耗 → RETURN(还) → idle 回升 → ...
-void UrmaAsyncSocket::maybeReturnCredit() noexcept {
-  if (!UrmaInit::getConfig().fc_enable) return;
-  if (state_ != State::kOpen || !res_.remote_fc_jetty) {
-    return;
-  }
-  int32_t pc = fc_state_.peer_credit.load(std::memory_order_acquire);
-  if (pc <= 0) {
-    return;  // 无可归还(软限制下允许负)
-  }
-  // 保留水位 = 初始授予量(覆盖 close-loop 并发窗口)
-  int32_t keep = 0;
-  if (shared_) {
-    keep = static_cast<int32_t>(
-        shared_->rxDepth() / UrmaFcState::INITIAL_CREDIT_DIVISOR);
-  }
-  if (pc <= keep) {
-    return;  // 未超保留水位,无需归还
-  }
-  uint16_t ret = static_cast<uint16_t>(pc - keep);
-  uint16_t fc_seq = fc_state_.fc_seq_next.fetch_add(1, std::memory_order_relaxed);
-  if (sendFcMsg(FC_RETURN, ret, fc_seq)) {
-    fc_state_.peer_credit.fetch_sub(ret, std::memory_order_acq_rel);
-    XLOG(INFO) << "[URMA-FC] RETURN sent: cnt=" << ret
-              << " peer_credit " << pc << "->" << (pc - ret);
   }
 }
 
@@ -1542,14 +1539,15 @@ bool UrmaAsyncSocket::deliverDataFrame(void* recv_buf, uint32_t recv_len,
   return false;  // 数据已拷出,收割线程立即回收 slot
 }
 
-// ── Phase 6: FC 消息接收 ──
+// ── 流控:FC 消息接收(receiver-driven credit) ──
 //
-// FC 消息路由通路:UrmaJfrPool::harvestFcAndDispatch → fc_socket_map → 此方法
-// payload 前 8B = 发送方 SocketId,后续 8B = FcHeader(msg_type/credit_cnt/fc_seq)
-// 按 msg_type 分发到 handleFcReq/handleFcRep/handleFcReturn/handleFcAck
+// 路由通路:UrmaTransportContext::handleRecvCqe(FC 分支) → fc 路由表 → 此方法
+// payload 前 8B = 本端 SocketId(发送方填对端),后续 8B = FcHeader(msg_type/delta/fc_seq)
+//   GRANT   : 对端授予/回收我的发送窗口
+//   BLOCKED : 对端撞底,补发 last_grant 并翻倍
 
 void UrmaAsyncSocket::onFcMessageReceived(void* recv_buf,
-                                            uint32_t recv_len) noexcept {
+                                          uint32_t recv_len) noexcept {
   if (!recv_buf || recv_len < FC_MSG_LEN) {
     XLOG(WARN) << "[URMA-FC] recv too short: recv_len=" << recv_len;
     return;
@@ -1557,28 +1555,22 @@ void UrmaAsyncSocket::onFcMessageReceived(void* recv_buf,
 
   uint64_t dst_socket_id = 0;
   UrmaFcMsgType type;
-  uint16_t credit_cnt = 0;
+  int32_t delta = 0;
   uint16_t fc_seq = 0;
-  if (!deserializeFcMsg(recv_buf, dst_socket_id, type, credit_cnt, fc_seq)) {
+  if (!deserializeFcMsg(recv_buf, dst_socket_id, type, delta, fc_seq)) {
     return;
   }
 
-  XLOG(DBG) << "[URMA-FC] onFcMessageReceived: type=" << static_cast<int>(type)
-            << " credit_cnt=" << credit_cnt << " fc_seq=" << fc_seq
+  XLOG(DBG) << "[URMA-FC] recv: type=" << static_cast<int>(type)
+            << " delta=" << delta << " fc_seq=" << fc_seq
             << " dst_socket_id=0x" << std::hex << dst_socket_id << std::dec;
 
   switch (type) {
-    case FC_REQ:
-      handleFcReq(dst_socket_id, credit_cnt, fc_seq);
+    case FC_GRANT:
+      handleFcGrant(delta);
       break;
-    case FC_REP:
-      handleFcRep(credit_cnt, fc_seq);
-      break;
-    case FC_RETURN:
-      handleFcReturn(dst_socket_id, credit_cnt, fc_seq);
-      break;
-    case FC_ACK:
-      handleFcAck(credit_cnt, fc_seq);
+    case FC_BLOCKED:
+      handleFcBlocked();
       break;
     default:
       XLOG(WARN) << "[URMA-FC] unknown msg_type=" << static_cast<int>(type);
@@ -1586,147 +1578,123 @@ void UrmaAsyncSocket::onFcMessageReceived(void* recv_buf,
   }
 }
 
-// ── Phase 6: FC REQ 处理(接收方) ──
-// 对端申请 credit,从 credit_idle 扣减后回复 REP 授予
-// 去重:fc_seq 与 fc_last_req_seq 相同则跳过(防止 REQ 重发重复授信)
+// ── 发送方:收到 GRANT(窗口调整) ──
+// delta > 0 授出,delta < 0 回收。回收后 peer_credit 可能为负(在途未消费),
+// 由后续消费自然拉平;不阻塞当前已 post 的 WR。
+void UrmaAsyncSocket::handleFcGrant(int32_t delta) noexcept {
+  if (delta == 0) return;
+  fc_state_.peer_credit += delta;
+  if (delta > 0) {
+    fc_state_.blocked_sent = false;  // 有新额度,复位撞底标记
+  }
+  XLOG(DBG) << "[URMA-FC] GRANT delta=" << delta
+            << " peer_credit=" << fc_state_.peer_credit
+            << " socket_id=0x" << std::hex << socket_id_.toUint64() << std::dec;
+  if (delta > 0) {
+    onCreditAvailable();
+  }
+}
 
-void UrmaAsyncSocket::handleFcReq(uint64_t dst_socket_id, uint16_t credit_cnt,
-                                    uint16_t fc_seq) noexcept {
-  // 去重:同一 REQ 序列号只处理一次
-  uint16_t last_seq = fc_state_.fc_last_req_seq.load(std::memory_order_acquire);
-  if (fc_seq == last_seq && last_seq != 0) {
-    XLOG(DBG) << "[URMA-FC] dup REQ fc_seq=" << fc_seq << ", skip";
+// ── 接收方:收到 BLOCKED(对端撞底) ──
+// 补发 last_grant(上次补货量)并翻倍,指数增长直到对端不再撞底。
+void UrmaAsyncSocket::handleFcBlocked() noexcept {
+  if (!shared_) return;
+  shared_->diagFcBlockedRx();
+  uint32_t delta = conn_rx_.last_grant;
+  if (delta == 0) {
+    // 从未补过货(初始窗口为 0 的连接):给一个最小起步额度,避免永久卡死
+    delta = UrmaInit::getConfig().fc_min_window;
+  }
+  uint32_t grant = std::min(delta, shared_->creditIdle());
+  if (grant == 0) {
+    XLOG(DBG) << "[URMA-FC] BLOCKED but credit_idle=0, deferred";
     return;
   }
-  fc_state_.fc_last_req_seq.store(fc_seq, std::memory_order_release);
-
-  // SDD-URMA-EVBEXCLUSIVE-001: credit 从 ctx_->credit_idle 扣减(same-thread I2)
-  uint32_t granted = 0;
-  if (shared_) {
-    uint32_t idle = shared_->creditIdle();
-    uint32_t to_grant = std::min(static_cast<uint32_t>(credit_cnt), idle);
-    for (uint32_t i = 0; i < to_grant; ++i) {
-      if (shared_->tryAllocCredit()) {
-        ++granted;
-      } else {
-        break;
-      }
-    }
+  if (!shared_->grantCredit(grant)) {
+    return;  // 池子已空(并发竞态):不发送,下次 BLOCKED 重试
   }
-
-  fc_state_.peer_granted.fetch_add(granted, std::memory_order_acq_rel);
-
-  XLOG(DBG) << "[URMA-FC] REQ: requested=" << credit_cnt
-            << " granted=" << granted;
-
-  // 回复 REP(授予 credit)
-  if (granted > 0) {
-    uint16_t rep_seq = fc_state_.fc_seq_next.fetch_add(1, std::memory_order_relaxed);
-    sendFcMsg(FC_REP, static_cast<uint16_t>(granted), rep_seq);
+  if (!sendFcGrant(static_cast<int32_t>(grant))) {
+    shared_->releaseCredit(grant);  // 发送失败回滚
+    return;
   }
-}
-
-// ── Phase 6: FC REP 处理(发送方) ──
-// 对端授予 credit,增加 peer_credit,唤醒 pending_write_
-
-void UrmaAsyncSocket::handleFcRep(uint16_t credit_cnt, uint16_t fc_seq) noexcept {
-  fc_state_.peer_credit.fetch_add(credit_cnt, std::memory_order_acq_rel);
-
-  XLOG(DBG) << "[URMA-FC] REP received: credit_cnt=" << credit_cnt
-            << " fc_seq=" << fc_seq
-            << " peer_credit=" << fc_state_.peer_credit.load()
+  conn_rx_.limit_conn += grant;
+  // 翻倍,为下次撞底准备更大的量。必须设上限:否则持续撞底时
+  // last_grant 指数爆炸(16→32→…→52 万),窗口失控。
+  // 上限取"单连接合理窗口" = min_window * 16(默认 128),远大于
+  // rate×1ms+min 的稳态目标,又能覆盖真实突发。
+  const uint32_t cap = UrmaInit::getConfig().fc_min_window * 16;
+  uint32_t next = (conn_rx_.last_grant == 0 ? grant : conn_rx_.last_grant) * 2;
+  if (next > cap) next = cap;
+  conn_rx_.last_grant = next;
+  XLOG(DBG) << "[URMA-FC] BLOCKED -> grant=" << grant
+            << " last_grant=" << conn_rx_.last_grant
+            << " limit_conn=" << conn_rx_.limit_conn
             << " socket_id=0x" << std::hex << socket_id_.toUint64() << std::dec;
+}
 
-  // Phase 7: credit_multiple 自适应
-  // credit 充足(> 请求量) → ×2 扩大下次请求,不足 → /2 缩减,范围 [1, 8]
-  uint32_t cur_mult = fc_state_.credit_multiple.load(std::memory_order_relaxed);
-  if (credit_cnt > 0 && fc_state_.peer_credit.load(std::memory_order_relaxed) > 0) {
-    // 充足:扩大
-    uint32_t new_mult = std::min(cur_mult * 2, 8u);
-    fc_state_.credit_multiple.store(new_mult, std::memory_order_relaxed);
-  } else if (credit_cnt == 0) {
-    // 不足:缩减
-    uint32_t new_mult = std::max(cur_mult / 2, 1u);
-    fc_state_.credit_multiple.store(new_mult, std::memory_order_relaxed);
-  }
+// ── 流控:记录一次收到本连接消息(采样计数 + last_recv_ts) ──
+void UrmaAsyncSocket::noteRxActivity() noexcept {
+  if (!UrmaInit::getConfig().fc_enable) return;
+  // 消费 1 个已授出额度:limit_conn 是"未消费额度",收到消息即减 1。
+  // (全局池 allocated 已在 onBufferConsumed 中减过)
+  if (conn_rx_.limit_conn > 0) --conn_rx_.limit_conn;
+  ++conn_rx_.cnt_this_round;
+  conn_rx_.last_recv_ts = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
+}
 
-  XLOG(DBG) << "[URMA-FC] REP: granted=" << credit_cnt
-            << " peer_credit=" << fc_state_.peer_credit.load()
-            << " credit_multiple=" << fc_state_.credit_multiple.load();
-
-  // 唤醒 pending_write_(credit 到位后可继续发送)
-  // 线程安全修正:FC 收割线程可能非本 socket 属主 EVB(FC JFR 归属其他 EVB),
-  // runInLoop(Func) 非线程安全 —— 统一走 runInEventBaseThread
-  if (evb_) {
-    evb_->runInEventBaseThread([this] { handlePendingWrites(); });
+// ── 流控:发送窗口耗尽 → 挂起 + 首次发 BLOCKED ──
+void UrmaAsyncSocket::onCreditExhausted() noexcept {
+  credit_blocked_ = true;
+  if (!fc_state_.blocked_sent) {
+    fc_state_.blocked_sent = true;
+    sendFcBlocked();
+    if (shared_) shared_->diagFcBlockedTx();
   }
 }
 
-// ── Phase 6: FC RETURN 处理(接收方) ──
-// 对端归还 credit,credit_idle += N,credit_allocated -= N
-
-void UrmaAsyncSocket::handleFcReturn(uint64_t dst_socket_id,
-                                       uint16_t credit_cnt,
-                                       uint16_t fc_seq) noexcept {
-  if (shared_) {
-    shared_->releaseCredit(credit_cnt);  // allocated -= cnt; idle += cnt
-  }
-  fc_state_.peer_granted.fetch_sub(credit_cnt, std::memory_order_acq_rel);
-
-  XLOG(DBG) << "[URMA-FC] RETURN: returned=" << credit_cnt;
-
-  // 回复 ACK(确认归还)
-  uint16_t ack_seq = fc_state_.fc_seq_next.fetch_add(1, std::memory_order_relaxed);
-  sendFcMsg(FC_ACK, credit_cnt, ack_seq);
+// ── 流控:窗口恢复 → 唤醒挂起的写 ──
+void UrmaAsyncSocket::onCreditAvailable() noexcept {
+  if (!credit_blocked_) return;
+  credit_blocked_ = false;
+  // FC 收割恒属主 EVB(per-EVB 独占 FC JFR),同线程直接唤醒
+  handlePendingWrites();
 }
 
-// ── Phase 6: FC ACK 处理(发送方) ──
-// 对端确认归还(可选,用于可靠性,当前仅日志)
-
-void UrmaAsyncSocket::handleFcAck(uint16_t credit_cnt,
-                                    uint16_t fc_seq) noexcept {
-  XLOG(DBG) << "[URMA-FC] ACK: confirmed=" << credit_cnt;
-}
-
-// ── Phase 6: FC 消息发送(通过 FC JFS 池) ──
-// 序列化 16B FC 消息 → acquireFcJfs → post SEND
-// 目标 jetty:res_.remote_fc_jetty(握手时 importPeer 创建)
-
-bool UrmaAsyncSocket::sendFcMsg(UrmaFcMsgType type, uint16_t credit_cnt,
-                                  uint16_t fc_seq) noexcept {
+// ── 流控:发送 FC 消息(GRANT/BLOCKED,通过独占 FC JFS) ──
+// 返回 true 表示已成功 post;调用方据此决定是否记账。
+bool UrmaAsyncSocket::sendFcMsg(UrmaFcMsgType type, int32_t delta) noexcept {
   if (state_ != State::kOpen) return false;
   if (!res_.remote_fc_jetty) {
-    XLOG(WARN) << "[URMA-FC] sendFcMsg: no remote_fc_jetty";
+    XLOG(DBG) << "[URMA-FC] sendFcMsg: no remote_fc_jetty";
     return false;
   }
-
-  // SDD-URMA-EVBEXCLUSIVE-001: 独占 FC JFS
   if (!shared_) return false;
   EvbJfs* fc_jfs = shared_->fcJfs();
   if (!fc_jfs || !fc_jfs->jfs) return false;
   if (!shared_->tryAcquireFcSq()) {
+    shared_->diagFcSqFull();
     XLOG(DBG) << "[URMA-FC] FC SQ full";
     return false;
   }
 
-  // Phase 7: 每次分配独立 16B IOBuf 作为 FC buffer,避免复用 fc_send_buf_ 导致 DMA 数据竞争
-  // (onHandshakeReady 中连续两次 sendFcMsg 会覆盖同一 buffer,硬件 DMA 异步读取时
-  //  第二次序列化覆盖了第一次的内容,对端收到损坏的 FC 消息)
+  // 每次分配独立 16B IOBuf(DMA 异步读取,复用 buffer 会数据竞争)
   auto fc_iobuf = IOBuf::create(FC_MSG_LEN);
   fc_iobuf->append(FC_MSG_LEN);
-  serializeFcMsg(fc_iobuf->writableData(), res_.peer_socket_id, type, credit_cnt, fc_seq);
+  uint16_t seq = fc_seq_next_++;
+  serializeFcMsg(fc_iobuf->writableData(), res_.peer_socket_id, type, delta, seq);
 
-  // 构造 SGE + WR
   auto sge_arr = std::make_shared<std::vector<urma_sge_t>>(1);
   (*sge_arr)[0].addr = reinterpret_cast<uint64_t>(fc_iobuf->writableData());
   (*sge_arr)[0].len = FC_MSG_LEN;
   (*sge_arr)[0].tseg = UrmaInit::getPoolTseg();
 
-  // per-WR context:send_data move 持有 fc_iobuf,TX CQE 后 delete ctx → send_data 析构 → IOBuf 释放
   auto* tx_ctx = new TxCompletionCtx();
   tx_ctx->socket_id = socket_id_.toUint64();
-  tx_ctx->seq = fc_seq;
-  tx_ctx->type = TxCompletionCtx::MSG_CTRL_PULL;  // 复用控制包类型(FC CQE 回收路径相同)
+  tx_ctx->seq = seq;
+  tx_ctx->type = TxCompletionCtx::MSG_CTRL_PULL;  // FC CQE 回收路径同控制包
   tx_ctx->jfs_index = 0;
   tx_ctx->msg_id = 0;
   tx_ctx->sge_arr = sge_arr;
@@ -1744,14 +1712,21 @@ bool UrmaAsyncSocket::sendFcMsg(UrmaFcMsgType type, uint16_t credit_cnt,
   urma_jfs_wr_t* bad_wr = nullptr;
   urma_status_t ret = urma_post_jfs_wr(fc_jfs->jfs, &wr, &bad_wr);
   if (ret != URMA_SUCCESS) {
+    shared_->diagFcPostErr();
     XLOG(WARN) << "[URMA-FC] post_jfs_wr failed: " << ret;
     shared_->releaseFcSq();
     delete tx_ctx;
     return false;
   }
-
-  // SDD-URMA-EVBEXCLUSIVE-001: 无需 rearmAllFcTxFce(I3:TX JFC 独立收割)
   return true;
+}
+
+bool UrmaAsyncSocket::sendFcGrant(int32_t delta) noexcept {
+  return sendFcMsg(FC_GRANT, delta);
+}
+
+bool UrmaAsyncSocket::sendFcBlocked() noexcept {
+  return sendFcMsg(FC_BLOCKED, 0);
 }
 
 // ── 接收(普通 SEND 数据) ──
@@ -1852,6 +1827,12 @@ void UrmaAsyncSocket::destroyUrmaResources() {
     shared_->removeIoSqWaiter(&io_sq_waiter_);
     shared_->unregisterSocket(socket_id_.toUint64());
     shared_->unregisterFcSocket(socket_id_.toUint64());
+    // 流控:从本 JFR 连接列表摘除 + 归还剩余未消费额度(防 credit 泄漏)
+    shared_->unregisterConn(this);
+    if (conn_rx_.limit_conn > 0) {
+      shared_->reclaimConnCredit(conn_rx_.limit_conn);
+      conn_rx_.limit_conn = 0;
+    }
   }
   if (route_entry_) {
     route_entry_->sock.store(nullptr, std::memory_order_release);

@@ -172,23 +172,32 @@ class UrmaAsyncSocket : public AsyncTransport {
   // status: CQE 状态(URMA_CR_SUCCESS 或错误码)
   void handleRemoteReadCqe(uint16_t msg_id, urma_status_t status) noexcept;
 
-  // Phase 6: FC 消息接收入口(由 UrmaTransportContext::handleRecvCqe FC 分支调用)
+  // ── 流控:receiver-driven credit ──
+  // FC 消息接收入口(由 UrmaTransportContext::handleRecvCqe FC 分支调用)
   // recv_buf: payload 前 8B 携带对端 SocketId(无 64B headroom header)
-  // recv_len: 实际接收字节数
-  // 当前为占位实现,REQ/REP/RETURN/ACK 完整处理在 Phase 6 后续补全
   void onFcMessageReceived(void* recv_buf, uint32_t recv_len) noexcept;
 
-  // Phase 6: FC 消息处理(REQ/REP/RETURN/ACK)
-  void handleFcReq(uint64_t dst_socket_id, uint16_t credit_cnt,
-                    uint16_t fc_seq) noexcept;
-  void handleFcRep(uint16_t credit_cnt, uint16_t fc_seq) noexcept;
-  void handleFcReturn(uint64_t dst_socket_id, uint16_t credit_cnt,
-                       uint16_t fc_seq) noexcept;
-  void handleFcAck(uint16_t credit_cnt, uint16_t fc_seq) noexcept;
+  // 接收方:处理 GRANT(对端授予/回收我的发送窗口)
+  void handleFcGrant(int32_t delta) noexcept;
+  // 接收方:处理 BLOCKED(对端撞底,补发 last_grant 并翻倍)
+  void handleFcBlocked() noexcept;
 
-  // Phase 6: FC 消息发送(通过 FC JFS 池)
-  bool sendFcMsg(UrmaFcMsgType type, uint16_t credit_cnt,
-                  uint16_t fc_seq) noexcept;
+  // 发送方:发 GRANT(delta 可负)。返回是否成功 post(失败调用方不记账)
+  bool sendFcGrant(int32_t delta) noexcept;
+  // 发送方:发 BLOCKED(纯通知,撞底去重)
+  bool sendFcBlocked() noexcept;
+  // FC 消息底层发送(独占 FC JFS)
+  bool sendFcMsg(UrmaFcMsgType type, int32_t delta) noexcept;
+
+  // 接收方状态访问(流控定时器 / 速率采样用)
+  ConnRxState& connRx() noexcept { return conn_rx_; }
+  const ConnRxState& connRx() const noexcept { return conn_rx_; }
+  // 流控:记录一次收到本连接消息(采样计数 + last_recv_ts)
+  void noteRxActivity() noexcept;
+  // 流控:发送窗口耗尽时挂起并首次发 BLOCKED
+  void onCreditExhausted() noexcept;
+  // 流控:窗口恢复后唤醒挂起的写
+  void onCreditAvailable() noexcept;
 
   // SDD-URMA-EVBEXCLUSIVE-001: 独占四件套下 JFS 位图/pin 逻辑整体删除
   // (I1:每 EVB 只有一个 JFS,pollAndDispatch 统一收割 TX+RX CQE)
@@ -295,11 +304,6 @@ class UrmaAsyncSocket : public AsyncTransport {
   // ── 保序:重排缓冲超时检查(ScanTimer 100ms tick 驱动) ──
   // 空洞超时(reorder_timeout_ms)未补齐 → 放行缓冲全部 + 重同步 + WARN
   void checkReorderTimeout() noexcept;
-
-  // ── FC:周期 credit 归还(ScanTimer 100ms tick 驱动,任务:流控闭环) ──
-  // peer_credit 超过保留阈值(初始授予量)时归还多余 → 接收方 idle 回升,
-  // 修复"只借不还"导致的 credit 统计失效(peer_credit 单调下探)
-  void maybeReturnCredit() noexcept;
 
   // ── 任务 E(H-6):大包超时扫描定时器(可取消 AsyncTimeout,替代 runAfterDelay) ──
   // runAfterDelay([this], 100) 不可取消,析构后 100ms 窗口内触发 = UAF;
@@ -437,12 +441,11 @@ class UrmaAsyncSocket : public AsyncTransport {
   size_t bytes_received_{0};
   bool eor_tracking_{false};
 
-  // Phase 6: FC 流控状态(per-连接)
-  UrmaFcState fc_state_;
-
-  // Phase 6: FC 发送缓冲区(16B,复用避免每次分配)
-  // sendFcMsg 中序列化后 post 到 FC JFS
-  uint8_t fc_send_buf_[FC_MSG_LEN] __attribute__((aligned(16)));
+  // 流控状态(per-连接)
+  UrmaFcState fc_state_;   // 发送方视角:peer_credit / blocked_sent
+  ConnRxState conn_rx_;    // 接收方视角:limit_conn / rate / last_recv_ts
+  uint16_t fc_seq_next_{0};      // FC 消息序列号(GRANT/BLOCKED 共用)
+  bool credit_blocked_{false};   // 是否因 credit 耗尽而挂起(区别于 SQ 满)
 
   static constexpr int POLL_BATCH_MAX = 64;
 };

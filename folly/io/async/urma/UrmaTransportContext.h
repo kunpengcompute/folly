@@ -47,6 +47,7 @@ struct RecvWaterMark {
   uint32_t min_water = 64;
   uint32_t max_water = 256;
   uint32_t batch_post = 32;
+  uint32_t initial_water = 1024;  // 初始分配/投递量(阶梯扩容起点)
 };
 
 // ── RX slot 回收上下文(全局结构体) ──
@@ -114,10 +115,19 @@ struct EvbJfr {
     // 问题 5.1:shared_ptr 保活 RxSlotCtx,独立于 jfr 析构
     std::shared_ptr<RxSlotCtx> ctx;
   };
+  // 注意:rx_bufs 一次性 reserve 到 rx_depth 上限,之后只做惰性初始化
+  // (分配 data + 填 sge/wr),绝不 resize 重分配 —— 已 post 的 wr/sge
+  // 地址被硬件异步引用,vector 重分配会让这些指针悬垂。
   std::vector<RxBuf> rx_bufs;
+  uint32_t rx_capacity = 0;       // rx_bufs.size(),即 rx_depth 上限(稳定)
+  uint32_t rx_allocated = 0;      // 已分配内存的 slot 数(阶梯增长)
   uint32_t recv_posted = 0;       // same-thread(I2)
   uint32_t next_free_slot = 0;    // same-thread
   RecvWaterMark watermark;
+
+  // 阶梯扩容参数(构造时从 UrmaConfig 快照)
+  uint32_t grow_step = 512;       // 每次追加的 slot 数
+  uint32_t high_water_pct = 80;   // 使用率达到此百分比触发扩容
 
   // RX 所有权记账(I2 豁免:IOBuf deleter 任意线程 → 保留 atomic)
   std::atomic<uint32_t> held_count{0};
@@ -129,26 +139,37 @@ struct EvbJfr {
   uint32_t credit_allocated = 0;
   uint32_t rx_depth = 0;
 
+  // 本 JFR 下挂载的连接(流控 1ms 定时器 / harvest 速率采样遍历用)
+  // 由 registerSocket / unregisterSocket 维护,仅属主 EVB 线程访问(I1)
+  std::vector<UrmaAsyncSocket*> conns;
+  // 上次 harvest 时刻(纳秒),速率采样的全局分母
+  uint64_t last_harvest_ts = 0;
+
   bool is_fc = false;
 
   EvbJfr() = default;
   EvbJfr(EvbJfr&& o) noexcept
       : jfr(o.jfr), rx_jfc(o.rx_jfc), rx_jfce(o.rx_jfce), rx_jfce_fd(o.rx_jfce_fd),
         rx_bufs(std::move(o.rx_bufs)),
+        rx_capacity(o.rx_capacity), rx_allocated(o.rx_allocated),
         recv_posted(o.recv_posted), next_free_slot(o.next_free_slot),
+        watermark(o.watermark),
+        grow_step(o.grow_step), high_water_pct(o.high_water_pct),
         held_count(o.held_count.load(std::memory_order_relaxed)),
         transit_cnt(o.transit_cnt.load(std::memory_order_relaxed)),
         recycle(std::move(o.recycle)),
-        watermark(o.watermark),
         credit_idle(o.credit_idle), credit_allocated(o.credit_allocated),
-        rx_depth(o.rx_depth), is_fc(o.is_fc) {
+        rx_depth(o.rx_depth), conns(std::move(o.conns)),
+        last_harvest_ts(o.last_harvest_ts), is_fc(o.is_fc) {
     o.jfr = nullptr; o.rx_jfc = nullptr; o.rx_jfce = nullptr; o.rx_jfce_fd = -1;
   }
   EvbJfr& operator=(EvbJfr&& o) noexcept {
     if (this != &o) {
       jfr = o.jfr; rx_jfc = o.rx_jfc; rx_jfce = o.rx_jfce; rx_jfce_fd = o.rx_jfce_fd;
       rx_bufs = std::move(o.rx_bufs);
+      rx_capacity = o.rx_capacity; rx_allocated = o.rx_allocated;
       recv_posted = o.recv_posted; next_free_slot = o.next_free_slot;
+      grow_step = o.grow_step; high_water_pct = o.high_water_pct;
       held_count.store(o.held_count.load(std::memory_order_relaxed),
                        std::memory_order_relaxed);
       transit_cnt.store(o.transit_cnt.load(std::memory_order_relaxed),
@@ -156,7 +177,8 @@ struct EvbJfr {
       recycle = std::move(o.recycle);
       watermark = o.watermark;
       credit_idle = o.credit_idle; credit_allocated = o.credit_allocated;
-      rx_depth = o.rx_depth; is_fc = o.is_fc;
+      rx_depth = o.rx_depth; conns = std::move(o.conns);
+      last_harvest_ts = o.last_harvest_ts; is_fc = o.is_fc;
       o.jfr = nullptr; o.rx_jfc = nullptr; o.rx_jfce = nullptr; o.rx_jfce_fd = -1;
     }
     return *this;
@@ -190,6 +212,7 @@ class UrmaTransportContext {
   // ── 路由表(进程级,16 分片,自身带锁) ──
   void registerSocket(uint64_t socket_id, UrmaAsyncSocket* socket);
   void unregisterSocket(uint64_t socket_id);
+  void unregisterConn(UrmaAsyncSocket* socket);  // 流控连接列表按指针摘除
   void registerFcSocket(uint64_t socket_id, UrmaAsyncSocket* socket);
   void unregisterFcSocket(uint64_t socket_id);
   SafeRouteEntryPtr findRouteEntry(uint64_t socket_id);
@@ -257,10 +280,26 @@ class UrmaTransportContext {
   uint32_t ioSqWaiterCount() const noexcept { return io_waiters_.size(); }
 
   // ── credit_pool(same-thread,I2) ──
-  void recharge() noexcept { ++io_jfr_.credit_idle; }
+  // 恒等式:credit_idle + credit_allocated == recv_posted
+  //
+  // 记账口径(物理语义,修正设计文档 §1.3 表格中"消费"一行):
+  //   授信 g     : idle -= g, allocated += g        (和不变)
+  //   消费 1     : allocated -= 1, recv_posted -= 1 (和减 1)
+  //   补投 Δ     : idle += Δ,      recv_posted += Δ (和加 Δ)
+  // 消费时 buffer 尚未重投,idle 不增加;重投时才 idle += Δ。
+  // 消费 1 个 buffer:优先扣已授出额度;若 allocated 已为 0(控制包绕过
+  // 授信等场景),则从 idle 扣,保证 idle+allocated 与 recv_posted 同步下降。
+  void onBufferConsumed() noexcept {
+    if (io_jfr_.credit_allocated > 0) {
+      --io_jfr_.credit_allocated;
+    } else if (io_jfr_.credit_idle > 0) {
+      --io_jfr_.credit_idle;
+    }
+  }
   uint32_t creditIdle() const noexcept { return io_jfr_.credit_idle; }
   uint32_t creditAllocated() const noexcept { return io_jfr_.credit_allocated; }
   uint32_t rxDepth() const noexcept { return io_jfr_.rx_depth; }
+  uint32_t recvPosted() const noexcept { return io_jfr_.recv_posted; }
   bool tryAllocCredit() noexcept {
     if (io_jfr_.credit_idle > 0) {
       --io_jfr_.credit_idle;
@@ -270,9 +309,64 @@ class UrmaTransportContext {
     return false;
   }
   void releaseCredit(uint32_t cnt) noexcept {
-    io_jfr_.credit_allocated -= cnt;
+    if (io_jfr_.credit_allocated >= cnt) {
+      io_jfr_.credit_allocated -= cnt;
+    } else {
+      io_jfr_.credit_allocated = 0;
+    }
     io_jfr_.credit_idle += cnt;
   }
+  // 授信 g(先记账,发送失败由调用方回滚 releaseCredit)
+  bool grantCredit(uint32_t g) noexcept {
+    if (io_jfr_.credit_idle < g) return false;
+    io_jfr_.credit_idle -= g;
+    io_jfr_.credit_allocated += g;
+    return true;
+  }
+  // 补投 Δ 个 buffer 时容量增加 → credit_idle 同步增加(§1.3)
+  void onBuffersPosted(uint32_t delta) noexcept { io_jfr_.credit_idle += delta; }
+
+  // ── 常驻流控监控计数入口(开销:一次 relaxed fetch_add)──
+  void diagFcGrantTx() noexcept {
+    diag_.fc_grant_tx.fetch_add(1, std::memory_order_relaxed);
+  }
+  void diagFcGrantPos() noexcept {
+    diag_.fc_grant_pos.fetch_add(1, std::memory_order_relaxed);
+  }
+  void diagFcGrantNeg() noexcept {
+    diag_.fc_grant_neg.fetch_add(1, std::memory_order_relaxed);
+  }
+  void diagFcBlockedTx() noexcept {
+    diag_.fc_blocked_tx.fetch_add(1, std::memory_order_relaxed);
+  }
+  void diagFcBlockedRx() noexcept {
+    diag_.fc_blocked_rx.fetch_add(1, std::memory_order_relaxed);
+  }
+  void diagFcReclaim() noexcept {
+    diag_.fc_reclaim.fetch_add(1, std::memory_order_relaxed);
+  }
+  void diagFcGrantFail() noexcept {
+    diag_.fc_grant_fail.fetch_add(1, std::memory_order_relaxed);
+  }
+  void diagFcSqFull() noexcept {
+    diag_.fc_sq_full.fetch_add(1, std::memory_order_relaxed);
+  }
+  void diagFcPostErr() noexcept {
+    diag_.fc_post_err.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  // 连接关闭时归还其未消费额度,防止 credit 泄漏
+  void reclaimConnCredit(uint32_t cnt) noexcept {
+    if (cnt == 0) return;
+    if (io_jfr_.credit_allocated >= cnt) {
+      io_jfr_.credit_allocated -= cnt;
+    } else {
+      cnt = io_jfr_.credit_allocated;
+      io_jfr_.credit_allocated = 0;
+    }
+    io_jfr_.credit_idle += cnt;
+  }
+  EvbJfr& ioJfrMeta() noexcept { return io_jfr_; }
 
   // ── RX slot 回收(I2 豁免:deleter 任意线程) ──
   static void releaseHeldSlot(UrmaTransportContext* ctx, EvbJfr* jfr,
@@ -280,6 +374,12 @@ class UrmaTransportContext {
   static void recycleRxSlot(EvbJfr* jfr, uint32_t slot) noexcept;
   void repostRecycled(EvbJfr* jfr) noexcept;
   void checkRxAccounting(EvbJfr* jfr) noexcept;
+
+  // RX buffer 阶梯扩容:分配并投递 [rx_allocated, +count) 的 slot
+  bool growRxBufs(EvbJfr* jfr, uint32_t count);
+  // 按水位检查扩容(使用率 >= high_water_pct 时追加 grow_step)
+  // 返回本次新增的投递数(0 表示未扩容)
+  uint32_t tryGrowRxPool(EvbJfr* jfr) noexcept;
 
   // post recv WR
   static bool postRecvWr(EvbJfr* jfr, uint32_t slot);
@@ -355,6 +455,44 @@ class UrmaTransportContext {
   static std::atomic<uint32_t> kRepostIntervalMs;
   std::unique_ptr<RepostTimer> repost_timer_;
 
+  // ── 流控:1ms 水位调整定时器(per-EVB,receiver-driven credit) ──
+  // 遍历 io_jfr_.conns:空闲回收 + 水位差额调整。
+  // 与 RepostTimer 同构(AsyncTimeout 自续),仅在活跃连接存在时运行。
+  class CreditTimer : private AsyncTimeout {
+   public:
+    explicit CreditTimer(UrmaTransportContext* owner)
+        : AsyncTimeout(owner->evb_), owner_(owner) {}
+    void arm() { scheduleTimeout(owner_->creditPeriodMs()); }
+    void disarm() { cancelTimeout(); }
+   private:
+    void timeoutExpired() noexcept override;
+    UrmaTransportContext* owner_;
+  };
+  std::unique_ptr<CreditTimer> credit_timer_;
+  uint32_t creditPeriodMs() const noexcept { return fc_grant_period_ms_; }
+  void runCreditTick() noexcept;   // 1ms tick 主体(空闲回收 + 水位调整)
+  void sampleRates(uint64_t now_ns) noexcept;  // harvest 后速率采样
+
+  // 流控参数快照(构造时从 UrmaConfig 拷入)
+  uint32_t fc_initial_window_{16};
+  uint32_t fc_min_window_{8};
+  uint32_t fc_grant_period_ms_{1};
+  uint32_t fc_idle_timeout_ms_{100};
+  uint32_t fc_reclaim_used_percent_{80};
+  bool fc_enable_{true};
+
+  // 常驻流控监控 dump 间隔(ms)。URMA_FC_STATS_MS 覆盖;0=关闭。
+  // 默认 1000ms,与 CreditTimer 同频,开销可忽略。
+  static uint32_t fcStatsIntervalMs() {
+    if (kFcStatsIntervalMs == 0xFFFFFFFFu) {
+      const char* env = getenv("URMA_FC_STATS_MS");
+      kFcStatsIntervalMs = env ? static_cast<uint32_t>(atoi(env)) : 1000u;
+    }
+    return kFcStatsIntervalMs;
+  }
+  static std::atomic<uint32_t> kFcStatsIntervalMs;
+  void dumpFcStatsIfDue() noexcept;
+
   // 路由表(进程级,16 分片)
   UrmaRouteTable route_table_;
   UrmaRouteTable fc_route_table_;
@@ -379,6 +517,20 @@ class UrmaTransportContext {
     std::atomic<uint64_t> rearm_fail{0};            // rearm 失败次数
     std::atomic<uint64_t> repost_timer_tick{0};     // RepostTimer 触发次数
     std::atomic<uint64_t> last_log_us{0};           // 上次打点日志时间
+
+    // ── 常驻流控监控计数(URMA_FC_STATS_MS 控制 dump 间隔,0=关闭)──
+    std::atomic<uint64_t> fc_grant_tx{0};     // 发出 GRANT 次数
+    std::atomic<uint64_t> fc_grant_pos{0};    // 正 delta GRANT(授出)
+    std::atomic<uint64_t> fc_grant_neg{0};    // 负 delta GRANT(回收)
+    std::atomic<uint64_t> fc_blocked_tx{0};   // 发出 BLOCKED 次数
+    std::atomic<uint64_t> fc_blocked_rx{0};   // 收到 BLOCKED 次数
+    std::atomic<uint64_t> fc_reclaim{0};      // 空闲回收次数
+    std::atomic<uint64_t> fc_grant_fail{0};   // GRANT 发送失败次数
+    std::atomic<uint64_t> fc_credit_leak{0};  // 恒等式失衡检出次数
+    std::atomic<uint64_t> fc_sq_full{0};      // FC SQ 配额耗尽次数
+    std::atomic<uint64_t> fc_post_err{0};     // FC post_jfs_wr 失败次数
+    std::atomic<uint64_t> fc_stats_last_us{0};// 上次 FC stats dump 时间
+
     uint64_t last_handler_rx{0};                     // 上次打点时 handler_ready_io_rx 快照
     uint64_t last_handler_tx{0};                     // 上次打点时 handler_ready_io_tx 快照
 
