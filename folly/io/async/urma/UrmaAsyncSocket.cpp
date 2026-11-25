@@ -1368,7 +1368,7 @@ void UrmaAsyncSocket::checkReorderTimeout() noexcept {
 // MSG_PULL_MEM / MSG_FREE 走 SEND_IMM 路径,由 UrmaJfrPool::harvestAndDispatch
 // 解析 imm_data + PullMemControlPacket 后直接调 onControlMsgImm,不进入此方法
 //
-// 任务 C(H-3)零拷贝所有权交付(docs/urma-threading.md 不变量 I4):
+// 任务 C(H-3)零拷贝所有权交付(docs/urma-transport-design.md 不变量 I4):
 //   DATA slot 经 IOBuf::takeOwnership 交付,deleter 将 slot 送回 per-JFR
 //   无锁回收栈 —— 修复旧"wrapBuffer 非拥有交付 + 消费即重投"的数据竞争
 //   (上层异步持有期间 DMA 覆盖同一 buffer)。

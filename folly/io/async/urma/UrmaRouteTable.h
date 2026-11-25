@@ -11,7 +11,7 @@
  *   修复 H-1:原 socket_map_/fc_socket_map_ 为普通 unordered_map,任意 EVB 的
  *   收割线程读 + 任意握手线程写 → 多线程 UB / rehash 崩溃。
  *
- *   设计(docs/urma-threading.md 不变量 I2/I3):
+ *   设计(docs/urma-transport-design.md 不变量 I3):
  *     - 16 分片,每分片 folly::Synchronized<unordered_map, SharedMutex>(读写锁)
  *     - SafeRouteEntry 独立分配,shared_ptr 保活:find 持分片读锁拷出句柄后立即放锁,
  *       后续无锁使用;entry 生命周期 = map 内引用 + 已拷出引用,
