@@ -18,16 +18,25 @@ URMA 通过 TCP 建链，小包使用 SEND/RECV，大包使用 READ。接收端�
 | `registered_pool.pool_size` | 268435456 | 初始注册池容量，单位为字节，取页大小的正整数倍。 |
 | `registered_pool.pool_max_size` | 536870912 | 注册池容量上限，按页对齐且不小于初始容量。0 表示使用初始容量作为上限。默认配置下，有效上限至少为 16 KiB。 |
 
-随附的 [urma.json](urma.json) 省略 `dev_name` 和 `eid_index`，这两项沿用应用配置。要在文件中指定设备，可按下面的写法填写。本测试环境的 `udmac0d1e2` 列出索引 0–7，示例选择 0。
+随附的 `urma.json` 省略 `dev_name` 和 `eid_index`，这两项沿用应用配置。
+
+下面是 AccLibBenchmark 的 `fbthrift/fbthrift_urma/scripts/urma.example.json` 完整配置。本测试环境的 `udmac0d1e2` 列出索引 0–7，示例选择 0。两端分别按本机设备填写这两项。
 
 ```json
 {
   "dev_name": "udmac0d1e2",
-  "eid_index": 0
+  "eid_index": 0,
+  "rx_depth": 0,
+  "rx_target": 256,
+  "tx_depth": 1024,
+  "handshake_timeout_ms": 5000,
+  "max_pending_bytes": 134217728,
+  "registered_pool": {
+    "pool_size": 268435456,
+    "pool_max_size": 536870912
+  }
 }
 ```
-
-运行 fbthrift 压测时，可直接复制 AccLibBenchmark 的[完整配置样例](https://gitcode.com/boostkit/AccLibBenchmark/blob/master/fbthrift/fbthrift_urma/scripts/urma.example.json)。
 
 使用默认配置（`rx_depth=0`、`rx_target=256`）时，库根据设备能力和发送队列深度确定接收队列容量，每个 EventBase 预投 256 块接收缓冲。收发共用的完成队列（JFC）由库自动创建，无需配置其深度。
 
