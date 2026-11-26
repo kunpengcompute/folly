@@ -251,11 +251,11 @@ static void init(const UrmaConfig& config);
 
 |参数名|说明|输入/输出|
 |--|--|--|
-|config|设备、队列、连接积压及注册内存池配置。设置 `FOLLY_URMA_CONFIG` 时，文件中的字段覆盖同名配置。|输入|
+|config|设备、队列、连接积压及注册内存池配置。设置 `FOLLY_URMA_CONFIG` 后，创建上下文时读取文件，文件中的字段覆盖同名配置。|输入|
 
 #### UrmaInit::init函数约束说明
 
-- 编译时启用`FOLLY_USE_URMA=ON`，在创建socket前完成初始化。再次调用时可复用已绑定的设备和 EID，显式请求另一设备或 EID 会抛出异常，已有上下文继续工作。
+- 编译时启用`FOLLY_USE_URMA=ON`，在创建socket前完成初始化。已有上下文时，`UrmaInit::init({})` 直接复用当前绑定。C++ 参数显式指定的设备或 EID 与当前绑定不一致时会抛出异常。配置文件被修改或移走不影响复用，下一次创建上下文时才会重新读取。
 - `UrmaInit::getConfig()`返回生效的配置，包括按设备能力确定的接收队列深度。
 - 应用退出时先释放socket、EventBase及池化IOBuf，再调用`UrmaInit::fini()`。若DMA仍在途、对端仍持有引用或SDK清理需要重试，资源会延迟释放。清理完成前`UrmaInit::isInitialized()`仍可返回`true`。
 
@@ -370,7 +370,7 @@ UrmaConfig loadUrmaConfigFile(const std::string& path, const UrmaConfig& base = 
 
 `buffer_size`、`enable_read`、`read_threshold`、`read_window`、`offer_window`和`registered_pool.zero_copy`通过C++配置设置。`read_threshold`初始为4352字节。
 
-下面是 Folly 随附的 `folly/io/async/urma/urma.json`。加载该文件会选择 `udmac0d1e2` 和 EID 0。两端分别按本机设备填写。本测试环境列出 0–7，可用索引以所选设备实际报告的列表为准。
+下面是 Folly 随附的 `folly/io/async/urma/urma.json`。文件固定选择 `udmac0d1e2` 和 EID 索引 `0`。本机没有该设备或该设备未列出索引 `0` 时，直接加载会抛出异常。两端分别按本机设备修改配置副本。本测试环境的 `udmac0d1e2` 列出索引 0–7，可用索引以所选设备实际报告的列表为准。
 
 省略某个字段时沿用应用传入的值，加载 `{}` 会保留全部应用配置。初始化时若设备不存在、索引不属于所选设备，或 SDK 返回的上下文与设备或 EID 不符，Folly 会抛出异常。
 

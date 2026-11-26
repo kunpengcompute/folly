@@ -166,17 +166,19 @@ index 831acd883e54aad07cff19160e72688de8de1bf8..152e2e579aa76ff89e93260eaca38ff6
    bool useHeapFullStorage = false;
 diff --git a/folly/io/async/urma/README.md b/folly/io/async/urma/README.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..9fff379d1b604baf6623291946b42b511a494518
+index 0000000000000000000000000000000000000000..3f7b9e244cc70ff10002dcffe3ac61da8d030430
 --- /dev/null
 +++ b/folly/io/async/urma/README.md
-@@ -0,0 +1,92 @@
+@@ -0,0 +1,94 @@
 +# URMA 传输
 +
 +URMA 通过 TCP 建链，小包使用 SEND/RECV，大包使用 READ。接收端按发送顺序交付数据。
 +
 +## 配置
 +
-+构建 Folly 时启用 `FOLLY_USE_URMA=ON`。应用通过 `UrmaConfig` 配置传输。也可以将 `FOLLY_URMA_CONFIG` 指向 [urma.json](urma.json)，文件中的字段会在 `UrmaInit::init()` 时覆盖对应的 C++ 配置。未知字段、重复字段或值不合法会导致初始化失败。
++构建 Folly 时启用 `FOLLY_USE_URMA=ON`。应用通过 `UrmaConfig` 配置传输。设置 `FOLLY_URMA_CONFIG` 后，`UrmaInit::init()` 在创建上下文时读取文件。文件中的字段覆盖同名 C++ 配置，未知字段、重复字段或非法值会导致初始化失败。
++
++随附的 `urma.json` 固定选择设备 `udmac0d1e2` 和 EID 索引 `0`。使用前在两端分别执行 `urma_admin show --all`。如果本机没有该设备，或该设备未列出索引 `0`，直接加载此文件会抛出异常。请在本机的配置副本中填写实际的 `dev_name` 和 `eid_index`。如需沿用应用选卡，可省略这两个字段。
 +
 +| 字段 | 未指定时的默认值 | 取值与用途 |
 +|---|---:|---|
@@ -190,7 +192,7 @@ index 0000000000000000000000000000000000000000..9fff379d1b604baf6623291946b42b51
 +| `registered_pool.pool_size` | 268435456 | 初始注册池容量，单位为字节，取页大小的正整数倍。 |
 +| `registered_pool.pool_max_size` | 536870912 | 注册池容量上限，按页对齐且不小于初始容量。0 表示使用初始容量作为上限。默认配置下，有效上限至少为 16 KiB。 |
 +
-+下面是 Folly 随附的 `folly/io/async/urma/urma.json`。加载该文件会选择 `udmac0d1e2` 和 EID 0。两端分别运行 `urma_admin show --all` 查看本机设备及索引，再按实际情况填写。本测试环境列出 0–7，其他设备以各自报告的列表为准。省略某个字段时沿用应用传入的值，`{}` 保留应用的全部配置。
++下面是 `folly/io/async/urma/urma.json` 的完整内容。本测试环境的 `udmac0d1e2` 列出索引 0–7，可用索引以所选设备实际报告的列表为准。加载 `{}` 会保留应用的全部配置。
 +
 +```json
 +{
@@ -208,7 +210,7 @@ index 0000000000000000000000000000000000000000..9fff379d1b604baf6623291946b42b51
 +}
 +```
 +
-+`UrmaInit::init()` 会核对设备名、该设备的 EID 列表与 SDK 创建的上下文。设备不存在、索引不属于该设备、SDK 上下文与所选绑定冲突时，初始化会抛出异常。进程已有上下文时，显式请求另一设备或索引也会报错，已有连接继续使用原绑定。
++`UrmaInit::init()` 会核对设备名、该设备的 EID 列表与 SDK 创建的上下文。SDK 上下文与所选绑定冲突时，初始化会抛出异常。已有上下文时，`UrmaInit::init({})` 直接复用当前绑定。如在 C++ 参数中指定设备或 EID，指定的值必须与当前绑定一致。配置文件即使被修改或移走也不影响复用，下一次创建上下文时才会重新读取。
 +
 +使用默认配置（`rx_depth=0`、`rx_target=256`）时，库根据设备能力和发送队列深度确定接收队列容量，每个 EventBase 预投 256 块接收缓冲。收发共用的完成队列（JFC）由库自动创建，无需配置其深度。
 +
@@ -2505,7 +2507,7 @@ index 0000000000000000000000000000000000000000..00951f569b4d1495c878dd77797d1499
 +#endif
 diff --git a/folly/io/async/urma/UrmaInit.cpp b/folly/io/async/urma/UrmaInit.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..cb1c3ec7638ae3f9c763e4dc5e515b552319e77e
+index 0000000000000000000000000000000000000000..a9d52162e88a4e5ce95ed5bdb5fc2d9122591246
 --- /dev/null
 +++ b/folly/io/async/urma/UrmaInit.cpp
 @@ -0,0 +1,413 @@
@@ -2590,19 +2592,19 @@ index 0000000000000000000000000000000000000000..cb1c3ec7638ae3f9c763e4dc5e515b55
 +  std::lock_guard<std::mutex> lock(mutex);
 +  if (shutdownRequested)
 +    throw std::runtime_error("URMA shutdown is still pending");
-+  const char* path = std::getenv("FOLLY_URMA_CONFIG");
-+  const UrmaConfig config =
-+      path ? loadUrmaConfigFile(path, requested) : requested;
 +  if (context) {
-+    if (!config.dev_name.empty() && config.dev_name != settings.dev_name)
-+      throw std::runtime_error("requested URMA device " + config.dev_name +
++    if (!requested.dev_name.empty() && requested.dev_name != settings.dev_name)
++      throw std::runtime_error("requested URMA device " + requested.dev_name +
 +          " conflicts with active device " + settings.dev_name);
-+    if (config.eid_index && *config.eid_index != context->eid_index)
++    if (requested.eid_index && *requested.eid_index != context->eid_index)
 +      throw std::runtime_error("URMA device " + settings.dev_name +
-+          ": requested eid_index=" + std::to_string(*config.eid_index) +
++          ": requested eid_index=" + std::to_string(*requested.eid_index) +
 +          " conflicts with active eid_index=" + std::to_string(context->eid_index));
 +    return;
 +  }
++  const char* path = std::getenv("FOLLY_URMA_CONFIG");
++  const UrmaConfig config =
++      path ? loadUrmaConfigFile(path, requested) : requested;
 +  validateUrmaConfig(config);
 +  // Copy the allocating string before acquiring SDK resources. Publishing the
 +  // effective configuration below is a non-throwing move.
@@ -2924,10 +2926,10 @@ index 0000000000000000000000000000000000000000..cb1c3ec7638ae3f9c763e4dc5e515b55
 +#endif
 diff --git a/folly/io/async/urma/UrmaInit.h b/folly/io/async/urma/UrmaInit.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..51f9221d73a9cccfa059063263a12b2605d2d1ad
+index 0000000000000000000000000000000000000000..4e4dfa7a3325e1093c520f0adace994d586a6bf8
 --- /dev/null
 +++ b/folly/io/async/urma/UrmaInit.h
-@@ -0,0 +1,77 @@
+@@ -0,0 +1,78 @@
 +/* Copyright (c) Huawei Technologies Co., Ltd. 2026. Licensed under Apache-2.0.
 + */
 +#pragma once
@@ -2953,7 +2955,8 @@ index 0000000000000000000000000000000000000000..51f9221d73a9cccfa059063263a12b26
 +      UrmaPoolSignal* waiter = nullptr);
 +  // Acquires the process SDK context and registered pool. Queue resources are
 +  // prepared by each EventBase's shared owner when first needed.
-+  // A later init may reuse the active device and EID, but cannot switch either.
++  // FOLLY_URMA_CONFIG is read when creating the context. While it is active,
++  // any device or EID supplied by the caller must match the current binding.
 +  static void init(const UrmaConfig& config);
 +  // Requests shutdown and rejects new transports. Existing owners must still
 +  // be released by the caller; cleanup then retries automatically, including
@@ -6409,10 +6412,10 @@ index 0000000000000000000000000000000000000000..50c731d948e1f019c4291a5841db51a9
 +}
 diff --git a/folly/io/async/urma/test/InitTest.cpp b/folly/io/async/urma/test/InitTest.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..dfcfc4a5750a2bfd224f67b8894c42ff062fe4a7
+index 0000000000000000000000000000000000000000..32baec3f84dd76e7a56dc26b60b5638226c5b0b4
 --- /dev/null
 +++ b/folly/io/async/urma/test/InitTest.cpp
-@@ -0,0 +1,561 @@
+@@ -0,0 +1,602 @@
 +/* Copyright (c) Huawei Technologies Co., Ltd. 2026. Licensed under Apache-2.0.
 + */
 +#include <cstdlib>
@@ -6425,6 +6428,9 @@ index 0000000000000000000000000000000000000000..dfcfc4a5750a2bfd224f67b8894c42ff
 +#include <thread>
 +#include <utility>
 +#include <vector>
++#include <folly/FileUtil.h>
++#include <folly/experimental/EnvUtil.h>
++#include <folly/experimental/TestUtil.h>
 +#include <folly/io/async/urma/UrmaCleanup.h>
 +#include <folly/io/async/urma/UrmaInit.h>
 +
@@ -6663,6 +6669,43 @@ index 0000000000000000000000000000000000000000..dfcfc4a5750a2bfd224f67b8894c42ff
 +  std::cout << "PASS device discovery, per-device EIDs, active binding conflicts and SDK rollback\n";
 +}
 +
++void checkConfigFileReuse(const folly::UrmaConfig& base) {
++  using folly::UrmaInit;
++  reset();
++  eidCount = 2;
++  deviceEids[0].eid_index = 17;
++  deviceEids[1].eid_index = 19;
++  folly::test::TemporaryDirectory dir("urma-init");
++  const auto path = dir.path() / "urma.json";
++  folly::test::EnvVarSaver restoreEnv;
++  require(::setenv("FOLLY_URMA_CONFIG", path.c_str(), 1) == 0,
++          "could not set config path");
++  require(folly::writeFile(std::string(R"({"eid_index":17})"), path.c_str()),
++          "could not write config");
++
++  auto caller = base;
++  caller.eid_index = 3;
++  UrmaInit::init(caller);
++  require(UrmaInit::getConfig().eid_index == 17u,
++          "first init did not read the file");
++  expectInitError(caller, "requested eid_index=3 conflicts with active eid_index=17");
++
++  require(folly::fs::remove(path), "could not remove config");
++  UrmaInit::init({});
++  caller.eid_index = 17;
++  UrmaInit::init(caller);
++  require(initializes == 1 && contexts == 1, "reuse reacquired the SDK");
++  UrmaInit::fini();
++
++  require(folly::writeFile(std::string(R"({"eid_index":19})"), path.c_str()),
++          "could not replace config");
++  UrmaInit::init(base);
++  require(initializes == 2 && UrmaInit::getConfig().eid_index == 19u,
++          "a new context did not read the replacement config");
++  UrmaInit::fini();
++  std::cout << "PASS config file is read once per context\n";
++}
++
 +int main() {
 +  try {
 +    folly::UrmaConfig config;
@@ -6731,6 +6774,7 @@ index 0000000000000000000000000000000000000000..dfcfc4a5750a2bfd224f67b8894c42ff
 +    std::cout << "PASS sparse EID selection, missing index rollback and explicit zero\n";
 +
 +    checkDeviceBinding(config);
++    checkConfigFileReuse(config);
 +
 +    for (bool borrowed : {false, true}) {
 +      for (Failure stage :
@@ -6976,10 +7020,10 @@ index 0000000000000000000000000000000000000000..dfcfc4a5750a2bfd224f67b8894c42ff
 +#endif
 diff --git a/folly/io/async/urma/test/MemoryContractTest.cpp b/folly/io/async/urma/test/MemoryContractTest.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..155d4fd845458096fe7ea953ee320f1e1a372c22
+index 0000000000000000000000000000000000000000..d808f3831a395d0d78a1c7034db31f74d4c3a189
 --- /dev/null
 +++ b/folly/io/async/urma/test/MemoryContractTest.cpp
-@@ -0,0 +1,813 @@
+@@ -0,0 +1,817 @@
 +/* Copyright (c) Huawei Technologies Co., Ltd. 2026. Licensed under Apache-2.0.
 + */
 +#include <folly/io/async/urma/UrmaConfig.h>
@@ -7392,9 +7436,9 @@ index 0000000000000000000000000000000000000000..155d4fd845458096fe7ea953ee320f1e
 +    UrmaConfig base;
 +    base.dev_name = "device-supplied-by-caller";
 +    base.eid_index = 3;
-+    const auto sample = loadUrmaConfigFile(argv[1], base);
-+    check(sample.dev_name == "udmac0d1e2" && sample.eid_index == 0u,
-+          "urma.json did not select its example device and EID index");
++    const auto sample = loadUrmaConfigFile(argv[1]);
++    check(!sample.dev_name.empty() && sample.eid_index.has_value(),
++          "urma.json must specify a device name and an EID index");
 +    check(sample.registered_pool.enabled &&
 +              sample.registered_pool.elastic &&
 +              sample.registered_pool.zero_copy &&
@@ -7406,6 +7450,10 @@ index 0000000000000000000000000000000000000000..155d4fd845458096fe7ea953ee320f1e
 +    check(fd >= 0, "temporary config creation failed");
 +    ::close(fd);
 +    auto removeFile = makeGuard([&] { ::unlink(path); });
++    std::ofstream(path) << R"({"dev_name":"device-from-json","eid_index":0})";
++    const auto overridden = loadUrmaConfigFile(path, base);
++    check(overridden.dev_name == "device-from-json" && overridden.eid_index == 0u,
++          "explicit JSON fields did not override the caller's device and EID index");
 +    std::ofstream(path) << R"({"dev_name":"device-from-json"})";
 +    const auto selected = loadUrmaConfigFile(path, base);
 +    check(selected.dev_name == "device-from-json" && selected.eid_index == base.eid_index,

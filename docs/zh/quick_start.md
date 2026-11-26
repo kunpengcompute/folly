@@ -344,10 +344,10 @@ int main() {
 
 #### 配置建议
 
-- `FOLLY_URMA_CONFIG` 指向本机的 JSON 文件。文件中的字段覆盖同名 C++ 配置，省略的字段沿用应用传入值。客户端和服务端分别选择本机的 `dev_name` 和 `eid_index`。
+- `FOLLY_URMA_CONFIG` 指向本机的 JSON 文件。创建上下文时，文件中的字段覆盖同名 C++ 配置，省略的字段沿用应用传入值。
 - `rx_target`按EventBase设置预投接收缓冲数，`max_pending_bytes`按连接设置收发积压上限，`registered_pool`按进程设置注册内存容量。字段范围和默认值见《[API参考](./api_reference.md#urma配置项)》。
 
-两端分别执行 `urma_admin show --all` 查看本机设备，`eid0` 表示索引 0。本测试环境的 `udmac0d1e2` 列出索引 0–7。在 `urma.json` 中按以下写法选择索引 0。
+随附的 `urma.json` 固定选择 `udmac0d1e2` 和 EID 索引 `0`。两端分别执行 `urma_admin show --all`，`eid0` 表示索引 0。如果本机没有该设备，或该设备未列出索引 `0`，直接加载此文件会抛出异常。请先将本机配置副本中的 `dev_name` 和 `eid_index` 改为实际值。本测试环境的 `udmac0d1e2` 列出索引 0–7，示例选择 0。
 
 ```json
 {
