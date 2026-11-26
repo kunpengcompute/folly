@@ -781,6 +781,15 @@ class EventBase : public TimeoutManager,
    */
   void bumpHandlingTime() final;
 
+  /**
+   * Give the loop a chance to return from the backend after an internal
+   * event's callback ran, so that any loop callback it scheduled runs before
+   * the loop blocks again.
+   *
+   * Called by EventHandler and AsyncTimeout; not meant for user code.
+   */
+  void yieldAfterInternalEvent() final;
+
   class SmoothLoopTime {
    public:
     explicit SmoothLoopTime(std::chrono::microseconds timeInterval)

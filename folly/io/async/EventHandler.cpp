@@ -61,7 +61,12 @@ bool EventHandler::registerImpl(uint16_t events, bool internal) {
   // it before hand, then pass it back into event_base_set() afterwards
   auto* evb = event_.eb_ev_base();
   event_.eb_event_set(
-      event_.eb_ev_fd(), short(events), &EventHandler::libeventCallback, this);
+      event_.eb_ev_fd(),
+      short(events),
+      internal && kInternalEventsCanStallLoop
+          ? &EventHandler::libeventInternalCallback
+          : &EventHandler::libeventCallback,
+      this);
   event_.eb_event_base_set(evb);
 
   // Set EVLIST_INTERNAL if this is an internal event
@@ -161,6 +166,14 @@ void EventHandler::libeventCallback(libevent_fd_t fd, short events, void* arg) {
   if (observer) {
     observer->stopped(reinterpret_cast<uintptr_t>(handler));
   }
+}
+
+void EventHandler::libeventInternalCallback(
+    libevent_fd_t fd, short events, void* arg) {
+  // Read the EventBase up front: handlerReady() may destroy the handler.
+  auto* eventBase = reinterpret_cast<EventHandler*>(arg)->eventBase_;
+  libeventCallback(fd, events, arg);
+  eventBase->yieldAfterInternalEvent();
 }
 
 void EventHandler::setEventBase(EventBase* eventBase) {

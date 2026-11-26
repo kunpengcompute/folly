@@ -20,6 +20,7 @@
 
 #include <folly/io/IOBuf.h>
 
+#include <algorithm>
 #include <cassert>
 #include <cstdint>
 #include <cstdlib>
@@ -38,6 +39,7 @@
 #include <folly/lang/Exception.h>
 #include <folly/memory/Malloc.h>
 #include <folly/memory/SanitizeAddress.h>
+#include <folly/memory/IoBufPool.h>
 
 /*
  * Callbacks that will be invoked when IOBuf allocates or frees memory.
@@ -142,9 +144,9 @@ struct IOBuf::HeapStorage {
 };
 
 struct alignas(folly::max_align_v) IOBuf::HeapFullStorage {
-  // Make sure jemalloc allocates from the 64-byte class.  Putting this here
+  // Make sure jemalloc allocates from a reasonable size class.  Putting this here
   // because HeapStorage is private so it can't be at namespace level.
-  static_assert(sizeof(HeapStorage) <= 64, "IOBuf may not grow over 56 bytes!");
+  static_assert(sizeof(HeapStorage) <= 128, "IOBuf may not grow over 120 bytes!");
 
   HeapStorage hs;
   SharedInfo shared;
@@ -325,6 +327,14 @@ unique_ptr<IOBuf> IOBuf::create(std::size_t capacity) {
     throw_exception<std::bad_alloc>();
   }
 
+  if (sMemoryPoolEnabled.load(std::memory_order_relaxed)) {
+    size_t blockDataCap = gIoBufBlockSize - sizeof(IoBufBlock);
+    if (sUnifiedPoolMode.load(std::memory_order_acquire) || capacity <= blockDataCap) {
+      return createFromPoolShared(capacity);
+    }
+    // sUnifiedPoolMode=false && cap > blockDataCap → 原路径 createCombined/createSeparate
+  }
+
   // For smaller-sized buffers, allocate the IOBuf, SharedInfo, and the buffer
   // all with a single allocation.
   //
@@ -388,6 +398,62 @@ unique_ptr<IOBuf> IOBuf::createCombined(std::size_t capacity) {
 
 unique_ptr<IOBuf> IOBuf::createSeparate(std::size_t capacity) {
   return std::make_unique<IOBuf>(CREATE, capacity);
+}
+
+std::atomic<bool> IOBuf::sMemoryPoolEnabled{false};
+std::atomic<bool> IOBuf::sUnifiedPoolMode{false};
+
+void IOBuf::enableUnifiedPoolMode() {
+  sUnifiedPoolMode.store(true, std::memory_order_release);
+}
+
+void IOBuf::enableMemoryPool() {
+  sMemoryPoolEnabled.store(true, std::memory_order_relaxed);
+}
+
+void IOBuf::setBlockSize(std::size_t size) {
+  // Ensure block is large enough to hold the header + at least 1 byte of data
+  size = std::max(size, sizeof(IoBufBlock) + 1);
+  gIoBufBlockSize = size;
+}
+
+void IOBuf::setMaxBlocksPerThread(std::size_t n) {
+  n = std::clamp(n, size_t{1}, kMaxBlocksHardLimit);
+  gMaxBlocksPerThread = n;
+}
+
+void IOBuf::poolReleaseFn(void* buf, void* userData) {
+  IoBufBlock* block = static_cast<IoBufBlock*>(userData);
+  if (block->ref_count.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+    ioBufBlockRelease(block);
+  }
+}
+
+unique_ptr<IOBuf> IOBuf::createFromPoolShared(std::size_t capacity) {
+  IoBufBlock* b = share_block(capacity);
+  if (!b) {
+    // 池耗尽 —— 严禁 fallback 到 createCombined:
+    // 非 MR 堆内存不可被 URMA DMA 访问,若上层用作段表 PULL 源或
+    // READ dst 将产生 CQE 错误(远端 READ 失败/数据损坏)。
+    // 正确行为:干净失败(bad_alloc),由上层决定重试或报错。
+    throw_exception<std::bad_alloc>();
+  }
+
+  uint32_t offset = b->data_len;
+  // 截断修正: share_block 可能将 alloc_size 截断到池最大档位(1M),
+  // 但 min_capacity 参数未被截断 → 本函数用原始 capacity 声明 IOBuf
+  // 容量会超过块实际可用空间(b->capacity - offset) → 协议写入越界。
+  // 修正: 取 min(请求容量, 块实际剩余空间)。IOBufQueue::pushAtMost
+  // 基于 tailroom 写入,不受影响;剩余数据由 preallocateSlow 链化。
+  uint32_t remaining = b->capacity - offset;
+  uint32_t actual = std::min(static_cast<uint32_t>(capacity), remaining);
+  b->data_len += actual;
+  b->ref_count.fetch_add(1, std::memory_order_acq_rel);
+
+  uint8_t* buf = reinterpret_cast<uint8_t*>(b->payloadBegin()) + offset;
+  auto iobuf = takeOwnership(buf, actual, 0, poolReleaseFn, b);
+  iobuf->block_ = b;
+  return iobuf;
 }
 
 unique_ptr<IOBuf> IOBuf::createChain(
@@ -568,13 +634,15 @@ IOBuf::IOBuf(IOBuf&& other) noexcept
       buf_(other.buf_),
       length_(other.length_),
       capacity_(other.capacity_),
-      flagsAndSharedInfo_(other.flagsAndSharedInfo_) {
+      flagsAndSharedInfo_(other.flagsAndSharedInfo_),
+      block_(other.block_) {
   // Reset other so it is a clean state to be destroyed.
   other.data_ = nullptr;
   other.buf_ = nullptr;
   other.length_ = 0;
   other.capacity_ = 0;
   other.flagsAndSharedInfo_ = 0;
+  other.block_ = nullptr;
 
   // If other was part of the chain, assume ownership of the rest of its chain.
   // (It's only valid to perform move assignment on the head of a chain.)
@@ -603,18 +671,22 @@ IOBuf::IOBuf(
     uint8_t* buf,
     std::size_t capacity,
     uint8_t* data,
-    std::size_t length) noexcept
+    std::size_t length,
+    IoBufBlock* block) noexcept
     : next_(this),
       prev_(this),
       data_(data),
       buf_(buf),
       length_(length),
       capacity_(capacity),
-      flagsAndSharedInfo_(flagsAndSharedInfo) {
+      flagsAndSharedInfo_(flagsAndSharedInfo),
+      block_(block) {
   assert(data >= buf);
   assert(intptr_t(data) + length <= intptr_t(buf) + capacity);
 
-  CHECK(!folly::asan_region_is_poisoned(buf, capacity));
+  if (!block) {
+    CHECK(!folly::asan_region_is_poisoned(buf, capacity));
+  }
 }
 
 IOBuf::~IOBuf() {
@@ -651,12 +723,14 @@ IOBuf& IOBuf::operator=(IOBuf&& other) noexcept {
   length_ = other.length_;
   capacity_ = other.capacity_;
   flagsAndSharedInfo_ = other.flagsAndSharedInfo_;
+  block_ = other.block_;
   // Reset other so it is a clean state to be destroyed.
   other.data_ = nullptr;
   other.buf_ = nullptr;
   other.length_ = 0;
   other.capacity_ = 0;
   other.flagsAndSharedInfo_ = 0;
+  other.block_ = nullptr;
 
   // If other was part of the chain, assume ownership of the rest of its chain.
   // (It's only valid to perform move assignment on the head of a chain.)
@@ -757,7 +831,8 @@ unique_ptr<IOBuf> IOBuf::cloneOne() const {
       buf_,
       capacity_,
       data_,
-      length_));
+      length_,
+      block_));
 }
 
 unique_ptr<IOBuf> IOBuf::cloneCoalesced() const {
@@ -790,7 +865,8 @@ IOBuf IOBuf::cloneOneAsValue() const {
       buf_,
       capacity_,
       data_,
-      length_);
+      length_,
+      block_);
 }
 
 IOBuf IOBuf::cloneCoalescedAsValue() const {
@@ -858,6 +934,7 @@ void IOBuf::unshareOneSlow() {
   decrementRefcount();
   // Make sure flags are all cleared.
   setFlagsAndSharedInfo(0, sharedInfo);
+  block_ = nullptr;
 
   // Update the buffer pointers to point to the new buffer
   data_ = buf + headlen;
@@ -989,6 +1066,7 @@ void IOBuf::coalesceAndReallocate(
 
   // Make sure flags are all cleared.
   setFlagsAndSharedInfo(0, newInfo);
+  block_ = nullptr;
 
   capacity_ = actualCapacity;
   buf_ = newBuf;
@@ -1149,6 +1227,7 @@ void IOBuf::reserveSlow(std::size_t minHeadroom, std::size_t minTailroom) {
     if (sharedInfo()) {
       freeExtBuffer();
     }
+    block_ = nullptr;
     newHeadroom = minHeadroom;
   }
 
@@ -1319,6 +1398,7 @@ fbstring IOBuf::moveToFbString() {
 
   // Reset to a state where we can be deleted cleanly
   flagsAndSharedInfo_ = 0;
+  block_ = nullptr;
   buf_ = nullptr;
   clear();
   return str;

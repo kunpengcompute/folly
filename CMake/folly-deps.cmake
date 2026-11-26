@@ -306,6 +306,30 @@ if (NOT DEFINED fmt_CONFIG)
 endif()
 target_link_libraries(folly_deps INTERFACE fmt::fmt)
 
+# ---- URMA (UB hardware offload, direct URMA C API) ----
+
+find_path(URMA_INCLUDE_DIR urma_api.h
+    PATHS "/usr/include"
+    PATH_SUFFIXES "ub/umdk/urma"
+)
+
+find_library(URMA_LIBRARY NAMES urma
+    PATHS "/usr/lib64" "/usr/lib"
+)
+
+if (URMA_INCLUDE_DIR AND URMA_LIBRARY)
+    message(STATUS "Found URMA headers: ${URMA_INCLUDE_DIR}")
+    message(STATUS "Found URMA library: ${URMA_LIBRARY}")
+    target_compile_definitions(folly_deps INTERFACE FOLLY_HAVE_URMA)
+    target_include_directories(folly_deps SYSTEM INTERFACE
+        $<BUILD_INTERFACE:${URMA_INCLUDE_DIR}>)
+    target_link_libraries(folly_deps INTERFACE ${URMA_LIBRARY})
+elseif (URMA_INCLUDE_DIR)
+    message(WARNING "URMA headers found but liburma.so not found; URMA support disabled.")
+else()
+    message(STATUS "URMA headers not found; URMA support disabled.")
+endif()
+
 list(REMOVE_DUPLICATES FOLLY_INCLUDE_DIRECTORIES)
 target_include_directories(folly_deps INTERFACE ${FOLLY_INCLUDE_DIRECTORIES})
 target_link_libraries(folly_deps INTERFACE

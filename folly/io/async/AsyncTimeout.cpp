@@ -26,6 +26,17 @@
 
 namespace folly {
 
+void AsyncTimeout::initEvent(InternalEnum internal) {
+  event_.eb_event_set(
+      NetworkSocket::invalid_handle_value,
+      EV_TIMEOUT,
+      internal == InternalEnum::INTERNAL && kInternalEventsCanStallLoop
+          ? &AsyncTimeout::libeventInternalCallback
+          : &AsyncTimeout::libeventCallback,
+      this);
+  event_.eb_ev_base(nullptr);
+}
+
 AsyncTimeout::AsyncTimeout(TimeoutManager* timeoutManager)
     : timeoutManager_(timeoutManager) {
   event_.eb_event_set(
@@ -54,24 +65,18 @@ AsyncTimeout::AsyncTimeout(EventBase* eventBase) : timeoutManager_(eventBase) {
 AsyncTimeout::AsyncTimeout(
     TimeoutManager* timeoutManager, InternalEnum internal)
     : timeoutManager_(timeoutManager) {
-  event_.eb_event_set(
-      NetworkSocket::invalid_handle_value,
-      EV_TIMEOUT,
-      &AsyncTimeout::libeventCallback,
-      this);
-  event_.eb_ev_base(nullptr);
-  timeoutManager_->attachTimeoutManager(this, internal);
+  initEvent(internal);
+  if (timeoutManager) {
+    timeoutManager_->attachTimeoutManager(this, internal);
+  }
 }
 
 AsyncTimeout::AsyncTimeout(EventBase* eventBase, InternalEnum internal)
     : timeoutManager_(eventBase) {
-  event_.eb_event_set(
-      NetworkSocket::invalid_handle_value,
-      EV_TIMEOUT,
-      &AsyncTimeout::libeventCallback,
-      this);
-  event_.eb_ev_base(nullptr);
-  timeoutManager_->attachTimeoutManager(this, internal);
+  initEvent(internal);
+  if (eventBase) {
+    timeoutManager_->attachTimeoutManager(this, internal);
+  }
 }
 
 AsyncTimeout::AsyncTimeout() : timeoutManager_(nullptr) {
@@ -127,6 +132,8 @@ void AsyncTimeout::attachTimeoutManager(
   assert(timeoutManager->isInTimeoutManagerThread());
   timeoutManager_ = timeoutManager;
 
+  // The ctor ran without a manager, so it could not know internal yet.
+  initEvent(internal);
   timeoutManager_->attachTimeoutManager(this, internal);
 }
 
@@ -172,6 +179,14 @@ void AsyncTimeout::libeventCallback(libevent_fd_t fd, short events, void* arg) {
   RequestContextScopeGuard rctx(timeout->context_);
 
   timeout->timeoutExpired();
+}
+
+void AsyncTimeout::libeventInternalCallback(
+    libevent_fd_t fd, short events, void* arg) {
+  // Read the manager up front: timeoutExpired() may destroy the timeout.
+  auto* timeoutManager = reinterpret_cast<AsyncTimeout*>(arg)->timeoutManager_;
+  libeventCallback(fd, events, arg);
+  timeoutManager->yieldAfterInternalEvent();
 }
 
 } // namespace folly
