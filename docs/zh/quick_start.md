@@ -344,7 +344,7 @@ int main() {
 
 #### 配置建议
 
-- `FOLLY_URMA_CONFIG` 指向本机的 JSON 文件。首次初始化时，文件中的字段覆盖同名 C++ 配置，省略的字段沿用应用传入值。客户端和服务端分别选择本机的 `dev_name` 和 `eid_index`。
+- `FOLLY_URMA_CONFIG` 指向本机的 JSON 文件。文件中的字段覆盖同名 C++ 配置，省略的字段沿用应用传入值。客户端和服务端分别选择本机的 `dev_name` 和 `eid_index`。
 - `rx_target`按EventBase设置预投接收缓冲数，`max_pending_bytes`按连接设置收发积压上限，`registered_pool`按进程设置注册内存容量。字段范围和默认值见《[API参考](./api_reference.md#urma配置项)》。
 
 两端分别执行 `urma_admin show --all` 查看本机设备，`eid0` 表示索引 0。本测试环境的 `udmac0d1e2` 列出索引 0–7。在 `urma.json` 中按以下写法选择索引 0。
@@ -401,7 +401,7 @@ bash scripts/run.sh --config run.json
 
    客户端发送`ping`并核对回显内容。两端分别输出`PASS client`、`PASS server`且退出码均为0，表示验证通过。
 
-5. 验证 JSON 配置时，在两端各自的 Folly 源码目录执行以下命令，再重复步骤 3 和 4。随附的 `urma.json` 省略设备名和 EID 索引，Echo 沿用命令行传入的设备名，并选取该设备报告的首个 EID。启动日志会显示实际的 `device` 和 `eid_index`。
+5. 验证 JSON 配置时，在两端各自的 Folly 源码目录执行以下命令。随附的 `urma.json` 选择 `udmac0d1e2` 和 EID 0。按各端实际设备修改复制出的文件后，重复步骤 3 和 4，并从启动日志核对 `device` 和 `eid_index`。如需沿用 Echo 命令行指定的设备及该设备的首个 EID，将文件内容改为 `{}`。
 
    ```bash
    cp folly/io/async/urma/urma.json ./urma.json

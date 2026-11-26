@@ -166,7 +166,7 @@ index 831acd883e54aad07cff19160e72688de8de1bf8..152e2e579aa76ff89e93260eaca38ff6
    bool useHeapFullStorage = false;
 diff --git a/folly/io/async/urma/README.md b/folly/io/async/urma/README.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..610621a9fea8a0e435ae710e27964dc5af431d92
+index 0000000000000000000000000000000000000000..9fff379d1b604baf6623291946b42b511a494518
 --- /dev/null
 +++ b/folly/io/async/urma/README.md
 @@ -0,0 +1,92 @@
@@ -178,7 +178,7 @@ index 0000000000000000000000000000000000000000..610621a9fea8a0e435ae710e27964dc5
 +
 +构建 Folly 时启用 `FOLLY_USE_URMA=ON`。应用通过 `UrmaConfig` 配置传输。也可以将 `FOLLY_URMA_CONFIG` 指向 [urma.json](urma.json)，文件中的字段会在 `UrmaInit::init()` 时覆盖对应的 C++ 配置。未知字段、重复字段或值不合法会导致初始化失败。
 +
-+| 字段 | 默认值 | 取值与用途 |
++| 字段 | 未指定时的默认值 | 取值与用途 |
 +|---|---:|---|
 +| `dev_name` | 空，沿用应用配置 | 本机 URMA 设备名。fbthrift 服务端须指定设备。 |
 +| `eid_index` | 未指定，取设备报告的首项 | 客户端和服务端可分别选择本机设备列出的 EID 索引。 |
@@ -190,9 +190,7 @@ index 0000000000000000000000000000000000000000..610621a9fea8a0e435ae710e27964dc5
 +| `registered_pool.pool_size` | 268435456 | 初始注册池容量，单位为字节，取页大小的正整数倍。 |
 +| `registered_pool.pool_max_size` | 536870912 | 注册池容量上限，按页对齐且不小于初始容量。0 表示使用初始容量作为上限。默认配置下，有效上限至少为 16 KiB。 |
 +
-+随附的 `urma.json` 省略 `dev_name` 和 `eid_index`，这两项沿用应用配置。
-+
-+下面是 AccLibBenchmark 的 `fbthrift/fbthrift_urma/scripts/urma.example.json` 完整配置。本测试环境的 `udmac0d1e2` 列出索引 0–7，示例选择 0。两端分别按本机设备填写这两项。
++下面是 Folly 随附的 `folly/io/async/urma/urma.json`。加载该文件会选择 `udmac0d1e2` 和 EID 0。两端分别运行 `urma_admin show --all` 查看本机设备及索引，再按实际情况填写。本测试环境列出 0–7，其他设备以各自报告的列表为准。省略某个字段时沿用应用传入的值，`{}` 保留应用的全部配置。
 +
 +```json
 +{
@@ -209,6 +207,8 @@ index 0000000000000000000000000000000000000000..610621a9fea8a0e435ae710e27964dc5
 +  }
 +}
 +```
++
++`UrmaInit::init()` 会核对设备名、该设备的 EID 列表与 SDK 创建的上下文。设备不存在、索引不属于该设备、SDK 上下文与所选绑定冲突时，初始化会抛出异常。进程已有上下文时，显式请求另一设备或索引也会报错，已有连接继续使用原绑定。
 +
 +使用默认配置（`rx_depth=0`、`rx_target=256`）时，库根据设备能力和发送队列深度确定接收队列容量，每个 EventBase 预投 256 块接收缓冲。收发共用的完成队列（JFC）由库自动创建，无需配置其深度。
 +
@@ -2505,10 +2505,10 @@ index 0000000000000000000000000000000000000000..00951f569b4d1495c878dd77797d1499
 +#endif
 diff --git a/folly/io/async/urma/UrmaInit.cpp b/folly/io/async/urma/UrmaInit.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..b218e06bec1a518f2d9d7aecf7c167ff13343b56
+index 0000000000000000000000000000000000000000..cb1c3ec7638ae3f9c763e4dc5e515b552319e77e
 --- /dev/null
 +++ b/folly/io/async/urma/UrmaInit.cpp
-@@ -0,0 +1,382 @@
+@@ -0,0 +1,413 @@
 +/* Copyright (c) Huawei Technologies Co., Ltd. 2026. Licensed under Apache-2.0.
 + */
 +#include <folly/io/async/urma/UrmaCleanup.h>
@@ -2590,10 +2590,19 @@ index 0000000000000000000000000000000000000000..b218e06bec1a518f2d9d7aecf7c167ff
 +  std::lock_guard<std::mutex> lock(mutex);
 +  if (shutdownRequested)
 +    throw std::runtime_error("URMA shutdown is still pending");
-+  if (context) return;
 +  const char* path = std::getenv("FOLLY_URMA_CONFIG");
 +  const UrmaConfig config =
 +      path ? loadUrmaConfigFile(path, requested) : requested;
++  if (context) {
++    if (!config.dev_name.empty() && config.dev_name != settings.dev_name)
++      throw std::runtime_error("requested URMA device " + config.dev_name +
++          " conflicts with active device " + settings.dev_name);
++    if (config.eid_index && *config.eid_index != context->eid_index)
++      throw std::runtime_error("URMA device " + settings.dev_name +
++          ": requested eid_index=" + std::to_string(*config.eid_index) +
++          " conflicts with active eid_index=" + std::to_string(context->eid_index));
++    return;
++  }
 +  validateUrmaConfig(config);
 +  // Copy the allocating string before acquiring SDK resources. Publishing the
 +  // effective configuration below is a non-throwing move.
@@ -2606,11 +2615,13 @@ index 0000000000000000000000000000000000000000..b218e06bec1a518f2d9d7aecf7c167ff
 +  if (status != URMA_SUCCESS && status != URMA_EEXIST)
 +    throw std::runtime_error("urma_init failed");
 +  const bool initializedHere = status == URMA_SUCCESS;
++  urma_context_t* created = nullptr;
 +  auto rollback = makeGuard([&] {
-+    if (initializedHere && urma_uninit() != URMA_SUCCESS) {
-+      // Device discovery/context creation can fail before context publication.
-+      // Retain SDK ownership if even this early rollback cannot uninitialize.
-+      libraryOwned = true;
++    const bool pendingContext = created && urma_delete_context(created) != URMA_SUCCESS;
++    if (pendingContext || (initializedHere && urma_uninit() != URMA_SUCCESS)) {
++      // Keep the SDK alive until a rejected context can be deleted.
++      context = pendingContext ? created : nullptr;
++      libraryOwned = initializedHere;
 +      shutdownRequested = true;
 +      urma_detail::cleanupOrDefer(std::move(preparedCleanup));
 +    }
@@ -2622,21 +2633,25 @@ index 0000000000000000000000000000000000000000..b218e06bec1a518f2d9d7aecf7c167ff
 +  });
 +  urma_device_t* device = nullptr;
 +  for (int i = 0; devices && i < count; ++i) {
-+    if (config.dev_name.empty() || config.dev_name == devices[i]->name) {
++    if (devices[i] && (config.dev_name.empty() || config.dev_name == devices[i]->name)) {
 +      device = devices[i];
 +      break;
 +    }
 +  }
++  if (!device) {
++    if (config.dev_name.empty()) throw std::runtime_error("no URMA devices found");
++    throw std::runtime_error("URMA device " + config.dev_name + " not found");
++  }
++  effective.dev_name = device->name;
 +  urma_device_attr_t attr{};
 +  uint32_t n = 0;
 +  urma_eid_info_t* eids = nullptr;
 +  auto releaseEids = makeGuard([&] {
 +    if (eids) urma_free_eid_list(eids);
 +  });
-+  urma_context_t* created = nullptr;
 +  uint32_t readCapacity = 0;
 +  urma_eid_t eid{};
-+  if (device && urma_query_device(device, &attr) == URMA_SUCCESS &&
++  if (urma_query_device(device, &attr) == URMA_SUCCESS &&
 +      (attr.dev_cap.trans_mode & URMA_TM_RM)) {
 +    auto deviceLimit = [](const char* field, uint32_t requested, uint32_t maximum) {
 +      if (!maximum || requested > maximum)
@@ -2689,7 +2704,23 @@ index 0000000000000000000000000000000000000000..b218e06bec1a518f2d9d7aecf7c167ff
 +    }
 +  }
 +  if (!created) {
-+    throw std::runtime_error("no usable URMA RM context/device");
++    throw std::runtime_error("no usable URMA RM context for device " + effective.dev_name);
++  }
++  if (!created->dev || effective.dev_name != created->dev->name) {
++    throw std::runtime_error("URMA requested device " + effective.dev_name +
++        " but SDK context reports " + (created->dev ? created->dev->name : "<none>"));
++  }
++  if (created->eid_index != *effective.eid_index) {
++    throw std::runtime_error("URMA device " + effective.dev_name + ": selected eid_index=" +
++        std::to_string(*effective.eid_index) + " but SDK context reports eid_index=" +
++        std::to_string(created->eid_index));
++  }
++  // Some SDK-created virtual devices leave the context EID address unset.
++  const urma_eid_t unsetEid{};
++  if (std::memcmp(created->eid.raw, unsetEid.raw, sizeof(eid.raw)) != 0 &&
++      std::memcmp(created->eid.raw, eid.raw, sizeof(eid.raw)) != 0) {
++    throw std::runtime_error("URMA device " + effective.dev_name + ": eid_index=" +
++        std::to_string(*effective.eid_index) + " has a different EID address in the SDK context");
 +  }
 +  settings = std::move(effective);
 +  maxReadSize = std::min(attr.dev_cap.max_read_size, readCapacity);
@@ -2893,10 +2924,10 @@ index 0000000000000000000000000000000000000000..b218e06bec1a518f2d9d7aecf7c167ff
 +#endif
 diff --git a/folly/io/async/urma/UrmaInit.h b/folly/io/async/urma/UrmaInit.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..48c84cb8c41289f4ed1852e9b5355a7a5edb3626
+index 0000000000000000000000000000000000000000..51f9221d73a9cccfa059063263a12b2605d2d1ad
 --- /dev/null
 +++ b/folly/io/async/urma/UrmaInit.h
-@@ -0,0 +1,76 @@
+@@ -0,0 +1,77 @@
 +/* Copyright (c) Huawei Technologies Co., Ltd. 2026. Licensed under Apache-2.0.
 + */
 +#pragma once
@@ -2922,6 +2953,7 @@ index 0000000000000000000000000000000000000000..48c84cb8c41289f4ed1852e9b5355a7a
 +      UrmaPoolSignal* waiter = nullptr);
 +  // Acquires the process SDK context and registered pool. Queue resources are
 +  // prepared by each EventBase's shared owner when first needed.
++  // A later init may reuse the active device and EID, but cannot switch either.
 +  static void init(const UrmaConfig& config);
 +  // Requests shutdown and rejects new transports. Existing owners must still
 +  // be released by the caller; cleanup then retries automatically, including
@@ -6377,10 +6409,10 @@ index 0000000000000000000000000000000000000000..50c731d948e1f019c4291a5841db51a9
 +}
 diff --git a/folly/io/async/urma/test/InitTest.cpp b/folly/io/async/urma/test/InitTest.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..78df77d10c5f5a8393f026d97a9da0dec1f22e66
+index 0000000000000000000000000000000000000000..dfcfc4a5750a2bfd224f67b8894c42ff062fe4a7
 --- /dev/null
 +++ b/folly/io/async/urma/test/InitTest.cpp
-@@ -0,0 +1,470 @@
+@@ -0,0 +1,561 @@
 +/* Copyright (c) Huawei Technologies Co., Ltd. 2026. Licensed under Apache-2.0.
 + */
 +#include <cstdlib>
@@ -6391,6 +6423,7 @@ index 0000000000000000000000000000000000000000..78df77d10c5f5a8393f026d97a9da0de
 +#include <new>
 +#include <stdexcept>
 +#include <thread>
++#include <utility>
 +#include <vector>
 +#include <folly/io/async/urma/UrmaCleanup.h>
 +#include <folly/io/async/urma/UrmaInit.h>
@@ -6398,19 +6431,22 @@ index 0000000000000000000000000000000000000000..78df77d10c5f5a8393f026d97a9da0de
 +// Standalone binary: allocation and SDK failures must not affect other tests.
 +namespace {
 +thread_local bool failNextAllocation = false;
-+enum class Failure { None, Devices, Query, Eids, Context };
++enum class Failure { None, Devices, Query, Eids, Context, WrongDevice, WrongIndex, WrongAddress };
 +Failure failure = Failure::None;
 +bool borrowedLibrary = false;
 +int initializes = 0, finalizes = 0, devices = 0, eids = 0, contexts = 0;
 +uint32_t deviceSendSges = 4;
 +constexpr uint32_t kDeviceMaxReadSize = 1024 * 1024;
 +uint32_t deviceRxDepth = 4096, deviceTxDepth = 4096, deviceCqDepth = 8193;
-+urma_device_t device{};
-+urma_device_t* deviceList[]{&device};
++urma_device_t device{}, otherDevice{};
++urma_device_t* deviceList[]{&device, &otherDevice};
++int deviceCount = 1;
 +urma_eid_info_t deviceEids[2]{};
++urma_eid_info_t otherEid{};
 +uint32_t eidCount = 1;
 +std::optional<uint32_t> createdIndex;
 +urma_context_t context{};
++bool failNextContextDelete = false;
 +#ifndef URMA_TEST_EXTERNAL_POOL
 +unsigned poolRegistrations = 0, poolUnregistrations = 0;
 +bool failPoolRegistration = false;
@@ -6429,8 +6465,10 @@ index 0000000000000000000000000000000000000000..78df77d10c5f5a8393f026d97a9da0de
 +  failure = stage;
 +  borrowedLibrary = borrowed;
 +  initializes = finalizes = 0;
++  deviceCount = 1;
 +  eidCount = 1;
 +  for (auto& entry : deviceEids) entry = {};
++  otherEid = {};
 +  createdIndex.reset();
 +}
 +} // namespace
@@ -6472,7 +6510,7 @@ index 0000000000000000000000000000000000000000..78df77d10c5f5a8393f026d97a9da0de
 +  return URMA_SUCCESS;
 +}
 +urma_device_t** urma_get_device_list(int* count) {
-+  *count = failure == Failure::Devices ? 0 : 1;
++  *count = failure == Failure::Devices ? 0 : deviceCount;
 +  if (!*count) {
 +    return nullptr;
 +  }
@@ -6496,27 +6534,41 @@ index 0000000000000000000000000000000000000000..78df77d10c5f5a8393f026d97a9da0de
 +  attr->dev_cap.max_read_size = kDeviceMaxReadSize;
 +  return URMA_SUCCESS;
 +}
-+urma_eid_info_t* urma_get_eid_list(urma_device_t*, uint32_t* count) {
-+  *count = failure == Failure::Eids ? 0 : eidCount;
++urma_eid_info_t* urma_get_eid_list(urma_device_t* selected, uint32_t* count) {
++  *count = selected == &otherDevice ? 1 : eidCount;
++  if (failure == Failure::Eids) *count = 0;
 +  if (!*count) {
 +    return nullptr;
 +  }
 +  ++eids;
-+  return deviceEids;
++  return selected == &otherDevice ? &otherEid : deviceEids;
 +}
 +void urma_free_eid_list(urma_eid_info_t*) {
 +  --eids;
 +}
-+urma_context_t* urma_create_context(urma_device_t*, uint32_t index) {
++urma_context_t* urma_create_context(urma_device_t* selected, uint32_t index) {
 +  createdIndex = index;
 +  if (failure == Failure::Context) {
 +    return nullptr;
 +  }
-+  context.eid_index = index;
++  const auto* entries = selected == &otherDevice ? &otherEid : deviceEids;
++  const auto* end = entries + (selected == &otherDevice ? 1 : eidCount);
++  const auto* entry = std::find_if(entries, end, [index](const auto& e) {
++    return e.eid_index == index;
++  });
++  if (entry == end) return nullptr;
++  context.dev = failure == Failure::WrongDevice ? &otherDevice : selected;
++  context.eid_index = failure == Failure::WrongIndex ? index + 1 : index;
++  context.eid = entry->eid;
++  if (failure == Failure::WrongAddress) context.eid.raw[0] ^= 0xff;
 +  ++contexts;
 +  return &context;
 +}
 +urma_status_t urma_delete_context(urma_context_t*) {
++  if (failNextContextDelete) {
++    failNextContextDelete = false;
++    return URMA_EAGAIN;
++  }
 +  --contexts;
 +  return URMA_SUCCESS;
 +}
@@ -6542,6 +6594,75 @@ index 0000000000000000000000000000000000000000..78df77d10c5f5a8393f026d97a9da0de
 +}
 +
 +#ifndef URMA_TEST_EXTERNAL_POOL
++void expectInitError(const folly::UrmaConfig& config, const std::string& expected) {
++  try {
++    folly::UrmaInit::init(config);
++  } catch (const std::runtime_error& error) {
++    if (std::string(error.what()).find(expected) != std::string::npos) return;
++    throw;
++  }
++  throw std::runtime_error("expected initialization failure: " + expected);
++}
++
++void checkDeviceBinding(const folly::UrmaConfig& base) {
++  using folly::UrmaInit;
++  auto cfg = base;
++  reset();
++  std::strcpy(otherDevice.name, "urma-second-device");
++  deviceCount = 2;
++  otherEid.eid_index = 42;
++  otherEid.eid.raw[0] = 0x2a;
++  cfg.dev_name = "missing-device";
++  expectInitError(cfg, "URMA device missing-device not found");
++  require(!createdIndex && !devices && !eids && !contexts && finalizes == 1,
++          "unknown device allocated resources or selected a fallback");
++
++  cfg.eid_index = 42;
++  cfg.dev_name = device.name;
++  expectInitError(cfg, std::string(device.name) + ": eid_index=42 unavailable");
++  cfg.dev_name = otherDevice.name;
++  UrmaInit::init(cfg);
++  const int starts = initializes;
++  UrmaInit::init(cfg);
++  UrmaInit::init({});
++  cfg.dev_name = device.name;
++  expectInitError(cfg, std::string("conflicts with active device ") + otherDevice.name);
++  cfg.dev_name = otherDevice.name;
++  cfg.eid_index = 0;
++  expectInitError(cfg, "requested eid_index=0 conflicts with active eid_index=42");
++  require(initializes == starts && contexts == 1 && UrmaInit::getConfig().dev_name == otherDevice.name &&
++              UrmaInit::getConfig().eid_index == 42u && UrmaInit::getLocalEid().raw[0] == 0x2a,
++          "a repeated init replaced the active binding or reacquired the SDK");
++  UrmaInit::fini();
++
++  reset();
++  cfg = base;
++  cfg.dev_name.clear();
++  UrmaInit::init(cfg);
++  require(UrmaInit::getConfig().dev_name == device.name, "automatic device selection was not recorded");
++  UrmaInit::init(base);
++  UrmaInit::fini();
++
++  for (bool borrowed : {false, true}) {
++    for (const auto& [stage, error] : {
++             std::pair{Failure::WrongDevice, "SDK context reports urma-second-device"},
++             std::pair{Failure::WrongIndex, "SDK context reports eid_index=1"},
++             std::pair{Failure::WrongAddress, "different EID address"}}) {
++      reset(stage, borrowed);
++      expectInitError(base, error);
++      require(!UrmaInit::isInitialized() && !contexts && !devices && !eids &&
++                  finalizes == (borrowed ? 0 : 1), "rejected SDK binding leaked resources");
++    }
++  }
++  reset(Failure::WrongDevice);
++  failNextContextDelete = true;
++  expectInitError(base, "SDK context reports urma-second-device");
++  require(folly::urma_detail::waitForCleanups(std::chrono::seconds(2)) &&
++              !UrmaInit::isInitialized() && !contexts && finalizes == 1,
++          "rejected SDK binding was not cleaned up after a delete failure");
++  std::cout << "PASS device discovery, per-device EIDs, active binding conflicts and SDK rollback\n";
++}
++
 +int main() {
 +  try {
 +    folly::UrmaConfig config;
@@ -6608,6 +6729,8 @@ index 0000000000000000000000000000000000000000..78df77d10c5f5a8393f026d97a9da0de
 +    checkEid(0, 1);
 +    config.eid_index.reset();
 +    std::cout << "PASS sparse EID selection, missing index rollback and explicit zero\n";
++
++    checkDeviceBinding(config);
 +
 +    for (bool borrowed : {false, true}) {
 +      for (Failure stage :
@@ -6853,10 +6976,10 @@ index 0000000000000000000000000000000000000000..78df77d10c5f5a8393f026d97a9da0de
 +#endif
 diff --git a/folly/io/async/urma/test/MemoryContractTest.cpp b/folly/io/async/urma/test/MemoryContractTest.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..7337decda978e857230b0477b2fad1a66f8fe987
+index 0000000000000000000000000000000000000000..155d4fd845458096fe7ea953ee320f1e1a372c22
 --- /dev/null
 +++ b/folly/io/async/urma/test/MemoryContractTest.cpp
-@@ -0,0 +1,814 @@
+@@ -0,0 +1,813 @@
 +/* Copyright (c) Huawei Technologies Co., Ltd. 2026. Licensed under Apache-2.0.
 + */
 +#include <folly/io/async/urma/UrmaConfig.h>
@@ -7269,30 +7392,29 @@ index 0000000000000000000000000000000000000000..7337decda978e857230b0477b2fad1a6
 +    UrmaConfig base;
 +    base.dev_name = "device-supplied-by-caller";
 +    base.eid_index = 3;
-+    const auto defaults = loadUrmaConfigFile(argv[1], base);
-+    check(defaults.dev_name == base.dev_name &&
-+              defaults.eid_index == base.eid_index,
-+          "urma.json changed the caller's device or EID index");
-+    check(defaults.registered_pool.enabled &&
-+              defaults.registered_pool.elastic &&
-+              defaults.registered_pool.zero_copy &&
-+              defaults.registered_pool == base.registered_pool &&
-+              defaults.registered_pool.pool_max_size >
-+                  defaults.registered_pool.pool_size,
++    const auto sample = loadUrmaConfigFile(argv[1], base);
++    check(sample.dev_name == "udmac0d1e2" && sample.eid_index == 0u,
++          "urma.json did not select its example device and EID index");
++    check(sample.registered_pool.enabled &&
++              sample.registered_pool.elastic &&
++              sample.registered_pool.zero_copy &&
++              sample.registered_pool == base.registered_pool &&
++              sample.registered_pool.pool_max_size > sample.registered_pool.pool_size,
 +          "urma.json changed the registered pool defaults");
 +    char path[] = "/tmp/urma-config-test-XXXXXX";
 +    int fd = ::mkstemp(path);
 +    check(fd >= 0, "temporary config creation failed");
 +    ::close(fd);
 +    auto removeFile = makeGuard([&] { ::unlink(path); });
-+    std::ofstream(path) << R"({"dev_name":"device-from-json","eid_index":0})";
++    std::ofstream(path) << R"({"dev_name":"device-from-json"})";
 +    const auto selected = loadUrmaConfigFile(path, base);
-+    check(selected.dev_name == "device-from-json" && selected.eid_index == 0u,
-+          "explicit JSON device and EID index did not override the caller's selection");
++    check(selected.dev_name == "device-from-json" && selected.eid_index == base.eid_index,
++          "device-only JSON changed the caller's EID index");
 +    for (uint32_t index : {uint32_t(0), uint32_t(7), UINT32_MAX}) {
 +      std::ofstream(path) << "{\"eid_index\":" << index << "}";
-+      check(loadUrmaConfigFile(path, base).eid_index == index,
-+            "JSON EID index did not override the caller's selection");
++      const auto indexed = loadUrmaConfigFile(path, base);
++      check(indexed.eid_index == index && indexed.dev_name == base.dev_name,
++            "index-only JSON did not preserve the caller's device");
 +    }
 +    for (const char* key : {"io_owners", "max_water", "fc_rx_depth",
 +                            "fc_max_water", "rx_spare_blocks",
@@ -11458,11 +11580,13 @@ index 0000000000000000000000000000000000000000..d877f077c3c60dc60093faea7f855732
 +}
 diff --git a/folly/io/async/urma/urma.json b/folly/io/async/urma/urma.json
 new file mode 100644
-index 0000000000000000000000000000000000000000..48bbee859379498f6c43e9db139a602aeccc8584
+index 0000000000000000000000000000000000000000..ae60af21449341d2b9b904489cca37d0fd01a819
 --- /dev/null
 +++ b/folly/io/async/urma/urma.json
-@@ -0,0 +1,11 @@
+@@ -0,0 +1,13 @@
 +{
++  "dev_name": "udmac0d1e2",
++  "eid_index": 0,
 +  "rx_depth": 0,
 +  "rx_target": 256,
 +  "tx_depth": 1024,
