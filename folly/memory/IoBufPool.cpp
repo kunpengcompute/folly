@@ -1,7 +1,8 @@
 #include <folly/memory/IoBufPool.h>
 
-#include <cassert>
 #include <cstdlib>
+
+#include <folly/lang/SafeAssert.h>
 
 namespace folly {
 
@@ -46,7 +47,6 @@ static inline void blockFree(void* ptr) {
 // 供 IOBuf::prepend(64) 写入 UrmaMsgHeader（DPDK rte_mbuf 风格）。
 // 外部可通过 g_urma_headroom 设置（0=禁用，64=启用）。
 // 启用时：capacity 减 64，data_len 初始 = 64，IOBuf 的 data_ 从 payloadBegin()+64 开始。
-extern std::atomic<size_t> g_urma_headroom;
 
 static IoBufBlock* allocateFromSystem(size_t size = gIoBufBlockSize) {
   void* mem = blockAlloc(size);
@@ -66,7 +66,8 @@ IoBufBlock* ioBufBlockAllocate() {
   TLSBlockCache& c = g_tls_cache;
   if (c.count > 0) {
     IoBufBlock* b = c.blocks[--c.count];
-    assert(b->magic == IoBufBlock::kBlockMagic);
+    FOLLY_SAFE_CHECK(
+        b->magic == IoBufBlock::kBlockMagic, "corrupt IOBuf block");
     b->ref_count.store(1, std::memory_order_relaxed);
     size_t headroom = g_urma_headroom.load(std::memory_order_acquire);
     b->data_len = static_cast<uint32_t>(headroom);
@@ -77,7 +78,8 @@ IoBufBlock* ioBufBlockAllocate() {
 
 void ioBufBlockRelease(IoBufBlock* b) {
   if (!b) return;
-  assert(b->magic == IoBufBlock::kBlockMagic);
+  FOLLY_SAFE_CHECK(
+      b->magic == IoBufBlock::kBlockMagic, "corrupt IOBuf block");
   TLSBlockCache& c = g_tls_cache;
   size_t headroom = g_urma_headroom.load(std::memory_order_acquire);
   size_t blockDataCap = gIoBufBlockSize - sizeof(IoBufBlock) - headroom;

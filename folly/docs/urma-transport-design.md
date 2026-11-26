@@ -6,7 +6,7 @@
 
 ## 1. 总体结构
 
-```
+```text
 上层(fbthrift ThriftServer / 客户端)
         │  AsyncTransport 接口
         ▼
@@ -31,7 +31,7 @@ UrmaAsyncSocket ──── UrmaHandshake        (TCP fd 上完成 v2 握手,�
 
 ## 2. 线程模型：四条不变量
 
-```
+```text
 I1 属主 EVB 独占     UrmaAsyncSocket 的全部可变状态只在其 evb_ 线程访问
 I2 四件套同线程      per-EVB 的 JFS/JFR/JFC/JFCE 及水位、计数、定时器均在该 EVB 线程,
                      因此 sq_inflight / recv_posted / credit_* 等使用普通 uint32_t,不加锁
@@ -137,7 +137,7 @@ DMA 数据被覆盖、RX 饿死、计数下溢、UAF、回调悬挂。
 
 ### 5.3 记账
 
-```
+```text
 收割 CQE:      transit++ → recv_posted--
 movable 交付:  held++ → transit--              (先加后减)
 deleter 回收:  slot 入栈 → held--
@@ -181,7 +181,7 @@ deleter 回收:  slot 入栈 → held--
   - `BLOCKED`：发送方 → 接收方，撞底通知（纯通知，`delta` 忽略）。
 - FC payload 固定 16B：
 
-  ```
+  ```text
   ┌───────────────┬──────────┬───────────┬─────────┬──────────┐
   │ dst_socket_id │ msg_type │   delta   │ fc_seq  │ reserved │
   │    8 bytes    │  1 byte  │  4 bytes  │ 2 bytes │  1 byte  │
@@ -191,7 +191,7 @@ deleter 回收:  slot 入栈 → held--
   接收方从 payload 前 8B 取 SocketId，查 FC 路由表定位连接。
 - 记账（per-JFR，同线程）：
 
-  ```
+  ```text
   credit_idle + credit_allocated == recv_posted
   授信 g : idle -= g, allocated += g
   消费 1 : allocated -= 1, recv_posted -= 1
