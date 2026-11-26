@@ -8,8 +8,8 @@ URMA 通过 TCP 建链，小包使用 SEND/RECV，大包使用 READ。接收端�
 
 | 字段 | 默认值 | 取值与用途 |
 |---|---:|---|
-| `dev_name` | 由应用指定 | URMA 设备名。fbthrift 服务端须指定设备。 |
-| `eid_index` | 设备 EID 列表首项 | 本地设备报告的 EID 索引，取值 0–4294967295。显式指定的索引必须存在。客户端和服务端可分别配置。 |
+| `dev_name` | 空，沿用应用配置 | 本机 URMA 设备名。fbthrift 服务端须指定设备。 |
+| `eid_index` | 未指定，取设备报告的首项 | 客户端和服务端可分别选择本机设备列出的 EID 索引。 |
 | `rx_depth` | 0 | 每个 EventBase 的接收队列（JFR）最多可容纳的接收请求数。0 表示自动选择。手动设置时可填 1–65536，超过设备可用深度会导致初始化失败。 |
 | `rx_target` | 256 | 每个 EventBase 预投的接收缓冲块数，取值为 1 至实际接收队列深度。每块默认 4 KiB。 |
 | `tx_depth` | 1024 | 每个 EventBase 的发送队列深度，取值为 1–4096，且不能超过设备支持的深度。 |
@@ -17,6 +17,26 @@ URMA 通过 TCP 建链，小包使用 SEND/RECV，大包使用 READ。接收端�
 | `max_pending_bytes` | 134217728 | 每连接的积压上限，按默认缓冲大小可设为 4096–4294967295 字节。发送和接收分别计限，须容纳单次完整写入。 |
 | `registered_pool.pool_size` | 268435456 | 初始注册池容量，单位为字节，取页大小的正整数倍。 |
 | `registered_pool.pool_max_size` | 536870912 | 注册池容量上限，按页对齐且不小于初始容量。0 表示使用初始容量作为上限。默认配置下，有效上限至少为 16 KiB。 |
+
+随附的 `urma.json` 省略 `dev_name` 和 `eid_index`，这两项沿用应用配置。
+
+下面是 AccLibBenchmark 的 `fbthrift/fbthrift_urma/scripts/urma.example.json` 完整配置。本测试环境的 `udmac0d1e2` 列出索引 0–7，示例选择 0。两端分别按本机设备填写这两项。
+
+```json
+{
+  "dev_name": "udmac0d1e2",
+  "eid_index": 0,
+  "rx_depth": 0,
+  "rx_target": 256,
+  "tx_depth": 1024,
+  "handshake_timeout_ms": 5000,
+  "max_pending_bytes": 134217728,
+  "registered_pool": {
+    "pool_size": 268435456,
+    "pool_max_size": 536870912
+  }
+}
+```
 
 使用默认配置（`rx_depth=0`、`rx_target=256`）时，库根据设备能力和发送队列深度确定接收队列容量，每个 EventBase 预投 256 块接收缓冲。收发共用的完成队列（JFC）由库自动创建，无需配置其深度。
 
