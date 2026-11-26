@@ -363,7 +363,13 @@ cp scripts/run.example.json run.json
 cp scripts/urma.example.json urma.json
 ```
 
-服务端也执行第二条命令。在 `run.json` 中将 `client.urma_config` 和 `server.urma_config` 分别指向各端 `urma.json` 的绝对路径。运行步骤见 [AccLibBenchmark 压测指南](https://gitcode.com/boostkit/AccLibBenchmark/blob/master/fbthrift/fbthrift_urma/scripts/README.md)。
+服务端也执行第二条命令。在 `run.json` 中填写两端的主机、安装路径和网络配置，将 `client.urma_config` 和 `server.urma_config` 分别设为各端 `urma.json` 的绝对路径。两端安装好压测程序后，在客户端依次执行预检、短测和正式压测。
+
+```bash
+bash scripts/run.sh --config run.json --check
+bash scripts/run.sh --config run.json --smoke
+bash scripts/run.sh --config run.json
+```
 
 ### URMA正确性验证
 

@@ -370,7 +370,25 @@ UrmaConfig loadUrmaConfigFile(const std::string& path, const UrmaConfig& base = 
 
 `buffer_size`、`enable_read`、`read_threshold`、`read_window`、`offer_window`和`registered_pool.zero_copy`通过C++配置设置。`read_threshold`初始为4352字节。
 
-Folly 随附的 [urma.json](https://gitcode.com/boostkit/folly/blob/dev_urma_20221104/folly/io/async/urma/urma.json) 省略 `dev_name` 和 `eid_index`，保留应用传入的设备和索引。压测用的完整配置见 AccLibBenchmark 的 [scripts/urma.example.json](https://gitcode.com/boostkit/AccLibBenchmark/blob/master/fbthrift/fbthrift_urma/scripts/urma.example.json)。
+Folly 随附的 `folly/io/async/urma/urma.json` 省略 `dev_name` 和 `eid_index`，保留应用传入的设备和索引。
+
+下面是 AccLibBenchmark 的 `fbthrift/fbthrift_urma/scripts/urma.example.json` 完整配置。本测试环境的 `udmac0d1e2` 列出索引 0–7，示例选择 0。复制到客户端和服务端后，分别按本机设备填写这两项。
+
+```json
+{
+  "dev_name": "udmac0d1e2",
+  "eid_index": 0,
+  "rx_depth": 0,
+  "rx_target": 256,
+  "tx_depth": 1024,
+  "handshake_timeout_ms": 5000,
+  "max_pending_bytes": 134217728,
+  "registered_pool": {
+    "pool_size": 268435456,
+    "pool_max_size": 536870912
+  }
+}
+```
 
 ## 修订记录
 
