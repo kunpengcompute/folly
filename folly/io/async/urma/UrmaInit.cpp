@@ -79,19 +79,19 @@ void UrmaInit::init(const UrmaConfig& requested) {
   std::lock_guard<std::mutex> lock(mutex);
   if (shutdownRequested)
     throw std::runtime_error("URMA shutdown is still pending");
-  const char* path = std::getenv("FOLLY_URMA_CONFIG");
-  const UrmaConfig config =
-      path ? loadUrmaConfigFile(path, requested) : requested;
   if (context) {
-    if (!config.dev_name.empty() && config.dev_name != settings.dev_name)
-      throw std::runtime_error("requested URMA device " + config.dev_name +
+    if (!requested.dev_name.empty() && requested.dev_name != settings.dev_name)
+      throw std::runtime_error("requested URMA device " + requested.dev_name +
           " conflicts with active device " + settings.dev_name);
-    if (config.eid_index && *config.eid_index != context->eid_index)
+    if (requested.eid_index && *requested.eid_index != context->eid_index)
       throw std::runtime_error("URMA device " + settings.dev_name +
-          ": requested eid_index=" + std::to_string(*config.eid_index) +
+          ": requested eid_index=" + std::to_string(*requested.eid_index) +
           " conflicts with active eid_index=" + std::to_string(context->eid_index));
     return;
   }
+  const char* path = std::getenv("FOLLY_URMA_CONFIG");
+  const UrmaConfig config =
+      path ? loadUrmaConfigFile(path, requested) : requested;
   validateUrmaConfig(config);
   // Copy the allocating string before acquiring SDK resources. Publishing the
   // effective configuration below is a non-throwing move.

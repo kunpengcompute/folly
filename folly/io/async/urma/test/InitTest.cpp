@@ -10,6 +10,9 @@
 #include <thread>
 #include <utility>
 #include <vector>
+#include <folly/FileUtil.h>
+#include <folly/experimental/EnvUtil.h>
+#include <folly/experimental/TestUtil.h>
 #include <folly/io/async/urma/UrmaCleanup.h>
 #include <folly/io/async/urma/UrmaInit.h>
 
@@ -248,6 +251,43 @@ void checkDeviceBinding(const folly::UrmaConfig& base) {
   std::cout << "PASS device discovery, per-device EIDs, active binding conflicts and SDK rollback\n";
 }
 
+void checkConfigFileReuse(const folly::UrmaConfig& base) {
+  using folly::UrmaInit;
+  reset();
+  eidCount = 2;
+  deviceEids[0].eid_index = 17;
+  deviceEids[1].eid_index = 19;
+  folly::test::TemporaryDirectory dir("urma-init");
+  const auto path = dir.path() / "urma.json";
+  folly::test::EnvVarSaver restoreEnv;
+  require(::setenv("FOLLY_URMA_CONFIG", path.c_str(), 1) == 0,
+          "could not set config path");
+  require(folly::writeFile(std::string(R"({"eid_index":17})"), path.c_str()),
+          "could not write config");
+
+  auto caller = base;
+  caller.eid_index = 3;
+  UrmaInit::init(caller);
+  require(UrmaInit::getConfig().eid_index == 17u,
+          "first init did not read the file");
+  expectInitError(caller, "requested eid_index=3 conflicts with active eid_index=17");
+
+  require(folly::fs::remove(path), "could not remove config");
+  UrmaInit::init({});
+  caller.eid_index = 17;
+  UrmaInit::init(caller);
+  require(initializes == 1 && contexts == 1, "reuse reacquired the SDK");
+  UrmaInit::fini();
+
+  require(folly::writeFile(std::string(R"({"eid_index":19})"), path.c_str()),
+          "could not replace config");
+  UrmaInit::init(base);
+  require(initializes == 2 && UrmaInit::getConfig().eid_index == 19u,
+          "a new context did not read the replacement config");
+  UrmaInit::fini();
+  std::cout << "PASS config file is read once per context\n";
+}
+
 int main() {
   try {
     folly::UrmaConfig config;
@@ -316,6 +356,7 @@ int main() {
     std::cout << "PASS sparse EID selection, missing index rollback and explicit zero\n";
 
     checkDeviceBinding(config);
+    checkConfigFileReuse(config);
 
     for (bool borrowed : {false, true}) {
       for (Failure stage :

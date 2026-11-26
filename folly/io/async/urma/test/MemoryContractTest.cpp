@@ -410,9 +410,9 @@ int main(int argc, char** argv) {
     UrmaConfig base;
     base.dev_name = "device-supplied-by-caller";
     base.eid_index = 3;
-    const auto sample = loadUrmaConfigFile(argv[1], base);
-    check(sample.dev_name == "udmac0d1e2" && sample.eid_index == 0u,
-          "urma.json did not select its example device and EID index");
+    const auto sample = loadUrmaConfigFile(argv[1]);
+    check(!sample.dev_name.empty() && sample.eid_index.has_value(),
+          "urma.json must specify a device name and an EID index");
     check(sample.registered_pool.enabled &&
               sample.registered_pool.elastic &&
               sample.registered_pool.zero_copy &&
@@ -424,6 +424,10 @@ int main(int argc, char** argv) {
     check(fd >= 0, "temporary config creation failed");
     ::close(fd);
     auto removeFile = makeGuard([&] { ::unlink(path); });
+    std::ofstream(path) << R"({"dev_name":"device-from-json","eid_index":0})";
+    const auto overridden = loadUrmaConfigFile(path, base);
+    check(overridden.dev_name == "device-from-json" && overridden.eid_index == 0u,
+          "explicit JSON fields did not override the caller's device and EID index");
     std::ofstream(path) << R"({"dev_name":"device-from-json"})";
     const auto selected = loadUrmaConfigFile(path, base);
     check(selected.dev_name == "device-from-json" && selected.eid_index == base.eid_index,
