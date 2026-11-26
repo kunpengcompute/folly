@@ -1,0 +1,13 @@
+{
+  "dev_name": "udmac0d1e2",
+  "eid_index": 0,
+  "rx_depth": 0,
+  "rx_target": 256,
+  "tx_depth": 1024,
+  "handshake_timeout_ms": 5000,
+  "max_pending_bytes": 134217728,
+  "registered_pool": {
+    "pool_size": 268435456,
+    "pool_max_size": 536870912
+  }
+}

@@ -5,7 +5,9 @@ foreach(test MemoryContract Wire ResourceSharing Init Buffer CleanupQueue Socket
   target_link_libraries(Urma${test}Test PRIVATE folly ${CMAKE_DL_LIBS})
   apply_folly_compile_options_to_target(Urma${test}Test)
   if(test STREQUAL "MemoryContract")
-    add_test(NAME URMA.${test} COMMAND Urma${test}Test ${CMAKE_CURRENT_SOURCE_DIR}/../urma.json)
+    add_test(NAME URMA.${test} COMMAND Urma${test}Test
+      "${CMAKE_CURRENT_SOURCE_DIR}/../urma.json"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../urma.example.json")
   elseif(NOT test STREQUAL "SocketContract")
     add_test(NAME URMA.${test} COMMAND Urma${test}Test)
   endif()

@@ -406,19 +406,24 @@ int main(int argc, char** argv) {
     tlsCacheBoundaries();
     resourceNotifications();
     largeExtents();
-    check(argc == 2, "shipped config fixture argument missing");
+    check(argc == 3, "expected paths to urma.json and urma.example.json");
     UrmaConfig base;
     base.dev_name = "device-supplied-by-caller";
     base.eid_index = 3;
-    auto example = loadUrmaConfigFile(argv[1], base);
-    check(example.dev_name == base.dev_name && example.eid_index == base.eid_index &&
-              example.registered_pool.enabled &&
-              example.registered_pool.elastic &&
-              example.registered_pool.zero_copy &&
-              example.registered_pool == base.registered_pool &&
-              example.registered_pool.pool_max_size >
-                  example.registered_pool.pool_size,
-          "shipped config overlay");
+    const auto defaults = loadUrmaConfigFile(argv[1], base);
+    check(defaults.dev_name == base.dev_name &&
+              defaults.eid_index == base.eid_index,
+          "urma.json changed the caller's device or EID index");
+    check(defaults.registered_pool.enabled &&
+              defaults.registered_pool.elastic &&
+              defaults.registered_pool.zero_copy &&
+              defaults.registered_pool == base.registered_pool &&
+              defaults.registered_pool.pool_max_size >
+                  defaults.registered_pool.pool_size,
+          "urma.json changed the registered pool defaults");
+    const auto example = loadUrmaConfigFile(argv[2], base);
+    check(example.dev_name == "udmac0d1e2" && example.eid_index == 0u,
+          "urma.example.json did not select udmac0d1e2 and EID index 0");
     char path[] = "/tmp/urma-config-test-XXXXXX";
     int fd = ::mkstemp(path);
     check(fd >= 0, "temporary config creation failed");
@@ -495,8 +500,10 @@ int main(int argc, char** argv) {
     }
     { std::ofstream out(path); out << "{}"; }
     check(!loadUrmaConfigFile(path).eid_index, "omitted EID index selected zero");
-    check(loadUrmaConfigFile(path, base).dev_name == base.dev_name,
-          "empty overlay lost caller defaults");
+    const auto inherited = loadUrmaConfigFile(path, base);
+    check(inherited.dev_name == base.dev_name &&
+              inherited.eid_index == base.eid_index,
+          "empty overlay lost the caller's device or EID index");
     std::cout << "PASS versionless config, public fields, ranges and JSON/C++ parity\n";
     using namespace urma_detail;
     auto c = config();
