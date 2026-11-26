@@ -6,7 +6,7 @@ URMA 通过 TCP 建链，小包使用 SEND/RECV，大包使用 READ。接收端�
 
 构建 Folly 时启用 `FOLLY_USE_URMA=ON`。应用通过 `UrmaConfig` 配置传输。也可以将 `FOLLY_URMA_CONFIG` 指向 [urma.json](urma.json)，文件中的字段会在 `UrmaInit::init()` 时覆盖对应的 C++ 配置。未知字段、重复字段或值不合法会导致初始化失败。
 
-| 字段 | 默认值 | 取值与用途 |
+| 字段 | 未指定时的默认值 | 取值与用途 |
 |---|---:|---|
 | `dev_name` | 空，沿用应用配置 | 本机 URMA 设备名。fbthrift 服务端须指定设备。 |
 | `eid_index` | 未指定，取设备报告的首项 | 客户端和服务端可分别选择本机设备列出的 EID 索引。 |
@@ -18,9 +18,7 @@ URMA 通过 TCP 建链，小包使用 SEND/RECV，大包使用 READ。接收端�
 | `registered_pool.pool_size` | 268435456 | 初始注册池容量，单位为字节，取页大小的正整数倍。 |
 | `registered_pool.pool_max_size` | 536870912 | 注册池容量上限，按页对齐且不小于初始容量。0 表示使用初始容量作为上限。默认配置下，有效上限至少为 16 KiB。 |
 
-随附的 `urma.json` 省略 `dev_name` 和 `eid_index`，这两项沿用应用配置。
-
-下面是 AccLibBenchmark 的 `fbthrift/fbthrift_urma/scripts/urma.example.json` 完整配置。本测试环境的 `udmac0d1e2` 列出索引 0–7，示例选择 0。两端分别按本机设备填写这两项。
+下面是 Folly 随附的 `folly/io/async/urma/urma.json`。加载该文件会选择 `udmac0d1e2` 和 EID 0。两端分别运行 `urma_admin show --all` 查看本机设备及索引，再按实际情况填写。本测试环境列出 0–7，其他设备以各自报告的列表为准。省略某个字段时沿用应用传入的值，`{}` 保留应用的全部配置。
 
 ```json
 {
@@ -37,6 +35,8 @@ URMA 通过 TCP 建链，小包使用 SEND/RECV，大包使用 READ。接收端�
   }
 }
 ```
+
+`UrmaInit::init()` 会核对设备名、该设备的 EID 列表与 SDK 创建的上下文。设备不存在、索引不属于该设备、SDK 上下文与所选绑定冲突时，初始化会抛出异常。进程已有上下文时，显式请求另一设备或索引也会报错，已有连接继续使用原绑定。
 
 使用默认配置（`rx_depth=0`、`rx_target=256`）时，库根据设备能力和发送队列深度确定接收队列容量，每个 EventBase 预投 256 块接收缓冲。收发共用的完成队列（JFC）由库自动创建，无需配置其深度。
 

@@ -410,30 +410,29 @@ int main(int argc, char** argv) {
     UrmaConfig base;
     base.dev_name = "device-supplied-by-caller";
     base.eid_index = 3;
-    const auto defaults = loadUrmaConfigFile(argv[1], base);
-    check(defaults.dev_name == base.dev_name &&
-              defaults.eid_index == base.eid_index,
-          "urma.json changed the caller's device or EID index");
-    check(defaults.registered_pool.enabled &&
-              defaults.registered_pool.elastic &&
-              defaults.registered_pool.zero_copy &&
-              defaults.registered_pool == base.registered_pool &&
-              defaults.registered_pool.pool_max_size >
-                  defaults.registered_pool.pool_size,
+    const auto sample = loadUrmaConfigFile(argv[1], base);
+    check(sample.dev_name == "udmac0d1e2" && sample.eid_index == 0u,
+          "urma.json did not select its example device and EID index");
+    check(sample.registered_pool.enabled &&
+              sample.registered_pool.elastic &&
+              sample.registered_pool.zero_copy &&
+              sample.registered_pool == base.registered_pool &&
+              sample.registered_pool.pool_max_size > sample.registered_pool.pool_size,
           "urma.json changed the registered pool defaults");
     char path[] = "/tmp/urma-config-test-XXXXXX";
     int fd = ::mkstemp(path);
     check(fd >= 0, "temporary config creation failed");
     ::close(fd);
     auto removeFile = makeGuard([&] { ::unlink(path); });
-    std::ofstream(path) << R"({"dev_name":"device-from-json","eid_index":0})";
+    std::ofstream(path) << R"({"dev_name":"device-from-json"})";
     const auto selected = loadUrmaConfigFile(path, base);
-    check(selected.dev_name == "device-from-json" && selected.eid_index == 0u,
-          "explicit JSON device and EID index did not override the caller's selection");
+    check(selected.dev_name == "device-from-json" && selected.eid_index == base.eid_index,
+          "device-only JSON changed the caller's EID index");
     for (uint32_t index : {uint32_t(0), uint32_t(7), UINT32_MAX}) {
       std::ofstream(path) << "{\"eid_index\":" << index << "}";
-      check(loadUrmaConfigFile(path, base).eid_index == index,
-            "JSON EID index did not override the caller's selection");
+      const auto indexed = loadUrmaConfigFile(path, base);
+      check(indexed.eid_index == index && indexed.dev_name == base.dev_name,
+            "index-only JSON did not preserve the caller's device");
     }
     for (const char* key : {"io_owners", "max_water", "fc_rx_depth",
                             "fc_max_water", "rx_spare_blocks",

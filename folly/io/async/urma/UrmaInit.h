@@ -23,6 +23,7 @@ class UrmaInit {
       UrmaPoolSignal* waiter = nullptr);
   // Acquires the process SDK context and registered pool. Queue resources are
   // prepared by each EventBase's shared owner when first needed.
+  // A later init may reuse the active device and EID, but cannot switch either.
   static void init(const UrmaConfig& config);
   // Requests shutdown and rejects new transports. Existing owners must still
   // be released by the caller; cleanup then retries automatically, including

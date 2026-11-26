@@ -8,6 +8,7 @@
 #include <new>
 #include <stdexcept>
 #include <thread>
+#include <utility>
 #include <vector>
 #include <folly/io/async/urma/UrmaCleanup.h>
 #include <folly/io/async/urma/UrmaInit.h>
@@ -15,19 +16,22 @@
 // Standalone binary: allocation and SDK failures must not affect other tests.
 namespace {
 thread_local bool failNextAllocation = false;
-enum class Failure { None, Devices, Query, Eids, Context };
+enum class Failure { None, Devices, Query, Eids, Context, WrongDevice, WrongIndex, WrongAddress };
 Failure failure = Failure::None;
 bool borrowedLibrary = false;
 int initializes = 0, finalizes = 0, devices = 0, eids = 0, contexts = 0;
 uint32_t deviceSendSges = 4;
 constexpr uint32_t kDeviceMaxReadSize = 1024 * 1024;
 uint32_t deviceRxDepth = 4096, deviceTxDepth = 4096, deviceCqDepth = 8193;
-urma_device_t device{};
-urma_device_t* deviceList[]{&device};
+urma_device_t device{}, otherDevice{};
+urma_device_t* deviceList[]{&device, &otherDevice};
+int deviceCount = 1;
 urma_eid_info_t deviceEids[2]{};
+urma_eid_info_t otherEid{};
 uint32_t eidCount = 1;
 std::optional<uint32_t> createdIndex;
 urma_context_t context{};
+bool failNextContextDelete = false;
 #ifndef URMA_TEST_EXTERNAL_POOL
 unsigned poolRegistrations = 0, poolUnregistrations = 0;
 bool failPoolRegistration = false;
@@ -46,8 +50,10 @@ void reset(Failure stage = Failure::None, bool borrowed = false) {
   failure = stage;
   borrowedLibrary = borrowed;
   initializes = finalizes = 0;
+  deviceCount = 1;
   eidCount = 1;
   for (auto& entry : deviceEids) entry = {};
+  otherEid = {};
   createdIndex.reset();
 }
 } // namespace
@@ -89,7 +95,7 @@ urma_status_t urma_uninit() {
   return URMA_SUCCESS;
 }
 urma_device_t** urma_get_device_list(int* count) {
-  *count = failure == Failure::Devices ? 0 : 1;
+  *count = failure == Failure::Devices ? 0 : deviceCount;
   if (!*count) {
     return nullptr;
   }
@@ -113,27 +119,41 @@ urma_status_t urma_query_device(urma_device_t*, urma_device_attr_t* attr) {
   attr->dev_cap.max_read_size = kDeviceMaxReadSize;
   return URMA_SUCCESS;
 }
-urma_eid_info_t* urma_get_eid_list(urma_device_t*, uint32_t* count) {
-  *count = failure == Failure::Eids ? 0 : eidCount;
+urma_eid_info_t* urma_get_eid_list(urma_device_t* selected, uint32_t* count) {
+  *count = selected == &otherDevice ? 1 : eidCount;
+  if (failure == Failure::Eids) *count = 0;
   if (!*count) {
     return nullptr;
   }
   ++eids;
-  return deviceEids;
+  return selected == &otherDevice ? &otherEid : deviceEids;
 }
 void urma_free_eid_list(urma_eid_info_t*) {
   --eids;
 }
-urma_context_t* urma_create_context(urma_device_t*, uint32_t index) {
+urma_context_t* urma_create_context(urma_device_t* selected, uint32_t index) {
   createdIndex = index;
   if (failure == Failure::Context) {
     return nullptr;
   }
-  context.eid_index = index;
+  const auto* entries = selected == &otherDevice ? &otherEid : deviceEids;
+  const auto* end = entries + (selected == &otherDevice ? 1 : eidCount);
+  const auto* entry = std::find_if(entries, end, [index](const auto& e) {
+    return e.eid_index == index;
+  });
+  if (entry == end) return nullptr;
+  context.dev = failure == Failure::WrongDevice ? &otherDevice : selected;
+  context.eid_index = failure == Failure::WrongIndex ? index + 1 : index;
+  context.eid = entry->eid;
+  if (failure == Failure::WrongAddress) context.eid.raw[0] ^= 0xff;
   ++contexts;
   return &context;
 }
 urma_status_t urma_delete_context(urma_context_t*) {
+  if (failNextContextDelete) {
+    failNextContextDelete = false;
+    return URMA_EAGAIN;
+  }
   --contexts;
   return URMA_SUCCESS;
 }
@@ -159,6 +179,75 @@ urma_status_t urma_unregister_seg(urma_target_seg_t* segment) {
 }
 
 #ifndef URMA_TEST_EXTERNAL_POOL
+void expectInitError(const folly::UrmaConfig& config, const std::string& expected) {
+  try {
+    folly::UrmaInit::init(config);
+  } catch (const std::runtime_error& error) {
+    if (std::string(error.what()).find(expected) != std::string::npos) return;
+    throw;
+  }
+  throw std::runtime_error("expected initialization failure: " + expected);
+}
+
+void checkDeviceBinding(const folly::UrmaConfig& base) {
+  using folly::UrmaInit;
+  auto cfg = base;
+  reset();
+  std::strcpy(otherDevice.name, "urma-second-device");
+  deviceCount = 2;
+  otherEid.eid_index = 42;
+  otherEid.eid.raw[0] = 0x2a;
+  cfg.dev_name = "missing-device";
+  expectInitError(cfg, "URMA device missing-device not found");
+  require(!createdIndex && !devices && !eids && !contexts && finalizes == 1,
+          "unknown device allocated resources or selected a fallback");
+
+  cfg.eid_index = 42;
+  cfg.dev_name = device.name;
+  expectInitError(cfg, std::string(device.name) + ": eid_index=42 unavailable");
+  cfg.dev_name = otherDevice.name;
+  UrmaInit::init(cfg);
+  const int starts = initializes;
+  UrmaInit::init(cfg);
+  UrmaInit::init({});
+  cfg.dev_name = device.name;
+  expectInitError(cfg, std::string("conflicts with active device ") + otherDevice.name);
+  cfg.dev_name = otherDevice.name;
+  cfg.eid_index = 0;
+  expectInitError(cfg, "requested eid_index=0 conflicts with active eid_index=42");
+  require(initializes == starts && contexts == 1 && UrmaInit::getConfig().dev_name == otherDevice.name &&
+              UrmaInit::getConfig().eid_index == 42u && UrmaInit::getLocalEid().raw[0] == 0x2a,
+          "a repeated init replaced the active binding or reacquired the SDK");
+  UrmaInit::fini();
+
+  reset();
+  cfg = base;
+  cfg.dev_name.clear();
+  UrmaInit::init(cfg);
+  require(UrmaInit::getConfig().dev_name == device.name, "automatic device selection was not recorded");
+  UrmaInit::init(base);
+  UrmaInit::fini();
+
+  for (bool borrowed : {false, true}) {
+    for (const auto& [stage, error] : {
+             std::pair{Failure::WrongDevice, "SDK context reports urma-second-device"},
+             std::pair{Failure::WrongIndex, "SDK context reports eid_index=1"},
+             std::pair{Failure::WrongAddress, "different EID address"}}) {
+      reset(stage, borrowed);
+      expectInitError(base, error);
+      require(!UrmaInit::isInitialized() && !contexts && !devices && !eids &&
+                  finalizes == (borrowed ? 0 : 1), "rejected SDK binding leaked resources");
+    }
+  }
+  reset(Failure::WrongDevice);
+  failNextContextDelete = true;
+  expectInitError(base, "SDK context reports urma-second-device");
+  require(folly::urma_detail::waitForCleanups(std::chrono::seconds(2)) &&
+              !UrmaInit::isInitialized() && !contexts && finalizes == 1,
+          "rejected SDK binding was not cleaned up after a delete failure");
+  std::cout << "PASS device discovery, per-device EIDs, active binding conflicts and SDK rollback\n";
+}
+
 int main() {
   try {
     folly::UrmaConfig config;
@@ -225,6 +314,8 @@ int main() {
     checkEid(0, 1);
     config.eid_index.reset();
     std::cout << "PASS sparse EID selection, missing index rollback and explicit zero\n";
+
+    checkDeviceBinding(config);
 
     for (bool borrowed : {false, true}) {
       for (Failure stage :
