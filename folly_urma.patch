@@ -166,10 +166,10 @@ index 831acd883e54aad07cff19160e72688de8de1bf8..152e2e579aa76ff89e93260eaca38ff6
    bool useHeapFullStorage = false;
 diff --git a/folly/io/async/urma/README.md b/folly/io/async/urma/README.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..3482620b6c613584500f451154d4de5b0dfe0c2a
+index 0000000000000000000000000000000000000000..08f6fd19af03afff3771d4af8076f7622381fe53
 --- /dev/null
 +++ b/folly/io/async/urma/README.md
-@@ -0,0 +1,71 @@
+@@ -0,0 +1,83 @@
 +# URMA 传输
 +
 +URMA 通过 TCP 建链，小包使用 SEND/RECV，大包使用 READ。接收端按发送顺序交付数据。
@@ -180,7 +180,8 @@ index 0000000000000000000000000000000000000000..3482620b6c613584500f451154d4de5b
 +
 +| 字段 | 默认值 | 取值与用途 |
 +|---|---:|---|
-+| `dev_name` | 由应用指定 | URMA 设备名。fbthrift 服务端须指定设备。 |
++| `dev_name` | 空，沿用应用配置 | 本机 URMA 设备名。fbthrift 服务端须指定设备。 |
++| `eid_index` | 未指定，取设备报告的首项 | 客户端和服务端可分别选择本机设备列出的 EID 索引。 |
 +| `rx_depth` | 0 | 每个 EventBase 的接收队列（JFR）最多可容纳的接收请求数。0 表示自动选择。手动设置时可填 1–65536，超过设备可用深度会导致初始化失败。 |
 +| `rx_target` | 256 | 每个 EventBase 预投的接收缓冲块数，取值为 1 至实际接收队列深度。每块默认 4 KiB。 |
 +| `tx_depth` | 1024 | 每个 EventBase 的发送队列深度，取值为 1–4096，且不能超过设备支持的深度。 |
@@ -188,6 +189,17 @@ index 0000000000000000000000000000000000000000..3482620b6c613584500f451154d4de5b
 +| `max_pending_bytes` | 134217728 | 每连接的积压上限，按默认缓冲大小可设为 4096–4294967295 字节。发送和接收分别计限，须容纳单次完整写入。 |
 +| `registered_pool.pool_size` | 268435456 | 初始注册池容量，单位为字节，取页大小的正整数倍。 |
 +| `registered_pool.pool_max_size` | 536870912 | 注册池容量上限，按页对齐且不小于初始容量。0 表示使用初始容量作为上限。默认配置下，有效上限至少为 16 KiB。 |
++
++随附的 [urma.json](urma.json) 省略 `dev_name` 和 `eid_index`，这两项沿用应用配置。要在文件中指定设备，可按下面的写法填写。本测试环境的 `udmac0d1e2` 列出索引 0–7，示例选择 0。
++
++```json
++{
++  "dev_name": "udmac0d1e2",
++  "eid_index": 0
++}
++```
++
++运行 fbthrift 压测时，可直接复制 AccLibBenchmark 的[完整配置样例](https://gitcode.com/boostkit/AccLibBenchmark/blob/master/fbthrift/fbthrift_urma/scripts/urma.example.json)。
 +
 +使用默认配置（`rx_depth=0`、`rx_target=256`）时，库根据设备能力和发送队列深度确定接收队列容量，每个 EventBase 预投 256 块接收缓冲。收发共用的完成队列（JFC）由库自动创建，无需配置其深度。
 +
@@ -243,10 +255,10 @@ index 0000000000000000000000000000000000000000..3482620b6c613584500f451154d4de5b
 +```
 diff --git a/folly/io/async/urma/UrmaAsyncSocket.cpp b/folly/io/async/urma/UrmaAsyncSocket.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..faf134f01fce1a9fc86557742984f8421a0f3e74
+index 0000000000000000000000000000000000000000..139183ab800f7515e2ef26658cd0b2c4e48d99dc
 --- /dev/null
 +++ b/folly/io/async/urma/UrmaAsyncSocket.cpp
-@@ -0,0 +1,1791 @@
+@@ -0,0 +1,1794 @@
 +/* Copyright (c) Huawei Technologies Co., Ltd. 2026. Licensed under Apache-2.0.
 + */
 +#include <folly/io/async/urma/UrmaAsyncSocket.h>
@@ -669,7 +681,6 @@ index 0000000000000000000000000000000000000000..faf134f01fce1a9fc86557742984f842
 +    urma_detail::Hello hello;
 +    const auto& id = io->endpoint();
 +    hello.bufferSize = config.buffer_size;
-+    hello.posted = io->snapshot().posted;
 +    hello.jfr = id.id;
 +    std::memcpy(hello.eid.data(), id.eid.raw, 16);
 +    hello.uasid = id.uasid;
@@ -681,17 +692,19 @@ index 0000000000000000000000000000000000000000..faf134f01fce1a9fc86557742984f842
 +        fail("URMA initial READ segment setup failed");
 +        return;
 +      }
-+      hello.read = true;
++      if (std::memcmp(id.eid.raw, segment->ubva.eid.raw, hello.eid.size()) ||
++          id.uasid != segment->ubva.uasid) {
++        fail("URMA initial READ segment and JFR have different EID or UASID");
++        return;
++      }
 +      hello.maxRead =
 +          std::min(config.max_pending_bytes, UrmaInit::getMaxReadSize());
-+      std::memcpy(hello.segmentEid.data(), segment->ubva.eid.raw, 16);
-+      hello.segmentUasid = segment->ubva.uasid;
 +      hello.segmentAddress = segment->ubva.va;
 +      initialReadAddress = hello.segmentAddress;
 +      hello.segmentLength = segment->len;
 +      hello.segmentToken = segment->token_id;
 +    }
-+    std::array<uint8_t, kHelloSize> h{};
++    std::array<uint8_t, kHelloSize> h;
 +    urma_detail::encodeHello(h.data(), hello);
 +    sendHandshake(h.data(), h.size());
 +  }
@@ -729,28 +742,30 @@ index 0000000000000000000000000000000000000000..faf134f01fce1a9fc86557742984f842
 +    DestructorGuard guard(owner);
 +    if (!live())
 +      return;
-+    if (handshake.size() + n > kHelloSize + 4 + urma_detail::kEndSize) {
-+      fail("unexpected data on URMA handshake channel");
-+      return;
-+    }
 +    handshake.insert(handshake.end(), tcpBuffer.begin(), tcpBuffer.begin() + n);
 +    processHandshake();
 +  }
 +  void processHandshake() {
-+    if (!haveHello && handshake.size() >= 10 &&
-+        (load32(handshake.data()) != urma_detail::kMagic ||
-+         urma_detail::load16(handshake.data() + 4) != kHelloSize ||
-+         urma_detail::load16(handshake.data() + 6) != urma_detail::kHelloVersion ||
-+         urma_detail::load16(handshake.data() + 8) != urma_detail::kWireVersion)) {
-+      fail("incompatible URMA handshake version");
++    const auto* p = handshake.data();
++    if (!haveHello && handshake.size() >= urma_detail::kHelloPrefixSize) {
++      if (const auto* error = urma_detail::helloPrefixError(p)) {
++        fail(error);
++        return;
++      }
++    }
++    if (handshake.size() > kHelloSize + 4 + urma_detail::kEndSize) {
++      fail("unexpected data on URMA handshake channel");
 +      return;
 +    }
-+    if (!haveHello && handshake.size() >= kHelloSize) {
-+      if (!urma_detail::decodeHello(handshake.data(), kHelloSize, peerHello) ||
++    if (!haveHello) {
++      if (handshake.size() < kHelloSize) {
++        return;
++      }
++      if (!urma_detail::decodeHello(p, kHelloSize, peerHello) ||
 +          peerHello.tpType != URMA_CTP || peerHello.fcJfr ||
 +          peerHello.bufferSize <= kHeadroom || peerHello.bufferSize > 4096 ||
-+          !peerHello.jfr || !peerHello.posted) {
-+        fail("incompatible URMA HELLO102 or flow-control mode");
++          !peerHello.jfr) {
++        fail("invalid URMA HELLO fields");
 +        return;
 +      }
 +      std::memcpy(peerId.eid.raw, peerHello.eid.data(), 16);
@@ -758,7 +773,7 @@ index 0000000000000000000000000000000000000000..faf134f01fce1a9fc86557742984f842
 +      peerId.id = peerHello.jfr;
 +      peerBuffer = std::min(config.buffer_size, peerHello.bufferSize);
 +      peerRead =
-+          peerHello.read && config.enable_read && UrmaInit::getMaxReadSize();
++          peerHello.maxRead && config.enable_read && UrmaInit::getMaxReadSize();
 +      peerSocketId = peerHello.socket;
 +      if (!client) {
 +        // Validate the peer before publishing our routing identity, but send
@@ -774,8 +789,8 @@ index 0000000000000000000000000000000000000000..faf134f01fce1a9fc86557742984f842
 +      }
 +      if (peerRead) {
 +        urma_seg_t segment{};
-+        std::memcpy(segment.ubva.eid.raw, peerHello.segmentEid.data(), 16);
-+        segment.ubva.uasid = peerHello.segmentUasid;
++        segment.ubva.eid = peerId.eid;
++        segment.ubva.uasid = peerId.uasid;
 +        segment.ubva.va = peerHello.segmentAddress;
 +        segment.len = peerHello.segmentLength;
 +        segment.token_id = peerHello.segmentToken;
@@ -2324,10 +2339,10 @@ index 0000000000000000000000000000000000000000..6de0977866a57b3e41128e440e1a0903
 +#endif
 diff --git a/folly/io/async/urma/UrmaConfig.cpp b/folly/io/async/urma/UrmaConfig.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..a4d21922f087fdbaa3561b29c1a5b9da59de7506
+index 0000000000000000000000000000000000000000..68eec878f8dc40976899ff0e8475136c296a7ce7
 --- /dev/null
 +++ b/folly/io/async/urma/UrmaConfig.cpp
-@@ -0,0 +1,99 @@
+@@ -0,0 +1,103 @@
 +/* Copyright (c) Huawei Technologies Co., Ltd. 2026. Licensed under Apache-2.0.
 + */
 +#include <folly/io/async/urma/UrmaConfig.h>
@@ -2351,14 +2366,16 @@ index 0000000000000000000000000000000000000000..a4d21922f087fdbaa3561b29c1a5b9da
 +  }
 +}
 +template <class T>
-+void number(const dynamic& obj, const char* key, T& out) {
++bool number(const dynamic& obj, const char* key, T& out) {
 +  if (auto* v = obj.get_ptr(key)) {
 +    if (!v->isInt() || v->getInt() < 0 ||
 +        uint64_t(v->getInt()) > std::numeric_limits<T>::max())
 +      throw std::invalid_argument(std::string(key) +
 +                                  " must be an unsigned integer in range");
 +    out = static_cast<T>(v->getInt());
++    return true;
 +  }
++  return false;
 +}
 +void range(const char* field, uint64_t value, uint64_t low, uint64_t high) {
 +  if (value < low || value > high)
@@ -2399,7 +2416,7 @@ index 0000000000000000000000000000000000000000..a4d21922f087fdbaa3561b29c1a5b9da
 +    opts.validate_keys = true;
 +    opts.validate_utf8 = true;
 +    const auto root = parseJson(text, opts);
-+    keys(root, {"dev_name", "rx_depth", "rx_target", "tx_depth",
++    keys(root, {"dev_name", "eid_index", "rx_depth", "rx_target", "tx_depth",
 +                "handshake_timeout_ms", "max_pending_bytes", "registered_pool"});
 +    auto c = base;
 +    if (auto* name = root.get_ptr("dev_name")) {
@@ -2408,6 +2425,8 @@ index 0000000000000000000000000000000000000000..a4d21922f087fdbaa3561b29c1a5b9da
 +        throw std::invalid_argument("dev_name must be a string without NUL");
 +      c.dev_name = name->asString();
 +    }
++    uint32_t index;
++    if (number(root, "eid_index", index)) c.eid_index = index;
 +    number(root, "rx_depth", c.rx_depth);
 +    number(root, "rx_target", c.rx_target);
 +    number(root, "tx_depth", c.tx_depth);
@@ -2429,10 +2448,10 @@ index 0000000000000000000000000000000000000000..a4d21922f087fdbaa3561b29c1a5b9da
 +#endif
 diff --git a/folly/io/async/urma/UrmaConfig.h b/folly/io/async/urma/UrmaConfig.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..1526f0573600231563a78f8053c4fb067caac983
+index 0000000000000000000000000000000000000000..00951f569b4d1495c878dd77797d149974cd1a87
 --- /dev/null
 +++ b/folly/io/async/urma/UrmaConfig.h
-@@ -0,0 +1,39 @@
+@@ -0,0 +1,42 @@
 +/* Copyright (c) Huawei Technologies Co., Ltd. 2026. Licensed under Apache-2.0.
 + */
 +#pragma once
@@ -2440,6 +2459,7 @@ index 0000000000000000000000000000000000000000..1526f0573600231563a78f8053c4fb06
 +#include <folly/io/async/urma/UrmaMemoryPool.h>
 +
 +#include <cstdint>
++#include <optional>
 +#include <string>
 +namespace folly {
 +// Process-wide pool settings and per-connection transport limits.
@@ -2463,6 +2483,8 @@ index 0000000000000000000000000000000000000000..1526f0573600231563a78f8053c4fb06
 +  // Per-connection admission/receive bounds, not an up-front reservation.
 +  uint32_t max_pending_bytes{128 * 1024 * 1024};
 +  UrmaPoolConfig registered_pool;
++  // Local SDK index. If omitted, select the first EID reported by the device.
++  std::optional<uint32_t> eid_index;
 +};
 +// Shared by JSON overlays and direct C++ initialization, before SDK calls.
 +void validateUrmaConfig(const UrmaConfig& config);
@@ -2474,10 +2496,10 @@ index 0000000000000000000000000000000000000000..1526f0573600231563a78f8053c4fb06
 +#endif
 diff --git a/folly/io/async/urma/UrmaInit.cpp b/folly/io/async/urma/UrmaInit.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..ce277f9f3306a6ca259c94970e0001fd984b8caf
+index 0000000000000000000000000000000000000000..b218e06bec1a518f2d9d7aecf7c167ff13343b56
 --- /dev/null
 +++ b/folly/io/async/urma/UrmaInit.cpp
-@@ -0,0 +1,370 @@
+@@ -0,0 +1,382 @@
 +/* Copyright (c) Huawei Technologies Co., Ltd. 2026. Licensed under Apache-2.0.
 + */
 +#include <folly/io/async/urma/UrmaCleanup.h>
@@ -2641,9 +2663,19 @@ index 0000000000000000000000000000000000000000..ce277f9f3306a6ca259c94970e0001fd
 +        uint64_t(effective.rx_depth) + effective.tx_depth + 1 <=
 +            attr.dev_cap.max_jfc_depth) {
 +      eids = urma_get_eid_list(device, &n);
-+      if (eids && n) {
-+        eid = eids[0].eid;
-+        created = urma_create_context(device, eids[0].eid_index);
++      uint32_t i = 0;
++      if (config.eid_index) {
++        while (eids && i < n && eids[i].eid_index != *config.eid_index) ++i;
++        if (!eids || i == n) {
++          throw std::runtime_error(std::string("URMA device ") + device->name +
++              ": eid_index=" + std::to_string(*config.eid_index) + " unavailable");
++        }
++      }
++      if (eids && i < n) {
++        const auto& selected = eids[i];
++        eid = selected.eid;
++        effective.eid_index = selected.eid_index;
++        created = urma_create_context(device, selected.eid_index);
 +      }
 +    }
 +  }
@@ -2674,6 +2706,8 @@ index 0000000000000000000000000000000000000000..ce277f9f3306a6ca259c94970e0001fd
 +    }
 +    if (!(*memoryPool)->warm(std::chrono::seconds(5)))
 +      throw std::runtime_error("URMA soft capacity unavailable at startup");
++    XLOG(INFO) << "URMA context device=" << device->name
++               << " eid_index=" << created->eid_index;
 +    std::atomic_store(&*publishedPool, *memoryPool);
 +    poolEpoch.fetch_add(1, std::memory_order_release);
 +    poolIOBufEnabled.store(
@@ -5000,10 +5034,10 @@ index 0000000000000000000000000000000000000000..4ce9dc6dd8ecdd0d0245096d6d24e96c
 +#endif
 diff --git a/folly/io/async/urma/UrmaProtocol.h b/folly/io/async/urma/UrmaProtocol.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..179e4006946a0a8b7adf31caa7b2d3ea4f8bb8ba
+index 0000000000000000000000000000000000000000..f71d530bf7234dfc5d65ce10af2c8c3cde2e34f3
 --- /dev/null
 +++ b/folly/io/async/urma/UrmaProtocol.h
-@@ -0,0 +1,144 @@
+@@ -0,0 +1,136 @@
 +/* Copyright (c) Huawei Technologies Co., Ltd. 2026. Licensed under Apache-2.0.
 + */
 +#pragma once
@@ -5015,8 +5049,9 @@ index 0000000000000000000000000000000000000000..179e4006946a0a8b7adf31caa7b2d3ea
 +namespace folly::urma_detail {
 +constexpr size_t kHeaderSize = 24;
 +constexpr size_t kPullSize = 40;
-+constexpr size_t kHelloSize = 102;
 +constexpr size_t kSegmentSize = 40;
++constexpr size_t kHelloSize = 75;
++constexpr size_t kHelloPrefixSize = 10;
 +constexpr uint16_t kHelloVersion = 1;
 +constexpr uint8_t kWireVersion = 1;
 +constexpr uint32_t kMagic = 0x55524d41;
@@ -5080,18 +5115,22 @@ index 0000000000000000000000000000000000000000..179e4006946a0a8b7adf31caa7b2d3ea
 +      : n == kHeaderSize;
 +}
 +struct Hello {
-+  uint32_t bufferSize{0}, posted{0}, jfr{0};
++  uint32_t bufferSize{0}, jfr{0};
 +  std::array<uint8_t, 16> eid{};
 +  uint32_t uasid{0};
 +  uint8_t tpType{0};
-+  bool read{false};
-+  std::array<uint8_t, 16> segmentEid{};
-+  uint32_t segmentUasid{0};
 +  uint64_t segmentAddress{0}, segmentLength{0};
 +  uint32_t segmentToken{0}, fcJfr{0};
 +  uint64_t socket{0};
 +  uint32_t maxRead{0};
 +};
++inline const char* helloPrefixError(const uint8_t* p) {
++  if (load32(p) != kMagic) return "invalid URMA HELLO magic";
++  if (load16(p + 4) != kHelloSize) return "unsupported URMA HELLO length";
++  if (load16(p + 6) != kHelloVersion) return "unsupported URMA HELLO version";
++  if (load16(p + 8) != kWireVersion) return "unsupported URMA wire version";
++  return nullptr;
++}
 +inline void encodeHello(uint8_t* p, const Hello& h) {
 +  std::memset(p, 0, kHelloSize);
 +  store32(p, kMagic);
@@ -5099,51 +5138,38 @@ index 0000000000000000000000000000000000000000..179e4006946a0a8b7adf31caa7b2d3ea
 +  store16(p + 6, kHelloVersion);
 +  store16(p + 8, kWireVersion);
 +  store32(p + 10, h.bufferSize);
-+  store32(p + 14, h.posted);
-+  store32(p + 18, h.jfr);
-+  std::memcpy(p + 22, h.eid.data(), 16);
-+  store32(p + 38, h.uasid);
-+  p[42] = h.tpType;
-+  p[43] = h.read ? 4 : 0;
-+  std::memcpy(p + 46, h.segmentEid.data(), 16);
-+  store32(p + 62, h.segmentUasid);
-+  store64(p + 66, h.segmentAddress);
-+  store64(p + 74, h.segmentLength);
-+  store32(p + 82, h.segmentToken);
-+  store32(p + 86, h.fcJfr);
-+  store64(p + 90, h.socket);
-+  store32(p + 98, h.maxRead);
++  store32(p + 14, h.jfr);
++  std::memcpy(p + 18, h.eid.data(), 16);
++  store32(p + 34, h.uasid);
++  p[38] = h.tpType;
++  store64(p + 39, h.segmentAddress);
++  store64(p + 47, h.segmentLength);
++  store32(p + 55, h.segmentToken);
++  store32(p + 59, h.fcJfr);
++  store64(p + 63, h.socket);
++  store32(p + 71, h.maxRead);
 +}
 +inline bool decodeHello(const uint8_t* p, size_t n, Hello& h) {
-+  if (n != kHelloSize || load32(p) != kMagic || load16(p + 4) != n ||
-+      load16(p + 6) != kHelloVersion || load16(p + 8) != kWireVersion || (p[43] & ~4) || p[44] ||
-+      p[45] || !load64(p + 90))
-+    return false;
++  if (n != kHelloSize || helloPrefixError(p)) return false;
 +  h.bufferSize = load32(p + 10);
-+  h.posted = load32(p + 14);
-+  h.jfr = load32(p + 18);
-+  std::memcpy(h.eid.data(), p + 22, 16);
-+  h.uasid = load32(p + 38);
-+  h.tpType = p[42];
-+  h.read = p[43] != 0;
-+  std::memcpy(h.segmentEid.data(), p + 46, 16);
-+  h.segmentUasid = load32(p + 62);
-+  h.segmentAddress = load64(p + 66);
-+  h.segmentLength = load64(p + 74);
-+  h.segmentToken = load32(p + 82);
-+  h.fcJfr = load32(p + 86);
-+  h.socket = load64(p + 90);
-+  h.maxRead = load32(p + 98);
-+  if (h.read)
-+    return h.maxRead && h.segmentAddress && h.segmentLength &&
++  h.jfr = load32(p + 14);
++  std::memcpy(h.eid.data(), p + 18, 16);
++  h.uasid = load32(p + 34);
++  h.tpType = p[38];
++  h.segmentAddress = load64(p + 39);
++  h.segmentLength = load64(p + 47);
++  h.segmentToken = load32(p + 55);
++  h.fcJfr = load32(p + 59);
++  h.socket = load64(p + 63);
++  h.maxRead = load32(p + 71);
++  if (!h.socket) return false;
++  if (h.maxRead)
++    return h.segmentAddress && h.segmentLength &&
 +        h.segmentLength <= UINT64_MAX - h.segmentAddress;
-+  for (size_t i = 46; i < 86; ++i)
-+    if (p[i])
-+      return false;
-+  return !h.maxRead;
++  return !h.segmentAddress && !h.segmentLength && !h.segmentToken;
 +}
 +inline bool containsRead(const Hello& h, uint64_t address, uint32_t length) {
-+  return h.read && length && length <= h.maxRead &&
++  return length && length <= h.maxRead &&
 +      address >= h.segmentAddress && length <= h.segmentLength &&
 +      address - h.segmentAddress <= h.segmentLength - length;
 +}
@@ -6342,10 +6368,10 @@ index 0000000000000000000000000000000000000000..50c731d948e1f019c4291a5841db51a9
 +}
 diff --git a/folly/io/async/urma/test/InitTest.cpp b/folly/io/async/urma/test/InitTest.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..55246e6b257095c1107d694a1392ec75b1bbebb9
+index 0000000000000000000000000000000000000000..78df77d10c5f5a8393f026d97a9da0dec1f22e66
 --- /dev/null
 +++ b/folly/io/async/urma/test/InitTest.cpp
-@@ -0,0 +1,423 @@
+@@ -0,0 +1,470 @@
 +/* Copyright (c) Huawei Technologies Co., Ltd. 2026. Licensed under Apache-2.0.
 + */
 +#include <cstdlib>
@@ -6372,7 +6398,9 @@ index 0000000000000000000000000000000000000000..55246e6b257095c1107d694a1392ec75
 +uint32_t deviceRxDepth = 4096, deviceTxDepth = 4096, deviceCqDepth = 8193;
 +urma_device_t device{};
 +urma_device_t* deviceList[]{&device};
-+urma_eid_info_t eid{};
++urma_eid_info_t deviceEids[2]{};
++uint32_t eidCount = 1;
++std::optional<uint32_t> createdIndex;
 +urma_context_t context{};
 +#ifndef URMA_TEST_EXTERNAL_POOL
 +unsigned poolRegistrations = 0, poolUnregistrations = 0;
@@ -6392,6 +6420,9 @@ index 0000000000000000000000000000000000000000..55246e6b257095c1107d694a1392ec75
 +  failure = stage;
 +  borrowedLibrary = borrowed;
 +  initializes = finalizes = 0;
++  eidCount = 1;
++  for (auto& entry : deviceEids) entry = {};
++  createdIndex.reset();
 +}
 +} // namespace
 +
@@ -6457,20 +6488,22 @@ index 0000000000000000000000000000000000000000..55246e6b257095c1107d694a1392ec75
 +  return URMA_SUCCESS;
 +}
 +urma_eid_info_t* urma_get_eid_list(urma_device_t*, uint32_t* count) {
-+  *count = failure == Failure::Eids ? 0 : 1;
++  *count = failure == Failure::Eids ? 0 : eidCount;
 +  if (!*count) {
 +    return nullptr;
 +  }
 +  ++eids;
-+  return &eid;
++  return deviceEids;
 +}
 +void urma_free_eid_list(urma_eid_info_t*) {
 +  --eids;
 +}
-+urma_context_t* urma_create_context(urma_device_t*, uint32_t) {
++urma_context_t* urma_create_context(urma_device_t*, uint32_t index) {
++  createdIndex = index;
 +  if (failure == Failure::Context) {
 +    return nullptr;
 +  }
++  context.eid_index = index;
 +  ++contexts;
 +  return &context;
 +}
@@ -6526,6 +6559,46 @@ index 0000000000000000000000000000000000000000..55246e6b257095c1107d694a1392ec75
 +        !folly::UrmaInit::isInitialized(), "failed init published a context");
 +    std::cout
 +        << "PASS configuration allocation failure precedes SDK acquisition\n";
++
++    auto resetSparseEids = [](uint32_t secondIndex) {
++      reset();
++      eidCount = 2;
++      deviceEids[0].eid_index = 3;
++      deviceEids[0].eid.raw[0] = 0xa3;
++      deviceEids[1].eid_index = secondIndex;
++      deviceEids[1].eid.raw[0] = 0xa7;
++    };
++    auto checkEid = [&](std::optional<uint32_t> requested, size_t entry) {
++      config.eid_index = requested;
++      folly::UrmaInit::init(config);
++      const auto local = folly::UrmaInit::getLocalEid();
++      require(createdIndex == deviceEids[entry].eid_index &&
++                  folly::UrmaInit::getConfig().eid_index == createdIndex &&
++                  !std::memcmp(local.raw, deviceEids[entry].eid.raw, sizeof(local.raw)),
++              "context index and local EID must come from the selected entry");
++      folly::UrmaInit::fini();
++    };
++    resetSparseEids(7);
++    checkEid(std::nullopt, 0);
++    resetSparseEids(7);
++    checkEid(7, 1);
++    resetSparseEids(7);
++    config.eid_index = 0;
++    bool missing = false;
++    try {
++      folly::UrmaInit::init(config);
++    } catch (const std::runtime_error& e) {
++      const std::string msg(e.what());
++      missing = msg.find(config.dev_name) != std::string::npos &&
++          msg.find("eid_index=0") != std::string::npos;
++    }
++    require(missing && !createdIndex && !eids && !devices && !contexts &&
++                finalizes == 1 && !folly::UrmaInit::isInitialized(),
++            "missing EID must fail before context creation and release SDK lists");
++    resetSparseEids(0);
++    checkEid(0, 1);
++    config.eid_index.reset();
++    std::cout << "PASS sparse EID selection, missing index rollback and explicit zero\n";
 +
 +    for (bool borrowed : {false, true}) {
 +      for (Failure stage :
@@ -6771,10 +6844,10 @@ index 0000000000000000000000000000000000000000..55246e6b257095c1107d694a1392ec75
 +#endif
 diff --git a/folly/io/async/urma/test/MemoryContractTest.cpp b/folly/io/async/urma/test/MemoryContractTest.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..1d0147fd732f74111f2e6a73bfe9a4749158ffca
+index 0000000000000000000000000000000000000000..7337decda978e857230b0477b2fad1a66f8fe987
 --- /dev/null
 +++ b/folly/io/async/urma/test/MemoryContractTest.cpp
-@@ -0,0 +1,796 @@
+@@ -0,0 +1,814 @@
 +/* Copyright (c) Huawei Technologies Co., Ltd. 2026. Licensed under Apache-2.0.
 + */
 +#include <folly/io/async/urma/UrmaConfig.h>
@@ -7183,23 +7256,35 @@ index 0000000000000000000000000000000000000000..1d0147fd732f74111f2e6a73bfe9a474
 +    tlsCacheBoundaries();
 +    resourceNotifications();
 +    largeExtents();
-+    check(argc == 2, "shipped config fixture argument missing");
++    check(argc == 2, "expected path to urma.json");
 +    UrmaConfig base;
 +    base.dev_name = "device-supplied-by-caller";
-+    auto example = loadUrmaConfigFile(argv[1], base);
-+    check(example.dev_name == base.dev_name &&
-+              example.registered_pool.enabled &&
-+              example.registered_pool.elastic &&
-+              example.registered_pool.zero_copy &&
-+              example.registered_pool == base.registered_pool &&
-+              example.registered_pool.pool_max_size >
-+                  example.registered_pool.pool_size,
-+          "shipped config overlay");
++    base.eid_index = 3;
++    const auto defaults = loadUrmaConfigFile(argv[1], base);
++    check(defaults.dev_name == base.dev_name &&
++              defaults.eid_index == base.eid_index,
++          "urma.json changed the caller's device or EID index");
++    check(defaults.registered_pool.enabled &&
++              defaults.registered_pool.elastic &&
++              defaults.registered_pool.zero_copy &&
++              defaults.registered_pool == base.registered_pool &&
++              defaults.registered_pool.pool_max_size >
++                  defaults.registered_pool.pool_size,
++          "urma.json changed the registered pool defaults");
 +    char path[] = "/tmp/urma-config-test-XXXXXX";
 +    int fd = ::mkstemp(path);
 +    check(fd >= 0, "temporary config creation failed");
 +    ::close(fd);
 +    auto removeFile = makeGuard([&] { ::unlink(path); });
++    std::ofstream(path) << R"({"dev_name":"device-from-json","eid_index":0})";
++    const auto selected = loadUrmaConfigFile(path, base);
++    check(selected.dev_name == "device-from-json" && selected.eid_index == 0u,
++          "explicit JSON device and EID index did not override the caller's selection");
++    for (uint32_t index : {uint32_t(0), uint32_t(7), UINT32_MAX}) {
++      std::ofstream(path) << "{\"eid_index\":" << index << "}";
++      check(loadUrmaConfigFile(path, base).eid_index == index,
++            "JSON EID index did not override the caller's selection");
++    }
 +    for (const char* key : {"io_owners", "max_water", "fc_rx_depth",
 +                            "fc_max_water", "rx_spare_blocks",
 +                            "io_free_rx_reserve", "credit_target",
@@ -7249,6 +7334,9 @@ index 0000000000000000000000000000000000000000..1d0147fd732f74111f2e6a73bfe9a474
 +      check(rejects([&] { loadUrmaConfigFile(path, base); }), "JSON/C++ validation differs");
 +    }
 +    for (const char* json : {"{\"rx_depth\":4,\"rx_target\":5}",
++                             "{\"eid_index\":-1}", "{\"eid_index\":2.5}",
++                             "{\"eid_index\":4294967296}", "{\"eid_index\":true}",
++                             "{\"eid_index\":\"7\"}", "{\"eid_index\":null}",
 +                             "{\"tx_depth\":1,\"tx_depth\":2}",
 +                             "{\"tx_depth\":1.5}", "{\"tx_depth\":true}",
 +                             "{\"tx_depth\":-1}", "{\"tx_depth\":4294967296}",
@@ -7262,8 +7350,11 @@ index 0000000000000000000000000000000000000000..1d0147fd732f74111f2e6a73bfe9a474
 +      check(rejected, "invalid type, duplicate, or dependent limits accepted");
 +    }
 +    { std::ofstream out(path); out << "{}"; }
-+    check(loadUrmaConfigFile(path, base).dev_name == base.dev_name,
-+          "empty overlay lost caller defaults");
++    check(!loadUrmaConfigFile(path).eid_index, "omitted EID index selected zero");
++    const auto inherited = loadUrmaConfigFile(path, base);
++    check(inherited.dev_name == base.dev_name &&
++              inherited.eid_index == base.eid_index,
++          "empty overlay lost the caller's device or EID index");
 +    std::cout << "PASS versionless config, public fields, ranges and JSON/C++ parity\n";
 +    using namespace urma_detail;
 +    auto c = config();
@@ -7985,10 +8076,10 @@ index 0000000000000000000000000000000000000000..584bb8e77cb96f2cb2c5e3fab08bf2e0
 +}
 diff --git a/folly/io/async/urma/test/ResourceSharingTest.cpp b/folly/io/async/urma/test/ResourceSharingTest.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..c69774d605884b970d0c103a2960e23af3fd806f
+index 0000000000000000000000000000000000000000..8235e1056e7c8610e8e02fd8e77b0d58ee4297dd
 --- /dev/null
 +++ b/folly/io/async/urma/test/ResourceSharingTest.cpp
-@@ -0,0 +1,2142 @@
+@@ -0,0 +1,2185 @@
 +/* Copyright (c) Huawei Technologies Co., Ltd. 2026. Licensed under Apache-2.0. */
 +#include "TestUtil.h"
 +using namespace folly;
@@ -8038,6 +8129,7 @@ index 0000000000000000000000000000000000000000..c69774d605884b970d0c103a2960e23a
 +  bool closeOnRead{false};
 +  bool retainRead{false};
 +  bool allowReadError{false};
++  std::string readErrorMessage;
 +  size_t readErrors{0}, eofs{0};
 +  std::unique_ptr<IOBuf> retained;
 +  explicit Echo(AsyncTransport::UniquePtr s, bool e)
@@ -8078,6 +8170,7 @@ index 0000000000000000000000000000000000000000..c69774d605884b970d0c103a2960e23a
 +  void readEOF() noexcept override { ++eofs; }
 +  void readErr(const AsyncSocketException& e) noexcept override {
 +    if (allowReadError) {
++      readErrorMessage = e.what();
 +      ++readErrors;
 +      return;
 +    }
@@ -9492,7 +9585,6 @@ index 0000000000000000000000000000000000000000..c69774d605884b970d0c103a2960e23a
 +      urma_detail::Hello hello;
 +      const auto& endpoint = UrmaIoContext::get(&evb).endpoint();
 +      hello.bufferSize = 4096;
-+      hello.posted = 4;
 +      hello.jfr = endpoint.id;
 +      hello.tpType = URMA_CTP;
 +      hello.socket = UrmaIoContext::allocateSocketId();
@@ -9536,6 +9628,48 @@ index 0000000000000000000000000000000000000000..c69774d605884b970d0c103a2960e23a
 +      require(accepted->isUrmaReady(), "split TCP ACK not accepted");
 +      ::close(raw);
 +      acceptor.connections.clear();
++      auto rejectHello = [&](size_t bytes, size_t offset, uint8_t value, const char* reason) {
++        std::vector<uint8_t> frame(encoded.begin(), encoded.end());
++        frame.resize(bytes);
++        frame[offset] = value;
++        int pair[2];
++        require(!::socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, pair),
++                "invalid HELLO socketpair");
++        Echo peer(AsyncTransport::UniquePtr(new UrmaAsyncSocket(&evb, pair[0])), false);
++        peer.allowReadError = true;
++        require(::send(pair[1], frame.data(), bytes, MSG_NOSIGNAL) == ssize_t(bytes),
++                "short invalid HELLO send");
++        for (int i = 0; i < 1000 && !peer.readErrors; ++i)
++          evb.loopOnce(EVLOOP_NONBLOCK);
++        require(peer.readErrors == 1 && peer.readErrorMessage.find(reason) != std::string::npos &&
++                    ::recv(pair[1], reply, sizeof(reply), 0) == 0,
++                "invalid HELLO must report the cause and close before reply");
++        ::close(pair[1]);
++      };
++      for (size_t bytes : {urma_detail::kHelloPrefixSize, encoded.size()}) {
++        rejectHello(bytes, 0, 0, "invalid URMA HELLO magic");
++        rejectHello(bytes, 5, 102, "unsupported URMA HELLO length");
++        rejectHello(bytes, 7, 2, "unsupported URMA HELLO version");
++        rejectHello(bytes, 9, 2, "unsupported URMA wire version");
++      }
++      rejectHello(102, 5, 102, "unsupported URMA HELLO length");
++      rejectHello(encoded.size(), 38, 0xff, "invalid URMA HELLO fields");
++      auto& localId = receivers.at(endpoint.id)->jfr_id;
++      for (bool changeEid : {true, false}) {
++        const auto saved = localId;
++        if (changeEid) localId.eid.raw[0] ^= 1;
++        else localId.uasid ^= 1;
++        int pair[2];
++        require(!::socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, pair),
++                "segment identity socketpair");
++        auto tcp = AsyncSocket::newSocket(&evb, NetworkSocket::fromFd(pair[0]));
++        UrmaAsyncSocket socket(std::move(tcp), std::chrono::steady_clock::now(),
++                               {encoded.begin(), encoded.end()});
++        localId = saved;
++        require(socket.error() && ::recv(pair[1], reply, sizeof(reply), 0) == 0,
++                "server advertised a READ segment with a different identity");
++        ::close(pair[1]);
++      }
 +      // A mixed listener may already own part or all of HELLO. Any bytes
 +      // still buffered by AsyncSocket must follow that prefix exactly once.
 +      for (size_t prefixSize : {size_t{13}, encoded.size()}) {
@@ -11178,10 +11312,10 @@ index 0000000000000000000000000000000000000000..05a8c6e9531750d7de4befab4c66adbd
 +} // namespace folly::urma_test
 diff --git a/folly/io/async/urma/test/WireTest.cpp b/folly/io/async/urma/test/WireTest.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..4713c105943c5d858efa2531ccf31c52235074ab
+index 0000000000000000000000000000000000000000..d877f077c3c60dc60093faea7f855732abb1a374
 --- /dev/null
 +++ b/folly/io/async/urma/test/WireTest.cpp
-@@ -0,0 +1,132 @@
+@@ -0,0 +1,131 @@
 +/* Copyright (c) Huawei Technologies Co., Ltd. 2026. Licensed under Apache-2.0.
 + */
 +#include <array>
@@ -11246,41 +11380,35 @@ index 0000000000000000000000000000000000000000..4713c105943c5d858efa2531ccf31c52
 +
 +  Hello local;
 +  local.bufferSize = 4096;
-+  local.posted = 1024;
 +  local.jfr = 37;
 +  local.eid[0] = 12;
 +  local.uasid = 123;
 +  local.tpType = 1;
-+  local.read = true;
-+  local.segmentEid[0] =
-+      13; // Segment and endpoint address domains are distinct.
-+  local.segmentUasid = 456;
 +  local.segmentAddress = uint64_t(1) << 48;
 +  local.segmentLength = 128 * 1024 * 1024;
 +  local.segmentToken = 9;
 +  local.socket = UINT64_MAX;
 +  local.maxRead = 8 * 1024 * 1024;
-+  std::array<uint8_t, kHelloSize> hello{};
++  std::array<uint8_t, kHelloSize> hello;
++  hello.fill(0xa5);
 +  encodeHello(hello.data(), local);
 +  Hello decoded;
 +  require(decodeHello(hello.data(), hello.size(), decoded));
++  // Independent v1 fixture, including every offset and the network byte order.
++  const std::array<uint8_t, 75> expected = {{
++      'U','R','M','A', 0,75, 0,1, 0,1, 0,0,16,0, 0,0,0,37,
++      12,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,0,0,123, 1,
++      0,1,0,0,0,0,0,0, 0,0,0,0,8,0,0,0, 0,0,0,9, 0,0,0,0,
++      255,255,255,255,255,255,255,255, 0,128,0,0}};
++  require(hello == expected);
 +  require(
-+      load16(hello.data() + 4) == 102 && load16(hello.data() + 6) == kHelloVersion &&
-+      load16(hello.data() + 8) == kWireVersion && hello[43] == 4);
-+  require(
-+      decoded.socket == UINT64_MAX && decoded.segmentEid[0] == 13 &&
-+      decoded.segmentUasid == 456 && decoded.segmentToken == 9 &&
++      decoded.socket == UINT64_MAX && decoded.eid == local.eid &&
++      decoded.uasid == local.uasid && decoded.segmentToken == 9 &&
 +      decoded.segmentAddress == local.segmentAddress && decoded.fcJfr == 0);
 +  for (size_t n = 0; n < hello.size(); ++n)
 +    require(!decodeHello(hello.data(), n, decoded));
 +  for (size_t byte :
-+       {size_t(0),
-+        size_t(4),
-+        size_t(6),
-+        size_t(8),
-+        size_t(43),
-+        size_t(44),
-+        size_t(45)}) {
++       {size_t(0), size_t(4), size_t(6), size_t(8)}) {
 +    hello[byte] ^= 1;
 +    require(!decodeHello(hello.data(), hello.size(), decoded));
 +    hello[byte] ^= 1;
@@ -11293,14 +11421,14 @@ index 0000000000000000000000000000000000000000..4713c105943c5d858efa2531ccf31c52
 +  require(!containsRead(local, UINT64_MAX - 1, 8));
 +  require(!containsRead(local, local.segmentAddress, 0));
 +  require(!containsRead(local, local.segmentAddress, local.maxRead + 1));
-+  local.read = false;
++  local.maxRead = 0;
 +  encodeHello(hello.data(), local);
 +  require(!decodeHello(hello.data(), hello.size(), decoded));
 +  local = {};
 +  local.socket = 1;
 +  encodeHello(hello.data(), local);
 +  require(decodeHello(hello.data(), hello.size(), decoded));
-+  require(!decoded.read && !decoded.maxRead && !decoded.segmentAddress);
++  require(!decoded.maxRead && !decoded.segmentAddress);
 +  uint64_t boundary = 0;
 +  auto end = encodeEnd(0x123456789abcdefULL);
 +  require(decodeEnd(end.data(), end.size(), boundary) &&
@@ -11309,10 +11437,15 @@ index 0000000000000000000000000000000000000000..4713c105943c5d858efa2531ccf31c52
 +  end = encodeEnd(0);
 +  require(!decodeEnd(end.data(), end.size(), boundary));
 +  encodeHello(hello.data(), local);
-+  store16(hello.data() + 6, 0);
-+  require(!decodeHello(hello.data(), hello.size(), decoded));
++  for (size_t offset : {6, 8}) {
++    for (uint16_t version : {0, 2, 257}) {
++      store16(hello.data() + offset, version);
++      require(!decodeHello(hello.data(), hello.size(), decoded));
++    }
++    store16(hello.data() + offset, 1);
++  }
 +  std::cout
-+      << "PASS H24/PULL40/FREE24/SEGMENT64/READY24 and HELLO102: exact wire, full uint64 IDs, versions, READ ranges\n";
++      << "PASS H24/PULL40/FREE24/SEGMENT64/READY24 and HELLO75: exact wire, full uint64 IDs, versions, READ ranges\n";
 +}
 diff --git a/folly/io/async/urma/urma.json b/folly/io/async/urma/urma.json
 new file mode 100644

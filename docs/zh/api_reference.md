@@ -350,7 +350,8 @@ UrmaConfig loadUrmaConfigFile(const std::string& path, const UrmaConfig& base = 
 
 |配置项|默认值|取值范围|说明|
 |--|--|--|--|
-|`dev_name`|空字符串|本机设备名，不含NUL|空字符串选用枚举到的首个设备。|
+|`dev_name`|空，沿用应用配置|本机设备名，不含NUL|应用也未指定时，Folly 使用枚举到的首个设备。FbThrift 服务端须指定设备。|
+|`eid_index`|未指定，取设备报告的首项|本机设备列出的 EID 索引，本测试环境为 0–7|两端分别选择本机索引。显式指定的索引必须存在，否则初始化失败。|
 |`rx_depth`|0|0或1～65536，受设备JFR与JFC容量限制|每个EventBase的接收队列深度，0表示按设备能力选择。|
 |`rx_target`|256|1～实际`rx_depth`|每个EventBase预投的接收缓冲数。每块默认4 KiB，有效大小受设备能力约束。|
 |`tx_depth`|1024|1～4096，受设备JFS与JFC容量限制|每个EventBase的发送队列深度。|
@@ -367,7 +368,9 @@ UrmaConfig loadUrmaConfigFile(const std::string& path, const UrmaConfig& base = 
 }
 ```
 
-`buffer_size`、`enable_read`、`read_threshold`、`read_window`、`offer_window`和`registered_pool.zero_copy`通过C++配置设置。`read_threshold`初始为4352字节。完整JSON示例见[随包配置文件](https://gitcode.com/boostkit/folly/blob/dev_urma_20221104/folly/io/async/urma/urma.json)。
+`buffer_size`、`enable_read`、`read_threshold`、`read_window`、`offer_window`和`registered_pool.zero_copy`通过C++配置设置。`read_threshold`初始为4352字节。
+
+Folly 随附的 [urma.json](https://gitcode.com/boostkit/folly/blob/dev_urma_20221104/folly/io/async/urma/urma.json) 省略 `dev_name` 和 `eid_index`，保留应用传入的设备和索引。压测用的完整配置见 AccLibBenchmark 的 [scripts/urma.example.json](https://gitcode.com/boostkit/AccLibBenchmark/blob/master/fbthrift/fbthrift_urma/scripts/urma.example.json)。
 
 ## 修订记录
 

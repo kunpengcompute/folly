@@ -77,7 +77,7 @@ URMA 传输与注册内存池作为独立补丁发布，发布日期为 2026-12-
 |--|--|--|
 |openEuler 24.03 LTS SP3|Clang 16.0.6|AArch64|
 
-在上述环境中，使用 CMake 3.31.12 和 URMA SDK 编译并安装了 Release 共享库。33 项 URMA 单测全部通过，内置配置和样例 JSON 下的双机 Echo 各通过一次。复现步骤见《[URMA 快速入门](./quick_start.md#urma补丁快速入门)》。
+在上述环境中，使用 CMake 3.31.12 和 URMA SDK 从本补丁编译 Release 共享库，33 项 URMA 单测全部通过。双机 Echo 分别使用内置默认值、Folly 随附的 `urma.json` 和压测样例 `urma.example.json`，三次客户端和服务端均通过。复现步骤见《[URMA 快速入门](./quick_start.md#urma补丁快速入门)》。
 
 ### 新增特性
 
@@ -94,6 +94,8 @@ URMA 传输与注册内存池作为独立补丁发布，发布日期为 2026-12-
 |配置项|默认值|说明|
 |--|--|--|
 |URMA构建开关|关闭|配置CMake时设置`FOLLY_USE_URMA=ON`启用。|
+|本机设备名 `dev_name`|空，沿用应用配置|客户端和服务端可分别在本机 JSON 中指定设备。|
+|本机 EID 索引 `eid_index`|未指定，取设备报告的首项|本测试环境的 `udmac0d1e2` 列出索引 0–7，压测样例选择 0。|
 |预投接收缓冲数|256|`rx_target`控制每个EventBase预先投递的接收缓冲数。|
 |READ门限|4352字节|单条消息长度严格超过`read_threshold`时才考虑READ。|
 |连接积压上限|128 MiB|`max_pending_bytes`按连接限制积压，发送与接收分别计量。|
@@ -102,6 +104,7 @@ URMA 传输与注册内存池作为独立补丁发布，发布日期为 2026-12-
 ### 兼容性与风险说明
 
 - 编译需要URMA SDK，双机收发还需要两端的驱动、可用设备及可达的TCP握手地址。
+- 两端须使用兼容的握手格式。本版 HELLO 报文为 75 字节，HELLO 和数据报文的版本均为 1。收到不支持的长度或版本时，连接在握手阶段报错。
 - 直接使用 `dev_urma_20221104` 分支时，源码已包含 URMA 实现。应用程序通过 `UrmaInit::init(config)` 启用注册内存池。
 - 注册池暂时不足时，已接纳的异步写入可以等待内存归还或扩容。同步池化`IOBuf::create()`申请失败会抛出`std::bad_alloc`。
 - 关闭时先释放socket、EventBase和池化IOBuf，再调用`UrmaInit::fini()`。硬件或对端仍持有的注册内存会延迟回收。

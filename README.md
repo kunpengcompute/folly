@@ -6,7 +6,7 @@
 
 **URMA 传输与注册内存池** — [folly_urma.patch](folly_urma.patch)
 
-通过 TCP 握手建立连接，再使用 URMA 收发数据。同一 EventBase 上的连接共享收发队列，每个进程管理自己的注册内存池。
+通过 TCP 握手建立连接，再使用 URMA 收发数据。同一 EventBase 上的连接共享收发队列，每个进程管理自己的注册内存池。客户端和服务端可分别配置本机设备名和 EID 索引，写法见《[快速入门](./docs/zh/quick_start.md#启用urma传输)》。
 
 **IOBuf TLS 内存池与 io_uring 混合读写** — [folly_iobuf_iouring.patch](folly_iobuf_iouring.patch)
 

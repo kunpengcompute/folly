@@ -335,7 +335,7 @@ cmake --install _build
 
 int main() {
   folly::UrmaConfig config;
-  config.dev_name = "udmac1d1e2";
+  config.dev_name = "udmac0d1e2";  // 替换为本机设备名。
   folly::UrmaInit::init(config);
   // 在此创建、使用并释放本进程的传输对象。
   folly::UrmaInit::fini();
@@ -344,8 +344,26 @@ int main() {
 
 #### 配置建议
 
-- `dev_name`使用本机设备名，两端可不同。首次初始化时，环境变量`FOLLY_URMA_CONFIG`指向的JSON文件覆盖同名C++配置，省略的字段沿用传入值。
+- `FOLLY_URMA_CONFIG` 指向本机的 JSON 文件。首次初始化时，文件中的字段覆盖同名 C++ 配置，省略的字段沿用应用传入值。客户端和服务端分别选择本机的 `dev_name` 和 `eid_index`。
 - `rx_target`按EventBase设置预投接收缓冲数，`max_pending_bytes`按连接设置收发积压上限，`registered_pool`按进程设置注册内存容量。字段范围和默认值见《[API参考](./api_reference.md#urma配置项)》。
+
+两端分别执行 `urma_admin show --all` 查看本机设备，`eid0` 表示索引 0。本测试环境的 `udmac0d1e2` 列出索引 0–7。在 `urma.json` 中按以下写法选择索引 0。
+
+```json
+{
+  "dev_name": "udmac0d1e2",
+  "eid_index": 0
+}
+```
+
+使用 AccLibBenchmark 压测时，在客户端的 `fbthrift/fbthrift_urma/` 目录复制两份配置。
+
+```bash
+cp scripts/run.example.json run.json
+cp scripts/urma.example.json urma.json
+```
+
+服务端也执行第二条命令。在 `run.json` 中将 `client.urma_config` 和 `server.urma_config` 分别指向各端 `urma.json` 的绝对路径。运行步骤见 [AccLibBenchmark 压测指南](https://gitcode.com/boostkit/AccLibBenchmark/blob/master/fbthrift/fbthrift_urma/scripts/README.md)。
 
 ### URMA正确性验证
 
@@ -363,21 +381,21 @@ int main() {
    ldd ./_build/folly/io/async/urma/test/UrmaEchoTest
    ```
 
-3. 先启动服务端，将`192.0.2.10`替换为两端可达的服务端TCP地址，将`udmac1d1e2`替换为本机设备名。
+3. 先启动服务端，将`192.0.2.10`替换为两端可达的服务端TCP地址，将`udmac0d1e2`替换为本机设备名。
 
    ```bash
-   ./_build/folly/io/async/urma/test/UrmaEchoTest server 192.0.2.10 32181 udmac1d1e2
+   ./_build/folly/io/async/urma/test/UrmaEchoTest server 192.0.2.10 32181 udmac0d1e2
    ```
 
 4. 服务端输出`LISTEN`后，在客户端使用同一服务端地址、端口和客户端本机设备名执行以下命令。
 
    ```bash
-   ./_build/folly/io/async/urma/test/UrmaEchoTest client 192.0.2.10 32181 udmac1d1e2
+   ./_build/folly/io/async/urma/test/UrmaEchoTest client 192.0.2.10 32181 udmac0d1e2
    ```
 
    客户端发送`ping`并核对回显内容。两端分别输出`PASS client`、`PASS server`且退出码均为0，表示验证通过。
 
-5. 验证JSON配置时，在两端各自的源码目录执行以下命令，再重复步骤3和4。随包样例省略`dev_name`，Echo沿用各端命令行传入的设备名。
+5. 验证 JSON 配置时，在两端各自的 Folly 源码目录执行以下命令，再重复步骤 3 和 4。随附的 `urma.json` 省略设备名和 EID 索引，Echo 沿用命令行传入的设备名，并选取该设备报告的首个 EID。启动日志会显示实际的 `device` 和 `eid_index`。
 
    ```bash
    cp folly/io/async/urma/urma.json ./urma.json
