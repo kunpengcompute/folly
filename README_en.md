@@ -1,19 +1,21 @@
 # Folly Performance Optimization Patches
 
-<!-- md-trans-meta sourceCommit=6fc6532f1f14841cdb1f0c0137b40ec605234666 translatedAt=2026-10-13T03:52:47.658Z pushedAt=2026-10-13T06:33:54.110Z -->
+<!-- md-trans-meta sourceCommit=14b83392c2971dc9bc5c6e50559cb65eee2d2af7 translatedAt=2026-11-17T03:52:47.658Z pushedAt=2026-11-17T06:33:54.110Z -->
 
-[简体中文](./README.md) | English
+[简体中文](./README.md)|English
+
+This document introduces the Folly performance optimization patches, which optimize the Folly network I/O and buffer allocation paths, covering the IOBuf TLS memory pool and io_uring hybrid mode optimization. It is intended for developers who use the Folly component library.
 
 ## What's New
 
-- [2026.09.30]: Released a patch for Folly v1.1.0, adding a thread-local storage (TLS) memory pool for IOBuf. Thread-local data block reuse and contiguous slice splitting reduce `malloc/free` operations in high-queries per second (QPS) scenarios.
-- [2026.06.30]: Released a patch repository for Folly v1.0.0, optimizing io_uring for the Folly asynchronous network I/O framework to improve network I/O stability and baseline I/O performance.
+- [2026-09-30]: Released a patch for Folly V1.1.0, adding a thread-local storage (TLS) memory pool for IOBuf. Thread-local data block reuse and contiguous slice splitting reduce `malloc/free` operations in high queries per second (QPS) scenarios.
+- [2026-06-30]: Released a patch repository for Folly V1.0.0, optimizing io_uring for the Folly asynchronous network I/O framework to improve network I/O stability and baseline I/O performance.
 
 ## Project Introduction
 
 Folly is a high-performance C++11/14/17 component library open-sourced by Meta, designed specifically for large-scale, highly concurrent, low-latency server-side application scenarios.
 
-This project optimizes the Folly network I/O and buffer allocation paths. Folly v1.1.0 introduces the IOBuf TLS memory pool, which pools only data blocks, not the IOBuf objects themselves. Folly v1.0.0 adopts the io_uring hybrid mode: read operations use multishot to reduce system calls, while write operations use the open-source `send` to ensure the ordering and latency stability of consecutive writes.
+This project optimizes the Folly network I/O and buffer allocation paths. Folly V1.1.0 introduces the IOBuf TLS memory pool, which pools only data blocks, not the IOBuf objects themselves. Folly V1.0.0 adopts the io_uring hybrid mode: read operations use multishot to reduce system calls, while write operations use the `send` system call to ensure the ordering and latency stability of consecutive writes.
 
 The core design of the IOBuf TLS memory pool is as follows:
 
@@ -26,21 +28,24 @@ The core design of the IOBuf TLS memory pool is as follows:
 ## Directory Structure
 
 ```text
-fbthrift/
+folly/
 ├── docs/                           # Documentation directory
 │   ├── en/                         # English documents
-│   │   ├── api_reference.md        # API reference sheet
-│   │   ├── quick_start.md          # Menu for beginners
+│   │   ├── api_reference.md        # API reference
+│   │   ├── quick_start.md          # Quick start guide
+|   |   ├── menu_folly_en.md           # Document list
 │   │   └── release_notes.md        # Release notes
 │   │
 │   ├── zh/                         # Chinese documents
-│   │   ├── api_reference.md        # API reference sheet
-│   │   ├── quick_start.md          # Menu for beginners
+│   │   ├── api_reference.md        # API reference
+│   │   ├── quick_start.md          # Quick start guide
+|   |   ├── menu_folly.md           # Document list
 │   │   └── release_notes.md        # Release notes
 │   └── LICENSE
 ├── LICENSE
-├── iouring.patch                   # Folly v1.1.0 optimization patch file
-└── README.md                       # Project introduction
+├── iouring.patch                   # Folly V1.1.0 optimization patch file
+├──README.md                        # Project introduction
+└──README_en.md                     # Project introduction (English)
 ```
 
 ## Release Notes
@@ -56,7 +61,7 @@ For quick start instructions on Folly, see [Quick Start](docs/en/quick_start.md)
 | Document | Content |
 | --------- | --------- |
 | [Quick Start](docs/en/quick_start.md) | Provides guidance on compiling, enabling, and verifying io_uring and the IOBuf TLS memory pool. |
-| [Release Notes](docs/en/release_notes.md) | Provides Folly v1.1.0 version information, compatibility constraints, and feature updates. |
+| [Release Notes](docs/en/release_notes.md) | Provides Folly V1.1.0 version information, compatibility constraints, and feature updates. |
 | [API Reference](docs/en/api_reference.md) | Provides version-specific descriptions of the TLS memory pool and io_uring related interfaces. |
 
 ## Disclaimer
@@ -75,4 +80,4 @@ We welcome your contributions to the community. If you have any questions/sugges
 
 ## Acknowledgments
 
-Thank you to everyone in the community for your PRs. We warmly welcome contributions to the Folly patch repository!
+Thank you to everyone in the community for your PRs. We warmly welcome contributions to Folly!
