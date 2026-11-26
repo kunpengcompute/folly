@@ -406,7 +406,7 @@ int main(int argc, char** argv) {
     tlsCacheBoundaries();
     resourceNotifications();
     largeExtents();
-    check(argc == 3, "expected paths to urma.json and urma.example.json");
+    check(argc == 2, "expected path to urma.json");
     UrmaConfig base;
     base.dev_name = "device-supplied-by-caller";
     base.eid_index = 3;
@@ -421,14 +421,15 @@ int main(int argc, char** argv) {
               defaults.registered_pool.pool_max_size >
                   defaults.registered_pool.pool_size,
           "urma.json changed the registered pool defaults");
-    const auto example = loadUrmaConfigFile(argv[2], base);
-    check(example.dev_name == "udmac0d1e2" && example.eid_index == 0u,
-          "urma.example.json did not select udmac0d1e2 and EID index 0");
     char path[] = "/tmp/urma-config-test-XXXXXX";
     int fd = ::mkstemp(path);
     check(fd >= 0, "temporary config creation failed");
     ::close(fd);
     auto removeFile = makeGuard([&] { ::unlink(path); });
+    std::ofstream(path) << R"({"dev_name":"device-from-json","eid_index":0})";
+    const auto selected = loadUrmaConfigFile(path, base);
+    check(selected.dev_name == "device-from-json" && selected.eid_index == 0u,
+          "explicit JSON device and EID index did not override the caller's selection");
     for (uint32_t index : {uint32_t(0), uint32_t(7), UINT32_MAX}) {
       std::ofstream(path) << "{\"eid_index\":" << index << "}";
       check(loadUrmaConfigFile(path, base).eid_index == index,
