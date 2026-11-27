@@ -23,6 +23,8 @@ class UrmaInit {
       UrmaPoolSignal* waiter = nullptr);
   // Acquires the process SDK context and registered pool. Queue resources are
   // prepared by each EventBase's shared owner when first needed.
+  // FOLLY_URMA_CONFIG is read when creating the context. While it is active,
+  // any device or EID supplied by the caller must match the current binding.
   static void init(const UrmaConfig& config);
   // Requests shutdown and rejects new transports. Existing owners must still
   // be released by the caller; cleanup then retries automatically, including

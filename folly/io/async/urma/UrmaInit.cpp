@@ -79,7 +79,16 @@ void UrmaInit::init(const UrmaConfig& requested) {
   std::lock_guard<std::mutex> lock(mutex);
   if (shutdownRequested)
     throw std::runtime_error("URMA shutdown is still pending");
-  if (context) return;
+  if (context) {
+    if (!requested.dev_name.empty() && requested.dev_name != settings.dev_name)
+      throw std::runtime_error("requested URMA device " + requested.dev_name +
+          " conflicts with active device " + settings.dev_name);
+    if (requested.eid_index && *requested.eid_index != context->eid_index)
+      throw std::runtime_error("URMA device " + settings.dev_name +
+          ": requested eid_index=" + std::to_string(*requested.eid_index) +
+          " conflicts with active eid_index=" + std::to_string(context->eid_index));
+    return;
+  }
   const char* path = std::getenv("FOLLY_URMA_CONFIG");
   const UrmaConfig config =
       path ? loadUrmaConfigFile(path, requested) : requested;
@@ -95,11 +104,13 @@ void UrmaInit::init(const UrmaConfig& requested) {
   if (status != URMA_SUCCESS && status != URMA_EEXIST)
     throw std::runtime_error("urma_init failed");
   const bool initializedHere = status == URMA_SUCCESS;
+  urma_context_t* created = nullptr;
   auto rollback = makeGuard([&] {
-    if (initializedHere && urma_uninit() != URMA_SUCCESS) {
-      // Device discovery/context creation can fail before context publication.
-      // Retain SDK ownership if even this early rollback cannot uninitialize.
-      libraryOwned = true;
+    const bool pendingContext = created && urma_delete_context(created) != URMA_SUCCESS;
+    if (pendingContext || (initializedHere && urma_uninit() != URMA_SUCCESS)) {
+      // Keep the SDK alive until a rejected context can be deleted.
+      context = pendingContext ? created : nullptr;
+      libraryOwned = initializedHere;
       shutdownRequested = true;
       urma_detail::cleanupOrDefer(std::move(preparedCleanup));
     }
@@ -111,21 +122,25 @@ void UrmaInit::init(const UrmaConfig& requested) {
   });
   urma_device_t* device = nullptr;
   for (int i = 0; devices && i < count; ++i) {
-    if (config.dev_name.empty() || config.dev_name == devices[i]->name) {
+    if (devices[i] && (config.dev_name.empty() || config.dev_name == devices[i]->name)) {
       device = devices[i];
       break;
     }
   }
+  if (!device) {
+    if (config.dev_name.empty()) throw std::runtime_error("no URMA devices found");
+    throw std::runtime_error("URMA device " + config.dev_name + " not found");
+  }
+  effective.dev_name = device->name;
   urma_device_attr_t attr{};
   uint32_t n = 0;
   urma_eid_info_t* eids = nullptr;
   auto releaseEids = makeGuard([&] {
     if (eids) urma_free_eid_list(eids);
   });
-  urma_context_t* created = nullptr;
   uint32_t readCapacity = 0;
   urma_eid_t eid{};
-  if (device && urma_query_device(device, &attr) == URMA_SUCCESS &&
+  if (urma_query_device(device, &attr) == URMA_SUCCESS &&
       (attr.dev_cap.trans_mode & URMA_TM_RM)) {
     auto deviceLimit = [](const char* field, uint32_t requested, uint32_t maximum) {
       if (!maximum || requested > maximum)
@@ -178,7 +193,23 @@ void UrmaInit::init(const UrmaConfig& requested) {
     }
   }
   if (!created) {
-    throw std::runtime_error("no usable URMA RM context/device");
+    throw std::runtime_error("no usable URMA RM context for device " + effective.dev_name);
+  }
+  if (!created->dev || effective.dev_name != created->dev->name) {
+    throw std::runtime_error("URMA requested device " + effective.dev_name +
+        " but SDK context reports " + (created->dev ? created->dev->name : "<none>"));
+  }
+  if (created->eid_index != *effective.eid_index) {
+    throw std::runtime_error("URMA device " + effective.dev_name + ": selected eid_index=" +
+        std::to_string(*effective.eid_index) + " but SDK context reports eid_index=" +
+        std::to_string(created->eid_index));
+  }
+  // Some SDK-created virtual devices leave the context EID address unset.
+  const urma_eid_t unsetEid{};
+  if (std::memcmp(created->eid.raw, unsetEid.raw, sizeof(eid.raw)) != 0 &&
+      std::memcmp(created->eid.raw, eid.raw, sizeof(eid.raw)) != 0) {
+    throw std::runtime_error("URMA device " + effective.dev_name + ": eid_index=" +
+        std::to_string(*effective.eid_index) + " has a different EID address in the SDK context");
   }
   settings = std::move(effective);
   maxReadSize = std::min(attr.dev_cap.max_read_size, readCapacity);
