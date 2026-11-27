@@ -2,6 +2,8 @@
 
 本文档介绍API参考，适用于需要调用Folly接口的用户。
 
+URMA 传输与注册内存池的接口单列在[URMA补丁接口说明](#urma补丁接口说明)中。
+
 ## Folly V1.1.0：IOBuf TLS内存池接口说明
 
 本文档介绍Folly V1.1.0新增的IOBuf TLS内存池接口和生命周期规则。该能力默认不改变原有分配行为，调用enableMemoryPool()后才会进入池化路径。
@@ -213,8 +215,184 @@ void AsyncIoUringSocket::writeChain(
 
 该函数无返回值。当send因缓冲区不足无法继续发送时，结合PollWriteSqe侦听socket fd的可写事件，并在可写后恢复发送。
 
+## URMA补丁接口说明
+
+本节仅适用于 `folly_urma.patch`，介绍进程初始化、异步收发和注册内存分配接口。接口声明位于 `folly/io/async/urma/` 目录下的 `UrmaInit.h`、`UrmaAsyncSocket.h` 和 `UrmaConfig.h`。
+
+### 接口概览
+
+|名称|类型|说明|
+|--|--|--|
+|UrmaInit::init、getConfig、fini|初始化接口|建立进程级SDK上下文和注册池，读取生效配置，退出时释放资源。|
+|loadUrmaConfigFile|配置接口|从JSON文件加载配置，保留基础配置中未被覆盖的字段。|
+|UrmaAsyncSocket::newSocket|建连接口|创建客户端传输。服务端使用UrmaAsyncSocket构造函数接管已接受的TCP socket。|
+|UrmaAsyncSocket::connecting、isUrmaReady|状态查询接口|分别查询是否仍在连接或握手，以及是否已进入URMA收发状态。|
+|UrmaAsyncSocket::setReadCB、write、writev、writeChain|收发接口|在所属EventBase注册读回调或提交异步写入。|
+|UrmaAsyncSocket::writeChainWithRecords|收发接口|按序列化消息边界提交IOBuf链，多条消息共用一次写回调。|
+|UrmaAsyncSocket::getAppBytesBuffered、getAllocatedBytesBuffered|积压查询接口|前者返回待发送数据字节数，后者统计写队列持有的容量及为READ保留的源缓冲副本。|
+|UrmaAsyncSocket::setBufferCallback|通知接口|在所属EventBase通知发送积压变化或清空。注册时不触发回调，回调对象需保持有效直至用`nullptr`注销。|
+|UrmaAsyncSocket::getUrmaStats|统计接口|在所属EventBase读取SEND、RECV、READ完成数及复制字节数。连接关闭后仍可读取。|
+|UrmaInit::createPoolBuffer|分配接口|从本进程的注册池申请IOBuf。|
+|UrmaInit::poolStats、poolRegions|统计接口|查看进程注册池的容量、分配及各区域状态。|
+
+### UrmaInit::init
+
+#### UrmaInit::init函数功能
+
+客户端和服务端分别初始化本进程的SDK上下文与注册内存池。收发队列在EventBase首次使用时创建，供同一EventBase上的连接共享。
+
+#### UrmaInit::init函数定义
+
+```cpp
+static void init(const UrmaConfig& config);
+```
+
+#### UrmaInit::init函数参数说明
+
+|参数名|说明|输入/输出|
+|--|--|--|
+|config|设备、队列、连接积压及注册内存池配置。设置 `FOLLY_URMA_CONFIG` 后，创建上下文时读取文件，文件中的字段覆盖同名配置。|输入|
+
+#### UrmaInit::init函数约束说明
+
+- 编译时启用`FOLLY_USE_URMA=ON`，在创建socket前完成初始化。已有上下文时，`UrmaInit::init({})` 直接复用当前绑定。C++ 参数显式指定的设备或 EID 与当前绑定不一致时会抛出异常。配置文件被修改或移走不影响复用，下一次创建上下文时才会重新读取。
+- `UrmaInit::getConfig()`返回生效的配置，包括按设备能力确定的接收队列深度。
+- 应用退出时先释放socket、EventBase及池化IOBuf，再调用`UrmaInit::fini()`。若DMA仍在途、对端仍持有引用或SDK清理需要重试，资源会延迟释放。清理完成前`UrmaInit::isInitialized()`仍可返回`true`。
+
+### UrmaAsyncSocket::newSocket
+
+#### UrmaAsyncSocket::newSocket函数功能
+
+创建客户端传输，通过TCP握手交换URMA连接信息。服务端将已接受的TCP socket传入`UrmaAsyncSocket`构造函数。返回的客户端传输由所属EventBase推进握手和收发。
+
+#### UrmaAsyncSocket::newSocket函数定义
+
+```cpp
+static AsyncTransport::UniquePtr newSocket(EventBase* evb, const SocketAddress& address);
+```
+
+#### UrmaAsyncSocket::newSocket函数参数说明
+
+|参数名|说明|输入/输出|
+|--|--|--|
+|evb|驱动连接、握手及读写回调的EventBase。|输入|
+|address|服务端的TCP监听地址和端口。|输入|
+
+### UrmaAsyncSocket::writeChain
+
+#### UrmaAsyncSocket::writeChain函数功能
+
+接管并异步发送IOBuf链。`write()`和`writev()`借用调用方的数据，调用方需保持数据有效直至写回调完成。收发示例见《[快速入门](./quick_start.md#启用urma传输)》。
+
+#### UrmaAsyncSocket::writeChain函数定义
+
+```cpp
+void writeChain(WriteCallback* cb, std::unique_ptr<IOBuf>&& data,
+                WriteFlags flags = WriteFlags::NONE) noexcept override;
+```
+
+#### UrmaAsyncSocket::writeChain函数参数说明
+
+|参数名|说明|输入/输出|
+|--|--|--|
+|cb|写完成或失败回调。|输入|
+|data|待发送的IOBuf链，调用时转移所有权。|输入|
+|flags|本版支持`WriteFlags::NONE`。|输入|
+
+#### UrmaAsyncSocket::writeChain函数约束说明
+
+- `writeChain()`将整条链视为一条消息。一次提交多条序列化消息时，`writeChainWithRecords()`可额外传入各条消息的长度`recordLengths`。长度总和必须等于链的数据长度，空列表表示一条消息。
+- 双方支持READ且单条消息长度超过`read_threshold`时，接收端可从发送端的注册内存读入本地，发送端保留源缓冲直至读取完成。其余消息使用SEND/RECV。
+- 每个连接分别限制待发送数据字节数和队列持有的IOBuf容量。新提交的写入超限时，通过写回调的`writeErr()`报告错误。已接纳的写入遇到注册内存暂时不足时可等待内存归还或扩容，关闭、错误或发送超时会结束等待。
+
+### UrmaInit::createPoolBuffer
+
+#### UrmaInit::createPoolBuffer函数功能
+
+从本进程的注册池申请IOBuf。成功时初始长度为0，容量至少为请求值。写入数据后调用`append()`设置有效长度。
+
+#### UrmaInit::createPoolBuffer函数定义
+
+```cpp
+static std::unique_ptr<IOBuf> createPoolBuffer(size_t size);
+```
+
+#### UrmaInit::createPoolBuffer函数参数说明
+
+|参数名|说明|输入/输出|
+|--|--|--|
+|size|请求的数据容量，单位为字节。|输入|
+
+该接口在池分配失败时返回空指针，分配IOBuf元数据时仍可能抛出异常。默认配置下，普通`IOBuf::create()`也使用注册池，同步分配失败会抛出`std::bad_alloc`。通过C++设置`registered_pool.zero_copy=false`后，普通IOBuf沿用原分配路径，发送时按需复制到注册内存。
+
+### loadUrmaConfigFile
+
+#### loadUrmaConfigFile函数功能
+
+加载JSON配置，返回叠加到基础配置后的`UrmaConfig`。文件上限为64 KiB，未知字段、重复键、类型错误及越界值会引发`std::invalid_argument`。`UrmaInit::init(config)`在初始化时检查设备能力。
+
+#### loadUrmaConfigFile函数定义
+
+```cpp
+UrmaConfig loadUrmaConfigFile(const std::string& path, const UrmaConfig& base = {});
+```
+
+#### loadUrmaConfigFile函数参数说明
+
+|参数名|说明|输入/输出|
+|--|--|--|
+|path|本机JSON文件路径。|输入|
+|base|基础配置。省略时使用`UrmaConfig`的初始值。|输入|
+
+#### URMA配置项
+
+下表列出JSON支持的全部字段。下限和上限涉及C++配置时，按结构体初始值说明。
+
+|配置项|未指定时的默认值|取值范围|说明|
+|--|--|--|--|
+|`dev_name`|空，沿用应用配置|本机设备名，不含NUL|应用也未指定时，Folly 使用枚举到的首个设备。FbThrift 服务端须指定设备。|
+|`eid_index`|未指定，取设备报告的首项|本机设备列出的 EID 索引，本测试环境为 0–7|两端分别选择本机索引。显式指定的索引必须存在，否则初始化失败。|
+|`rx_depth`|0|0或1～65536，受设备JFR与JFC容量限制|每个EventBase的接收队列深度，0表示按设备能力选择。|
+|`rx_target`|256|1～实际`rx_depth`|每个EventBase预投的接收缓冲数。每块默认4 KiB，有效大小受设备能力约束。|
+|`tx_depth`|1024|1～4096，受设备JFS与JFC容量限制|每个EventBase的发送队列深度。|
+|`handshake_timeout_ms`|5000|1～60000毫秒|客户端从发起TCP连接计时，服务端从接管socket或调用方传入的握手起点计时。|
+|`max_pending_bytes`|134217728（128 MiB）|`buffer_size`～4294967295字节，初始下限为4096字节|每个连接的发送、接收积压分别计限。建连时不会按此值预留内存。|
+|`registered_pool.pool_size`|268435456（256 MiB）|正数，按系统页大小对齐|本进程注册池的初始容量，单位为字节。|
+|`registered_pool.pool_max_size`|536870912（512 MiB）|0或不小于`pool_size`的页对齐字节数|本进程注册池的上限。0表示以初始容量为上限。有效上限须能容纳TLS块，默认块大小为16 KiB。|
+
+例如，使用默认的256个接收缓冲、每块4 KiB时，一个EventBase为预投接收缓冲占用1 MiB，进程内8个这样的EventBase共占用8 MiB。若要将每个EventBase的预投数改为128，可在JSON文件中写入以下内容。
+
+```json
+{
+  "rx_target": 128
+}
+```
+
+`buffer_size`、`enable_read`、`read_threshold`、`read_window`、`offer_window`和`registered_pool.zero_copy`通过C++配置设置。`read_threshold`初始为4352字节。
+
+下面是 Folly 随附的 `folly/io/async/urma/urma.json`。文件固定选择 `udmac0d1e2` 和 EID 索引 `0`。本机没有该设备或该设备未列出索引 `0` 时，直接加载会抛出异常。两端分别按本机设备修改配置副本。本测试环境的 `udmac0d1e2` 列出索引 0–7，可用索引以所选设备实际报告的列表为准。
+
+省略某个字段时沿用应用传入的值，加载 `{}` 会保留全部应用配置。初始化时若设备不存在、索引不属于所选设备，或 SDK 返回的上下文与设备或 EID 不符，Folly 会抛出异常。
+
+```json
+{
+  "dev_name": "udmac0d1e2",
+  "eid_index": 0,
+  "rx_depth": 0,
+  "rx_target": 256,
+  "tx_depth": 1024,
+  "handshake_timeout_ms": 5000,
+  "max_pending_bytes": 134217728,
+  "registered_pool": {
+    "pool_size": 268435456,
+    "pool_max_size": 536870912
+  }
+}
+```
+
 ## 修订记录
 
 |文档版本|发布日期|修改说明|
 |:---|:---|:---|
 |01|2026-09-30|第一次正式发布。|
+|02|2026-12-30|新增独立的URMA补丁接口说明。|

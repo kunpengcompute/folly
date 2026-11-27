@@ -2,9 +2,23 @@
 
 简体中文|[English](./README_en.md)
 
+本仓库提供两份独立的 Folly 性能优化补丁，分别应用于上游 `v2022.11.14.00` 基线。
+
+**URMA 传输与注册内存池** — [folly_urma.patch](folly_urma.patch)
+
+通过 TCP 握手建立连接，再使用 URMA 收发数据。同一 EventBase 上的连接共享收发队列，每个进程管理自己的注册内存池。客户端和服务端分别用 `dev_name` 指定本机设备，用 `eid_index` 选择该设备的 EID。
+
+**IOBuf TLS 内存池与 io_uring 混合读写** — [folly_iobuf_iouring.patch](folly_iobuf_iouring.patch)
+
 本文档介绍Folly性能优化补丁，面向Folly网络I/O和缓冲区分配路径进行性能优化，涵盖IOBuf TLS内存池与io_uring混合模式优化，适用于使用Folly组件库的开发者。
 
 ## 最新消息
+
+**URMA 补丁**
+
+- [2026-12-30]：发布 Folly URMA 补丁，支持共享收发队列、弹性注册内存池和大消息并发 READ。
+
+**IOBuf TLS 内存池与 io_uring 补丁**
 
 - [2026-09-30]：发布Folly V1.1.0版本补丁，新增IOBuf TLS内存池，通过线程本地数据块复用和连续slice切分减少高QPS场景下的`malloc/free`。
 - [2026-06-30]：发布Folly V1.0.0版本补丁仓，针对Folly异步网络I/O框架进行io_uring优化，提升网络I/O的稳定性与基线io性能。
@@ -42,6 +56,8 @@ folly/
 │   └── LICENSE
 ├── LICENSE
 ├── iouring.patch                   # Folly V1.1.0优化补丁文件
+├── folly_urma.patch                # URMA传输与注册内存池补丁
+├── folly_urma.patch.sha256         # URMA补丁的SHA-256校验文件
 ├──README.md                        # 项目介绍
 └──README_en.md                     # 项目介绍（英文）
 ```
@@ -61,6 +77,8 @@ folly/
 | 《[快速入门](docs/zh/quick_start.md)》 | 提供io_uring与IOBuf TLS内存池的编译、启用和验证指导。 |
 | 《[版本说明书](docs/zh/release_notes.md)》 | 提供Folly V1.1.0版本信息、兼容性约束和特性更新。 |
 | 《[API参考](docs/zh/api_reference.md)》 | 按版本提供TLS内存池和io_uring相关接口说明。 |
+
+URMA 补丁的文档见《[URMA 快速入门](docs/zh/quick_start.md#urma补丁快速入门)》《[URMA 补丁说明](docs/zh/release_notes.md#urma补丁说明)》和《[URMA 接口说明](docs/zh/api_reference.md#urma补丁接口说明)》。
 
 ## 免责声明
 
